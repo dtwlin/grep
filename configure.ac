@@ -64,6 +64,9 @@ AC_DEFINE([GNULIB_NO_VLA], [1], [Define to 1 to disable use of VLAs])
 AC_DEFINE([GNULIB_EXCLUDE_SINGLE_THREAD], [1],
   [Define to 1 as the 'exclude' module's functions
    are invoked from a single thread.])
+AC_DEFINE([GNULIB_LOCALENAME_SINGLE_THREAD], [1],
+  [Define to 1 as the 'localename' module's functions
+   are invoked from a single thread.])
 AC_DEFINE([GNULIB_MBRTOWC_SINGLE_THREAD], [1],
   [Define to 1 as the 'mbrtoc32' and 'regex' modules' functions
    are invoked from a single thread.])
