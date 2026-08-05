@@ -2025,6 +2025,23 @@ grep -C 2 'hello' test*.log
 prints two lines of context around each matching line.
 
 @item
+How can I color only part of what my pattern matches?
+
+@cindex coloring part of a match
+@command{grep} colors the entire matching part of the line, so arrange
+for the pattern to match only the part you want colored.  With
+@option{-P} you can use lookaround assertions to require surrounding
+context without making it part of the match.  For example:
+
+@example
+grep -P --color=auto '(?<=id=")[^"]+' index.html
+@end example
+
+@noindent
+colors only the value of each @samp{id="@dots{}"} attribute, and not
+the surrounding @samp{id="} and @samp{"}.
+
+@item
 How do I force @command{grep} to print the name of the file?
 
 Append @file{/dev/null}:
