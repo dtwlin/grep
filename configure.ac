@@ -150,6 +150,7 @@ if test $gl_gcc_warnings != no; then
   gl_WARN_ADD([-Wno-unused-parameter]) # Too many warnings for now
   gl_WARN_ADD([-Wno-cast-function-type]) # sig-handler.h's sa_handler_t cast
   gl_WARN_ADD([-Wno-deprecated-declarations]) # clang complains about sprintf
+  gl_WARN_ADD([-Wno-keyword-macro])
 
   # In spite of excluding -Wlogical-op above, it is enabled, as of
   # gcc 4.5.0 20090517, and it provokes warnings in cat.c, dd.c, truncate.c
