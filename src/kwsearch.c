@@ -92,9 +92,18 @@ Fcompile (char *pattern, idx_t size, reg_syntax_t ignored, bool exact)
   struct kwsearch *kwsearch = xmalloc (sizeof *kwsearch);
   kwsearch->kwset = kwset;
   kwsearch->words = words;
-  kwsearch->pattern = pattern;
+  kwsearch->pattern = ximemdup0 (pattern, size);
   kwsearch->size = size;
   kwsearch->re = nullptr;
+
+  if (!localeinfo.multibyte && match_words)
+    {
+      fgrep_to_grep_pattern (&kwsearch->pattern, &kwsearch->size);
+      kwsearch->re = GEAcompile (kwsearch->pattern,
+                                 kwsearch->size,
+                                 RE_SYNTAX_GREP, exact);
+    }
+
   return kwsearch;
 }
 
@@ -235,4 +244,18 @@ Fexecute (void *vcp, char const *buf, idx_t size, idx_t *match_size,
  success_in_beg_and_len:;
   *match_size = len;
   return beg - buf;
+}
+
+void
+Ffree (void *vcp)
+{
+  if (!vcp)
+    return;
+  struct kwsearch *kwsearch = vcp;
+  if (kwsearch->kwset)
+    kwsfree (kwsearch->kwset);
+  free (kwsearch->pattern);
+  if (kwsearch->re)
+    EGfree (kwsearch->re);
+  free (kwsearch);
 }

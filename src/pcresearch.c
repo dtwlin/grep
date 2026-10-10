@@ -260,6 +260,28 @@ Pcompile (char *pattern, idx_t size, reg_syntax_t ignored, bool exact)
   return pc;
 }
 
+void *
+Pclone (void const *vcp)
+{
+  struct pcre_comp const *orig = vcp;
+  struct pcre_comp *pc = ximalloc (sizeof *pc);
+
+  pc->gcontext = pcre2_general_context_create (private_malloc, private_free, nullptr);
+  pc->cre = orig->cre;
+  pc->empty_match[0] = orig->empty_match[0];
+  pc->empty_match[1] = orig->empty_match[1];
+
+  pc->mcontext = pcre2_match_context_create (pc->gcontext);
+  pc->data = pcre2_match_data_create_from_pattern (pc->cre, pc->gcontext);
+
+  pc->jit_stack_size = 2 << 20; /* 2 MiB */
+  pc->jit_stack = pcre2_jit_stack_create (64 << 10, pc->jit_stack_size, pc->gcontext);
+  if (pc->jit_stack && pc->mcontext)
+    pcre2_jit_stack_assign (pc->mcontext, nullptr, pc->jit_stack);
+
+  return pc;
+}
+
 ptrdiff_t
 Pexecute (void *vcp, char const *buf, idx_t size, idx_t *match_size,
           char const *start_ptr)
@@ -418,4 +440,21 @@ Pexecute (void *vcp, char const *buf, idx_t size, idx_t *match_size,
       *match_size = end - beg;
       return beg - buf;
     }
+}
+
+void
+Pfree (void *vpc)
+{
+  if (!vpc)
+    return;
+  struct pcre_comp *pc = vpc;
+  if (pc->jit_stack)
+    pcre2_jit_stack_free (pc->jit_stack);
+  if (pc->data)
+    pcre2_match_data_free (pc->data);
+  if (pc->mcontext)
+    pcre2_match_context_free (pc->mcontext);
+  if (pc->gcontext)
+    pcre2_general_context_free (pc->gcontext);
+  free (pc);
 }

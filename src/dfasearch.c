@@ -34,6 +34,7 @@ struct dfa_comp
 
   /* Regex compiled regexps. */
   struct re_pattern_buffer *patterns;
+  struct re_pattern_buffer *patterns_alloc;
   idx_t pcount;
   struct re_registers regs;
 
@@ -45,6 +46,8 @@ struct dfa_comp
   bool begline;
 };
 
+_Thread_local bool suppress_dfawarn;
+
 void
 dfaerror (char const *mesg)
 {
@@ -54,6 +57,8 @@ dfaerror (char const *mesg)
 void
 dfawarn (char const *mesg)
 {
+  if (suppress_dfawarn)
+    return;
   error (0, 0, _("warning: %s"), mesg);
 }
 
@@ -217,8 +222,8 @@ GEAcompile (char *pattern, idx_t size, reg_syntax_t syntax_bits,
   char const *patlim = pattern + size;
   bool compilation_failed = false;
 
-  dc->patterns = xmalloc (sizeof *dc->patterns);
-  dc->patterns++;
+  dc->patterns_alloc = xmalloc (sizeof *dc->patterns);
+  dc->patterns = dc->patterns_alloc + 1;
   dc->pcount = 0;
   idx_t palloc = 1;
 
@@ -254,9 +259,9 @@ GEAcompile (char *pattern, idx_t size, reg_syntax_t syntax_bits,
       ptrdiff_t shortage = dc->pcount - palloc + 2;
       if (0 < shortage)
         {
-          dc->patterns = xpalloc (dc->patterns - 1, &palloc, shortage, -1,
-                                  sizeof *dc->patterns);
-          dc->patterns++;
+          dc->patterns_alloc = xpalloc (dc->patterns_alloc, &palloc, shortage, -1,
+                                        sizeof *dc->patterns);
+          dc->patterns = dc->patterns_alloc + 1;
         }
 
       if (!regex_compile (dc, p, len, dc->pcount, lineno, syntax_bits,
@@ -339,13 +344,56 @@ GEAcompile (char *pattern, idx_t size, reg_syntax_t syntax_bits,
             abort ();
         }
 
-      if (buf != pattern)
+      if (bufalloc != 0)
         free (buf);
     }
 
   free (motif);
 
   return dc;
+}
+
+static char *
+safe_dfaexec (struct dfa *d, char const *begin, char *end,
+              char const *buflim, idx_t *count, bool *backref)
+{
+  if (end < buflim)
+    return dfaexec (d, begin, end, 0, count, backref);
+
+  idx_t len = end - begin;
+  char stackbuf[4096];
+
+  if (len >= sizeof stackbuf && end > begin + 1)
+    {
+      char *prev_nl = memrchr (begin, eolbyte, (end - 1) - begin);
+      if (prev_nl)
+        {
+          char *split = prev_nl + 1;
+          /* split < buflim is strictly inside this worker's chunk, so dfaexec can safely write *split = eol */
+          char *r1 = dfaexec (d, begin, split, 0, count, backref);
+          if (r1 && r1 < split)
+            return r1;
+          begin = split;
+          len = end - begin;
+        }
+    }
+
+  char *copy = (len < sizeof stackbuf) ? stackbuf : xmalloc (len + 1);
+  memcpy (copy, begin, len);
+  copy[len] = eolbyte;
+
+  char *res = dfaexec (d, copy, copy + len, 0, count, backref);
+  char *ret;
+  if (!res)
+    ret = nullptr;
+  else if (res == copy + len)
+    ret = end;
+  else
+    ret = (char *) begin + (res - copy);
+
+  if (copy != stackbuf)
+    free (copy);
+  return ret;
 }
 
 ptrdiff_t
@@ -437,8 +485,8 @@ EGexecute (void *vdc, char const *buf, idx_t size, idx_t *match_size,
               /* Keep using the superset while it reports multiline
                  potential matches; this is more likely to be fast
                  than falling back to KWset would be.  */
-              next_beg = dfaexec (superset, dfa_beg, (char *) end, 0,
-                                  &count, nullptr);
+              next_beg = safe_dfaexec (superset, dfa_beg, (char *) end,
+                                       buflim, &count, nullptr);
               if (!next_beg || next_beg == end)
                 continue;
 
@@ -456,8 +504,8 @@ EGexecute (void *vdc, char const *buf, idx_t size, idx_t *match_size,
             }
 
           /* Try matching with DFA.  */
-          next_beg = dfaexec (dc->dfa, dfa_beg, (char *) end, 0, &count,
-                              &backref);
+          next_beg = safe_dfaexec (dc->dfa, dfa_beg, (char *) end, buflim,
+                                   &count, &backref);
 
           /* If there's no match, or if we've matched the sentinel,
              we're done.  */
@@ -596,4 +644,31 @@ EGexecute (void *vdc, char const *buf, idx_t size, idx_t *match_size,
  success_in_len:;
   *match_size = len;
   return beg - buf;
+}
+
+void
+EGfree (void *vdc)
+{
+  if (!vdc)
+    return;
+  struct dfa_comp *dc = vdc;
+  if (dc->dfa)
+    {
+      dfafree (dc->dfa);
+      free (dc->dfa);
+    }
+  if (dc->kwset)
+    kwsfree (dc->kwset);
+  if (dc->patterns_alloc)
+    {
+      for (idx_t i = 0; i < dc->pcount; i++)
+        {
+          regfree (&dc->patterns[i]);
+          free (dc->patterns[i].fastmap);
+        }
+      free (dc->patterns_alloc);
+    }
+  free (dc->regs.start);
+  free (dc->regs.end);
+  free (dc);
 }

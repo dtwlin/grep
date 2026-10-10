@@ -52,17 +52,24 @@ extern idx_t wordchar_prev (char const *, char const *, char const *)
 extern ptrdiff_t mb_goback (char const **, idx_t *, char const *, char const *);
 
 /* dfasearch.c */
+extern _Thread_local bool suppress_dfawarn;
 extern void *GEAcompile (char *, idx_t, reg_syntax_t, bool);
 extern ptrdiff_t EGexecute (void *, char const *, idx_t, idx_t *, char const *);
+extern void EGfree (void *);
 
 /* kwsearch.c */
 extern void *Fcompile (char *, idx_t, reg_syntax_t, bool);
 extern ptrdiff_t Fexecute (void *, char const *, idx_t, idx_t *, char const *);
+extern void Ffree (void *);
 
 /* pcresearch.c */
 extern void *Pcompile (char *, idx_t, reg_syntax_t, bool);
 extern ptrdiff_t Pexecute (void *, char const *, idx_t, idx_t *, char const *);
 extern void Pprint_version (void);
+#if HAVE_LIBPCRE
+extern void *Pclone (void const *);
+extern void Pfree (void *);
+#endif
 
 /* grep.c */
 extern struct localeinfo localeinfo;

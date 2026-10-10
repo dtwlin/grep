@@ -16,10 +16,10 @@
 
 LN = ln
 
-AM_CFLAGS = $(WARN_CFLAGS) $(WERROR_CFLAGS) $(PCRE_CFLAGS)
+AM_CFLAGS = $(WARN_CFLAGS) $(WERROR_CFLAGS) $(PCRE_CFLAGS) -pthread
 
 # Tell the linker to omit references to unused shared libraries.
-AM_LDFLAGS = $(IGNORE_UNUSED_LIBRARIES_CFLAGS)
+AM_LDFLAGS = $(IGNORE_UNUSED_LIBRARIES_CFLAGS) -pthread
 
 bin_PROGRAMS = grep
 bin_SCRIPTS = egrep fgrep
