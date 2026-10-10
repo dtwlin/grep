@@ -65,6 +65,10 @@ struct pcre_comp
   /* Table, indexed by ! (flag & PCRE2_NOTBOL), of whether the empty
      string matches when that flag is used.  */
   int empty_match[2];
+
+  /* Required literal substring pre-filter (AVX2-accelerated via kwset). */
+  kwset_t must_kwset;
+  bool is_clone;
 };
 
 /* Memory allocation functions for PCRE.  */
@@ -142,6 +146,119 @@ static bool
 bad_utf8_from_pcre2 (int e)
 {
   return PCRE2_ERROR_UTF8_ERR21 <= e && e <= PCRE2_ERROR_UTF8_ERR1;
+}
+
+static inline bool
+is_lit_char (char c)
+{
+  return ((c >= 'a' && c <= 'z') ||
+          (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') ||
+          c == '_' || c == '-' || c == '/' || c == ':' ||
+          c == '=' || c == '@' || c == '%' || c == '#' || c == '~');
+}
+
+/* Extract the longest contiguous literal ASCII substring (>= 2 chars)
+   that is unconditionally required by the PCRE pattern. */
+static char *
+find_must_literal (char const *pat, idx_t size, idx_t *out_len)
+{
+  if (memchr (pat, '|', size))
+    return nullptr;
+
+  char const *best_str = nullptr;
+  idx_t best_len = 0;
+  idx_t p = 0;
+
+  while (p < size)
+    {
+      if (pat[p] == '(')
+        {
+          int depth = 1;
+          p++;
+          while (p < size && depth > 0)
+            {
+              if (pat[p] == '\\' && p + 1 < size)
+                p += 2;
+              else if (pat[p] == '(')
+                {
+                  depth++;
+                  p++;
+                }
+              else if (pat[p] == ')')
+                {
+                  depth--;
+                  p++;
+                }
+              else
+                p++;
+            }
+          while (p < size && (pat[p] == '*' || pat[p] == '?'))
+            p++;
+          continue;
+        }
+
+      if (pat[p] == '[')
+        {
+          p++;
+          if (p < size && pat[p] == ']')
+            p++;
+          while (p < size && pat[p] != ']')
+            {
+              if (pat[p] == '\\' && p + 1 < size)
+                p += 2;
+              else
+                p++;
+            }
+          if (p < size && pat[p] == ']')
+            p++;
+          while (p < size && (pat[p] == '*' || pat[p] == '?'))
+            p++;
+          continue;
+        }
+
+      if (pat[p] == '\\')
+        {
+          p += (p + 1 < size) ? 2 : 1;
+          continue;
+        }
+
+      if (!is_lit_char (pat[p]))
+        {
+          p++;
+          continue;
+        }
+
+      idx_t run_start = p;
+      while (p < size && is_lit_char (pat[p]))
+        {
+          if (p + 1 < size && (pat[p + 1] == '*' || pat[p + 1] == '?'))
+            break;
+          p++;
+        }
+
+      idx_t run_len = p - run_start;
+      if (run_len >= 2 && run_len > best_len)
+        {
+          best_len = run_len;
+          best_str = pat + run_start;
+        }
+
+      if (p < size && is_lit_char (pat[p]) && p + 1 < size &&
+          (pat[p + 1] == '*' || pat[p + 1] == '?'))
+        p += 2;
+    }
+
+  if (best_len >= 2)
+    {
+      *out_len = best_len;
+      char *res = ximalloc (best_len + 1);
+      memcpy (res, best_str, best_len);
+      res[best_len] = '\0';
+      return res;
+    }
+
+  return nullptr;
 }
 
 /* Compile the -P style PATTERN, containing SIZE bytes that are
@@ -257,6 +374,22 @@ Pcompile (char *pattern, idx_t size, reg_syntax_t ignored, bool exact)
   pc->empty_match[false] = jit_exec (pc, "", 0, 0, PCRE2_NOTBOL);
   pc->empty_match[true] = jit_exec (pc, "", 0, 0, 0);
 
+  pc->must_kwset = nullptr;
+  pc->is_clone = false;
+  if (!match_lines && !match_words && (!match_icase || MB_CUR_MAX == 1))
+    {
+      idx_t lit_len = 0;
+      char *lit = find_must_literal (pattern, size, &lit_len);
+      if (lit)
+        {
+          kwset_t kws = kwsinit (false);
+          kwsincr (kws, lit, lit_len);
+          kwsprep (kws);
+          pc->must_kwset = kws;
+          free (lit);
+        }
+    }
+
   return pc;
 }
 
@@ -278,6 +411,9 @@ Pclone (void const *vcp)
   pc->jit_stack = pcre2_jit_stack_create (64 << 10, pc->jit_stack_size, pc->gcontext);
   if (pc->jit_stack && pc->mcontext)
     pcre2_jit_stack_assign (pc->mcontext, nullptr, pc->jit_stack);
+
+  pc->must_kwset = orig->must_kwset;
+  pc->is_clone = true;
 
   return pc;
 }
@@ -301,6 +437,22 @@ Pexecute (void *vcp, char const *buf, idx_t size, idx_t *match_size,
 
   do
     {
+      /* Fast pre-filter: if pc->must_kwset is active and we are at line start,
+         use AVX2 kwsexec to skip lines that cannot match! */
+      if (pc->must_kwset && !start_ptr && p == line_start)
+        {
+          struct kwsmatch kwsm;
+          ptrdiff_t off = kwsexec (pc->must_kwset, p, (buf + size) - p, &kwsm, true);
+          if (off < 0)
+            break;
+
+          char const *hit = p + off;
+          char const *prev_nl = memrchr (p, eolbyte, hit - p);
+          line_start = prev_nl ? prev_nl + 1 : p;
+          p = subject = line_start;
+          bol = true;
+        }
+
       /* Search line by line.  Although this formerly used something like
          PCRE2_MULTILINE for performance, the performance wasn't always
          better and the correctness issues were too puzzling.  See
@@ -456,5 +608,7 @@ Pfree (void *vpc)
     pcre2_match_context_free (pc->mcontext);
   if (pc->gcontext)
     pcre2_general_context_free (pc->gcontext);
+  if (!pc->is_clone && pc->must_kwset)
+    kwsfree (pc->must_kwset);
   free (pc);
 }
