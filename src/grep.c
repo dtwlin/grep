@@ -85,7 +85,7 @@ static bool only_matching;
 static bool align_tabs;
 
 /* Print width of line numbers and byte offsets.  Nonzero if ALIGN_TABS.  */
-static int offset_width;
+static _Thread_local int offset_width;
 
 /* An entry in the PATLOC array saying where patterns came from.  */
 struct patloc
@@ -230,8 +230,8 @@ pattern_file_name (idx_t lineno, idx_t *new_lineno)
 #if HAVE_ASAN
 /* Record the starting address and length of the sole poisoned region,
    so that we can unpoison it later, just before each following read.  */
-static void const *poison_buf;
-static idx_t poison_len;
+static _Thread_local void const *poison_buf;
+static _Thread_local idx_t poison_len;
 
 static void
 clear_asan_poison (void)
@@ -371,18 +371,22 @@ static const char *context_line_color  = "";	/* default color pair */
 static const char *sgr_start = "\33[%sm\33[K";
 static const char *sgr_end   = "\33[m\33[K";
 
+static void putchar_errno (int c);
+static void fputs_errno (char const *s);
+static void printf_errno (char const *format, ...) _GL_ATTRIBUTE_FORMAT_PRINTF_STANDARD (1, 2);
+
 /* SGR utility functions.  */
 static void
 pr_sgr_start (char const *s)
 {
   if (*s)
-    print_start_colorize (sgr_start, s);
+    printf_errno (sgr_start, s);
 }
 static void
 pr_sgr_end (char const *s)
 {
   if (*s)
-    print_end_colorize (sgr_end);
+    fputs_errno (sgr_end);
 }
 static void
 pr_sgr_start_if (char const *s)
@@ -449,9 +453,108 @@ static const struct color_cap color_dict[] =
    with EACCES.  */
 static int stdout_errno;
 
+struct membuf
+{
+  char *data;
+  size_t len;
+  size_t cap;
+  bool is_mmap;
+};
+
+static _Thread_local bool buffering_enabled;
+static _Thread_local struct membuf tls_out;
+static _Thread_local struct membuf tls_err;
+static _Thread_local bool tls_errseen;
+
+static void
+membuf_init (struct membuf *mb, size_t initial_cap)
+{
+  void *ptr = mmap (NULL, initial_cap, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  if (ptr != MAP_FAILED)
+    {
+      mb->data = ptr;
+      mb->len = 0;
+      mb->cap = initial_cap;
+      mb->is_mmap = true;
+    }
+  else
+    {
+      mb->data = xmalloc (initial_cap);
+      mb->len = 0;
+      mb->cap = initial_cap;
+      mb->is_mmap = false;
+    }
+}
+
+static void
+membuf_reset (struct membuf *mb)
+{
+  mb->len = 0;
+}
+
+static void
+membuf_append (struct membuf *mb, void const *src, size_t n)
+{
+  if (n == 0)
+    return;
+  if (mb->len + n > mb->cap)
+    {
+      size_t new_cap = MAX (mb->cap * 2, mb->len + n + 65536);
+      char *new_data;
+      if (mb->is_mmap)
+        {
+#if defined MREMAP_MAYMOVE
+          new_data = mremap (mb->data, mb->cap, new_cap, MREMAP_MAYMOVE);
+          if (new_data == MAP_FAILED)
+            {
+              new_data = xmalloc (new_cap);
+              memcpy (new_data, mb->data, mb->len);
+              munmap (mb->data, mb->cap);
+              mb->is_mmap = false;
+            }
+#else
+          new_data = xmalloc (new_cap);
+          memcpy (new_data, mb->data, mb->len);
+          munmap (mb->data, mb->cap);
+          mb->is_mmap = false;
+#endif
+        }
+      else
+        {
+          new_data = xrealloc (mb->data, new_cap);
+        }
+      mb->data = new_data;
+      mb->cap = new_cap;
+    }
+  memcpy (mb->data + mb->len, src, n);
+  mb->len += n;
+}
+
+static void
+membuf_free (struct membuf *mb)
+{
+  if (mb->data)
+    {
+      if (mb->is_mmap)
+        munmap (mb->data, mb->cap);
+      else
+        free (mb->data);
+      mb->data = nullptr;
+      mb->len = mb->cap = 0;
+      mb->is_mmap = false;
+    }
+}
+
 static void
 putchar_errno (int c)
 {
+  if (buffering_enabled)
+    {
+      char ch = (char) c;
+      membuf_append (&tls_out, &ch, 1);
+      return;
+    }
   if (putchar (c) < 0)
     stdout_errno = errno;
 }
@@ -459,6 +562,11 @@ putchar_errno (int c)
 static void
 fputs_errno (char const *s)
 {
+  if (buffering_enabled)
+    {
+      membuf_append (&tls_out, s, strlen (s));
+      return;
+    }
   if (fputs (s, stdout) < 0)
     stdout_errno = errno;
 }
@@ -468,14 +576,43 @@ printf_errno (char const *format, ...)
 {
   va_list ap;
   va_start (ap, format);
-  if (vfprintf (stdout, format, ap) < 0)
-    stdout_errno = errno;
+  if (buffering_enabled)
+    {
+      char buf[512];
+      va_list ap2;
+      va_copy (ap2, ap);
+      int n = vsnprintf (buf, sizeof buf, format, ap);
+      if (n >= 0 && (size_t) n < sizeof buf)
+        {
+          membuf_append (&tls_out, buf, n);
+        }
+      else if (n >= 0)
+        {
+          char *dyn = xmalloc (n + 1);
+          vsnprintf (dyn, n + 1, format, ap2);
+          membuf_append (&tls_out, dyn, n);
+          free (dyn);
+        }
+      va_end (ap2);
+    }
+  else
+    {
+      if (vfprintf (stdout, format, ap) < 0)
+        stdout_errno = errno;
+    }
   va_end (ap);
 }
 
 static void
 fwrite_errno (void const *ptr, idx_t size, idx_t nmemb)
 {
+  if (buffering_enabled)
+    {
+      size_t total;
+      if (!ckd_mul (&total, size, nmemb) && total > 0)
+        membuf_append (&tls_out, ptr, total);
+      return;
+    }
   if (fwrite (ptr, size, nmemb, stdout) != nmemb)
     stdout_errno = errno;
 }
@@ -483,9 +620,41 @@ fwrite_errno (void const *ptr, idx_t size, idx_t nmemb)
 static void
 fflush_errno (void)
 {
+  if (buffering_enabled)
+    return;
   if (fflush (stdout) != 0)
     stdout_errno = errno;
 }
+
+static void _GL_ATTRIBUTE_FORMAT_PRINTF_STANDARD (2, 3)
+task_error_buffered (int errnum, char const *fmt, ...)
+{
+  char msg[1024];
+  va_list ap;
+  va_start (ap, fmt);
+  vsnprintf (msg, sizeof msg, fmt, ap);
+  va_end (ap);
+
+  char errbuf[2048];
+  int len;
+  if (errnum)
+    len = snprintf (errbuf, sizeof errbuf, "%s: %s: %s\n",
+                    getprogname (), msg, strerror (errnum));
+  else
+    len = snprintf (errbuf, sizeof errbuf, "%s: %s\n",
+                    getprogname (), msg);
+
+  if (len > 0)
+    membuf_append (&tls_err, errbuf, len);
+}
+
+#define task_error(errnum, ...) \
+  do { \
+    if (buffering_enabled) \
+      task_error_buffered ((errnum), __VA_ARGS__); \
+    else \
+      error (0, (errnum), __VA_ARGS__); \
+  } while (0)
 
 static struct exclude *excluded_patterns[2];
 static struct exclude *excluded_directory_patterns[2];
@@ -572,14 +741,14 @@ char eolbyte;
 
 /* For error messages. */
 /* The input file name, or (if standard input) null or a --label argument.  */
-static char const *filename;
+static _Thread_local char const *filename;
 /* Omit leading "./" from file names in diagnostics.  */
 static bool omit_dot_slash;
 static bool errseen;
 
 /* True if output from the current input file has been suppressed
    because an output line had an encoding error.  */
-static bool encoding_error_output;
+static _Thread_local bool encoding_error_output;
 
 enum directories_type
   {
@@ -646,15 +815,21 @@ enum { SEEK_HOLE = SEEK_SET };
 #endif
 
 /* True if lseek with SEEK_CUR or SEEK_DATA failed on the current input.  */
-static bool seek_failed;
-static bool seek_data_failed;
+static _Thread_local bool seek_failed;
+static _Thread_local bool seek_data_failed;
 
 /* Functions we'll use to search. */
 typedef void *(*compile_fp_t) (char *, idx_t, reg_syntax_t, bool);
 typedef ptrdiff_t (*execute_fp_t) (void *, char const *, idx_t, idx_t *,
                                    char const *);
 static execute_fp_t execute;
-static void *compiled_pattern;
+static _Thread_local void *compiled_pattern;
+static void *primary_compiled_pattern;
+static char *raw_keys;
+static idx_t raw_keycc;
+static reg_syntax_t raw_matcher_syntax;
+static int raw_matcher_index;
+static bool raw_exact;
 
 char const *
 input_filename (void)
@@ -669,8 +844,11 @@ static void
 suppressible_error (int errnum)
 {
   if (! suppress_errors)
-    error (0, errnum, "%s", input_filename ());
-  errseen = true;
+    task_error (errnum, "%s", input_filename ());
+  if (buffering_enabled)
+    tls_errseen = true;
+  else
+    errseen = true;
 }
 
 /* If there has already been a write error, don't bother closing
@@ -786,7 +964,7 @@ buf_has_encoding_errors (char *buf, idx_t size)
 /* Return true if BUF, of size SIZE, has a null byte.
    BUF must be followed by at least one byte,
    which may be arbitrarily written to or read from.  */
-static bool _GL_ATTRIBUTE_PURE
+static bool
 buf_has_nulls (char *buf, idx_t size)
 {
   buf[size] = 0;
@@ -886,7 +1064,7 @@ static _Thread_local off_t bufoffset;		/* Read offset.  */
 static _Thread_local off_t after_last_match;	/* Pointer after last matching line that
                                    would have been output if we were
                                    outputting characters. */
-static _Thread_local bool skip_nuls;		/* Skip ' ' in data.  */
+static _Thread_local bool skip_nuls;		/* Skip '\0' in data.  */
 static bool skip_empty_lines;	/* Skip empty lines in data.  */
 static _Thread_local intmax_t totalnl;	/* Total newline count before lastnl. */
 static _Thread_local bool buffer_is_mmap;
@@ -983,8 +1161,8 @@ all_zeros (char const *buf, idx_t size)
       __m256i v3 = _mm256_loadu_si256 ((__m256i const *) (void const *) (p + 96));
       __m256i or01 = _mm256_or_si256 (v0, v1);
       __m256i or23 = _mm256_or_si256 (v2, v3);
-      __m256i orall = _mm256_or_si256 (or01, or23);
-      if (!_mm256_testz_si256 (orall, orall))
+      __m256i combined = _mm256_or_si256 (or01, or23);
+      if (!_mm256_testz_si256 (combined, combined))
         return false;
       p += 128;
     }
@@ -999,7 +1177,7 @@ all_zeros (char const *buf, idx_t size)
 
   while (p < lim)
     {
-      if (*p != 0)
+      if (*p)
         return false;
       p++;
     }
@@ -1177,7 +1355,8 @@ static enum
 static int out_file;
 
 static int filename_mask;	/* If zero, output nulls after filenames.  */
-static bool out_quiet;		/* Suppress all normal output. */
+static _Thread_local bool out_quiet;	/* Suppress all normal output. */
+static bool initial_out_quiet;
 static bool out_invert;		/* Print nonmatching stuff. */
 static bool out_line;		/* Print line numbers. */
 static bool out_byte;		/* Print byte offsets. */
@@ -1191,18 +1370,23 @@ static char *label;		/* Fake filename for stdin */
 
 
 /* Internal variables to keep track of byte count, context, etc. */
-static intmax_t totalcc;	/* Total character count before bufbeg. */
-static char const *lastnl;	/* Pointer after last newline counted. */
-static char *lastout;		/* Pointer after last character output;
+static _Thread_local intmax_t totalcc;	/* Total character count before bufbeg. */
+static _Thread_local char const *lastnl;	/* Pointer after last newline counted. */
+static _Thread_local char *lastout;		/* Pointer after last character output;
                                    null if no character has been output
                                    or if it's conceptually before bufbeg. */
-static intmax_t outleft;	/* Maximum number of selected lines.  */
-static intmax_t pending;	/* Pending lines of output.
+static _Thread_local intmax_t outleft;	/* Maximum number of selected lines.  */
+static _Thread_local intmax_t pending;	/* Pending lines of output.
                                    Always kept 0 if out_quiet is true.  */
-static bool done_on_match;	/* Stop scanning file on first match.  */
+static _Thread_local bool done_on_match;	/* Stop scanning file on first match.  */
+static bool initial_done_on_match;
 static bool exit_on_match;	/* Exit on first match.  */
 static bool dev_null_output;	/* Stdout is known to be /dev/null.  */
 static bool binary;		/* Use binary rather than text I/O.  */
+
+static bool global_used;
+static _Thread_local bool file_used;
+static _Thread_local bool task_had_prtext;
 
 static idx_t _GL_ATTRIBUTE_PURE
 count_newlines (char const *beg, char const *lim)
@@ -1504,7 +1688,6 @@ prpending (char const *lim)
 static void
 prtext (char *beg, char *lim)
 {
-  static bool used;	/* Avoid printing SEP_STR_GROUP before any output.  */
   char eol = eolbyte;
 
   if (!out_quiet && pending > 0)
@@ -1525,7 +1708,8 @@ prtext (char *beg, char *lim)
 
       /* Print the group separator unless the output is adjacent to
          the previous output in the file.  */
-      if ((0 <= out_before || 0 <= out_after) && used
+      bool is_used = buffering_enabled ? file_used : (file_used || global_used);
+      if ((0 <= out_before || 0 <= out_after) && is_used
           && p != lastout && group_separator)
         {
           pr_sgr_start_if (sep_color);
@@ -1567,7 +1751,10 @@ prtext (char *beg, char *lim)
 
   after_last_match = bufoffset - (buflim - p);
   pending = out_quiet ? 0 : MAX (0, out_after);
-  used = true;
+  file_used = true;
+  if (!buffering_enabled)
+    global_used = true;
+  task_had_prtext = true;
   outleft -= n;
 }
 
@@ -1629,8 +1816,12 @@ grepbuf (char *beg, char const *lim)
             {
               if (exit_on_match)
                 {
-                  stdout_errno = -1;
-                  exit (EXIT_SUCCESS);
+                  if (!buffering_enabled)
+                    {
+                      stdout_errno = -1;
+                      exit (EXIT_SUCCESS);
+                    }
+                  break;
                 }
               break;
             }
@@ -1786,7 +1977,7 @@ grep (int fd, struct stat const *st, bool *ineof)
   if (binary_files == BINARY_BINARY_FILES && !out_quiet
       && (encoding_error_output
           || (0 <= nlines_first_null && nlines_first_null < nlines)))
-    error (0, 0, _("%s: binary file matches"), input_filename ());
+    task_error (0, _("%s: binary file matches"), input_filename ());
   return nlines;
 }
 
@@ -1824,7 +2015,7 @@ grepdirent (FTS *fts, FTSENT *ent, bool command_line)
 
     case FTS_DC:
       if (!suppress_errors)
-        error (0, 0, _("%s: warning: recursive directory loop"), filename);
+        task_error (0, _("%s: warning: recursive directory loop"), filename);
       return true;
 
     case FTS_DNR:
@@ -2044,8 +2235,11 @@ grepdesc (int desc, bool command_line)
       && S_ISREG (st.st_mode) && SAME_INODE (st, out_stat))
     {
       if (! suppress_errors)
-        error (0, 0, _("%s: input file is also the output"), input_filename ());
-      errseen = true;
+        task_error (0, _("%s: input file is also the output"), input_filename ());
+      if (buffering_enabled)
+        tls_errseen = true;
+      else
+        errseen = true;
       goto closeout;
     }
 
@@ -2229,6 +2423,49 @@ static struct
 };
 /* Keep these in sync with the 'matchers' table.  */
 enum { E_MATCHER_INDEX = 1, F_MATCHER_INDEX = 2, G_MATCHER_INDEX = 0 };
+
+/* Clone a compiled pattern instance for a worker thread.  */
+void *
+clone_compiled_pattern (void)
+{
+#if HAVE_LIBPCRE
+  if (matchers[raw_matcher_index].compile == Pcompile)
+    return Pclone (primary_compiled_pattern);
+#endif
+
+  static pthread_mutex_t compile_mutex = PTHREAD_MUTEX_INITIALIZER;
+  pthread_mutex_lock (&compile_mutex);
+  suppress_dfawarn = true;
+  char *keys_copy = ximalloc (raw_keycc + 2);
+  memcpy (keys_copy, raw_keys, raw_keycc);
+  keys_copy[raw_keycc] = '\n';
+  keys_copy[raw_keycc + 1] = '\0';
+  void *pat = matchers[raw_matcher_index].compile (keys_copy, raw_keycc,
+                                                   raw_matcher_syntax,
+                                                   raw_exact);
+  free (keys_copy);
+  suppress_dfawarn = false;
+  pthread_mutex_unlock (&compile_mutex);
+  return pat;
+}
+
+static void
+free_compiled_pattern (void *pat)
+{
+  if (!pat)
+    return;
+#if HAVE_LIBPCRE
+  if (matchers[raw_matcher_index].compile == Pcompile)
+    {
+      Pfree (pat);
+      return;
+    }
+#endif
+  if (matchers[raw_matcher_index].compile == Fcompile)
+    Ffree (pat);
+  else
+    EGfree (pat);
+}
 
 /* Return the index of the matcher corresponding to M if available.
    MATCHER is the index of the previous matcher, or -1 if none.
@@ -3109,10 +3346,20 @@ main (int argc, char **argv)
         matcher = try_fgrep_pattern (matcher, keys, &keycc);
     }
 
+  raw_keys = ximalloc (keycc + 2);
+  memcpy (raw_keys, keys, keycc);
+  raw_keys[keycc] = '\n';
+  raw_keys[keycc + 1] = '\0';
+  raw_keycc = keycc;
+  raw_matcher_syntax = matchers[matcher].syntax;
+  raw_matcher_index = matcher;
+  raw_exact = only_matching | color_option;
+
   execute = matchers[matcher].execute;
   compiled_pattern =
     matchers[matcher].compile (keys, keycc, matchers[matcher].syntax,
                                only_matching | color_option);
+  primary_compiled_pattern = compiled_pattern;
   /* We need one byte prior and one after.  */
   char eolbytes[3] = { 0, eolbyte, 0 };
   idx_t match_size;
@@ -3141,6 +3388,9 @@ main (int argc, char **argv)
   if (fts_options & FTS_LOGICAL && devices == READ_COMMAND_LINE_DEVICES)
     devices = READ_DEVICES;
 
+  initial_out_quiet = out_quiet;
+  initial_done_on_match = done_on_match;
+
   char *const *files;
   if (0 < num_operands)
     {
@@ -3163,6 +3413,10 @@ main (int argc, char **argv)
     status &= grep_command_line_arg (*files++);
   while (*files);
 
+  membuf_init (&tls_out, 1024);
+  membuf_reset (&tls_out);
+  membuf_free (&tls_out);
+  free_compiled_pattern (compiled_pattern);
   free_worker_buffer ();
   return errseen ? EXIT_TROUBLE : status;
 }

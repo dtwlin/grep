@@ -74,6 +74,7 @@ extern void Pfree (void *);
 /* grep.c */
 extern struct localeinfo localeinfo;
 extern void fgrep_to_grep_pattern (char **, idx_t *);
+extern void *clone_compiled_pattern (void);
 
 /* Return the number of bytes in the character at the start of S, which
    is of size N.  N must be positive.  MBS is the conversion state.
