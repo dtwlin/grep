@@ -199,6 +199,23 @@ def run_edge_case_conformance():
     checks.append(("RLIMIT_AS 512MB slab fallback", ["-F", "ULTRA_RARE_TOKEN_9941", SINGLE_FILE], None, limit_vmem))
     checks.append(("RLIMIT_AS 512MB recursive tree", ["-r", "-n", "FATAL", f"{TREE_DIR}/dir_000"], None, limit_vmem))
 
+    # 9. Invert match with line numbers on 2GB file (Item 4)
+    checks.append(("Invert match lineno 2GB -m 1000", ["-v", "-n", "-m", "1000", "INFO", SINGLE_FILE], None, None))
+
+    # 10. PCRE case-insensitive and quantifiers (Item 3)
+    checks.append(("PCRE -Pi case-insensitive", ["-P", "-i", "user=admin_[0-9]+", test_file], None, None))
+    checks.append(("PCRE (?i) inline flag", ["-P", "(?i)user=admin_[0-9]+", test_file], None, None))
+    checks.append(("PCRE quantifier {0,3}", ["-P", "admin_[0-9]{1,3}", test_file], None, None))
+    checks.append(("PCRE group quantifier", ["-P", "(?:foo|bar){1,2}_[0-9]+", test_file], None, None))
+
+    # 11. Initial tab alignment (Item 6)
+    checks.append(("Initial tab align -T -n -b", ["-T", "-n", "-b", "ULTRA_RARE_TOKEN_9941", SINGLE_FILE], None, None))
+    checks.append(("Initial tab align tree", ["-T", "-n", "-b", "-r", "FATAL", f"{TREE_DIR}/dir_000"], None, None))
+
+    # 12. Dense context matches > 70,000 lines (Item 5)
+    checks.append(("Dense context match -C 1 75k", ["-C", "1", "-m", "75000", "INFO", SINGLE_FILE], None, None))
+    checks.append(("Dense context match -C 1 15k", ["-C", "1", "ERROR_[0-9]{4}_HANDLER", SINGLE_FILE], None, None))
+
     passed = 0
     total = len(checks)
     for name, args, env_vars, preexec in checks:
