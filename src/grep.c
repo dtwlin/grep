@@ -2834,8 +2834,6 @@ try_fgrep_pattern (int matcher, char *keys, idx_t *len_p)
   return result;
 }
 
-
-
 /* Number of threads to use.  */
 static int
 get_num_threads (void)
@@ -2949,6 +2947,46 @@ struct work_task
   void *shared_state;
 };
 
+struct match_record
+{
+  size_t chunk_idx;
+  char const *line_beg;
+  char const *line_end;
+  intmax_t rel_nl;
+  intmax_t lineno;
+};
+
+struct chunk_file_state
+{
+  char *base_addr;
+  size_t base_size;
+  char *mmap_data;
+  size_t mmap_size;
+  int file_desc;
+  bool close_fd;
+  char const *fname;
+  bool fname_allocated;
+  size_t num_chunks;
+  size_t *bounds;
+
+  _Atomic size_t chunks_completed;
+  _Atomic intmax_t total_count;
+  _Atomic bool has_match;
+  _Atomic bool early_stop;
+
+  pthread_mutex_t done_mutex;
+  pthread_cond_t done_cv;
+
+  intmax_t *chunk_nls;
+  intmax_t *prefix_nls;
+  bool *chunk_has_matches;
+
+  pthread_mutex_t match_mutex;
+  struct match_record *matches;
+  size_t match_count;
+  size_t match_cap;
+};
+
 enum { WORK_QUEUE_CAP = 256 };
 enum { ROB_CAP = 1024 };
 
@@ -2970,11 +3008,43 @@ static pthread_cond_t rob_done_cv = PTHREAD_COND_INITIALIZER;
 static size_t rob_space_waiters = 0;
 static size_t rob_done_waiters = 0;
 
+enum { SLICE_BUF_SIZE = 4 * 1024 * 1024 };
+static char *slice_freelist[64];
+static int slice_freelist_cnt = 0;
+
+static char *
+alloc_slice_buf_locked (void)
+{
+  if (slice_freelist_cnt > 0)
+    return slice_freelist[--slice_freelist_cnt];
+  return xmalloc (SLICE_BUF_SIZE + 2 + uword_size);
+}
+
+static void
+free_slice_buf_locked (char *ptr)
+{
+  if (slice_freelist_cnt < 64)
+    slice_freelist[slice_freelist_cnt++] = ptr;
+  else
+    free (ptr);
+}
+
+static void
+cleanup_slice_freelist (void)
+{
+  for (int i = 0; i < slice_freelist_cnt; ++i)
+    free (slice_freelist[i]);
+  slice_freelist_cnt = 0;
+}
+
 static int pool_nthreads;
 static pthread_t *pool_threads;
 static bool overall_status = true;
 static bool pool_terminate;
 
+static intmax_t chunk_accumulated_count = 0;
+static bool chunk_has_any_match = false;
+static intmax_t stream_commit_totalnl = 0;
 
 static void
 rob_try_commit_locked (void)
@@ -3003,6 +3073,111 @@ rob_try_commit_locked (void)
               putchar_errno ('\n');
             }
           global_used = true;
+        }
+
+      if (slot->is_stream_chunk)
+        {
+          if (slot->stream_chunk_data != nullptr)
+            {
+              char const *saved_filename = filename;
+              char *saved_bufbeg = bufbeg;
+              char *saved_buflim = buflim;
+              off_t saved_totalcc = totalcc;
+              intmax_t saved_totalnl = totalnl;
+              char const *saved_lastnl = lastnl;
+              char *saved_lastout = lastout;
+              intmax_t saved_outleft = outleft;
+              idx_t saved_pending = pending;
+              bool saved_buffering_enabled = buffering_enabled;
+
+              buffering_enabled = false;
+              filename = label;
+              bufbeg = slot->stream_chunk_data;
+              buflim = bufbeg + slot->stream_chunk_len;
+              totalcc = slot->stream_totalcc;
+              totalnl = stream_commit_totalnl + slot->stream_first_rel_nl;
+              lastnl = slot->stream_first_lbeg;
+              lastout = nullptr;
+              outleft = max_count;
+              pending = 0;
+
+              intmax_t mcnt = grepbuf (slot->stream_first_lbeg, buflim);
+              slot->status = (mcnt == 0);
+              if (mcnt > 0)
+                slot->had_prtext = true;
+
+              filename = saved_filename;
+              bufbeg = saved_bufbeg;
+              buflim = saved_buflim;
+              totalcc = saved_totalcc;
+              totalnl = saved_totalnl;
+              lastnl = saved_lastnl;
+              lastout = saved_lastout;
+              outleft = saved_outleft;
+              pending = saved_pending;
+              buffering_enabled = saved_buffering_enabled;
+
+              free_slice_buf_locked (slot->stream_chunk_alloc);
+              slot->stream_chunk_alloc = nullptr;
+              slot->stream_chunk_data = nullptr;
+            }
+          stream_commit_totalnl += slot->chunk_nls;
+          slot->is_stream_chunk = false;
+          slot->chunk_nls = 0;
+        }
+
+      if (slot->is_chunk)
+        {
+          chunk_accumulated_count += slot->chunk_count;
+          if (slot->chunk_count > 0 || !slot->status)
+            chunk_has_any_match = true;
+
+          if (slot->is_last_chunk)
+            {
+              if (count_matches)
+                {
+                  if (out_file)
+                    {
+                      print_filename ();
+                      if (filename_mask)
+                        print_sep (SEP_CHAR_SELECTED);
+                      else
+                        putchar_errno (0);
+                    }
+                  printf_errno ("%" PRIdMAX "\n", chunk_accumulated_count);
+                  if (line_buffered)
+                    fflush_errno ();
+                }
+              else if (list_files == LISTFILES_MATCHING)
+                {
+                  if (chunk_has_any_match)
+                    {
+                      print_filename ();
+                      putchar_errno ('\n' & filename_mask);
+                      if (line_buffered)
+                        fflush_errno ();
+                    }
+                }
+              else if (list_files == LISTFILES_NONMATCHING)
+                {
+                  if (!chunk_has_any_match)
+                    {
+                      print_filename ();
+                      putchar_errno ('\n' & filename_mask);
+                      if (line_buffered)
+                        fflush_errno ();
+                    }
+                }
+
+              slot->status = !chunk_has_any_match;
+              chunk_accumulated_count = 0;
+              chunk_has_any_match = false;
+            }
+          else
+            {
+              if (count_matches || list_files != LISTFILES_NONE)
+                slot->status = true;
+            }
         }
 
       if (slot->stdout_len > 0)
@@ -3051,6 +3226,13 @@ rob_try_commit_locked (void)
           free (slot->filename);
           slot->filename = nullptr;
           filename = nullptr;
+        }
+
+      if (slot->stream_chunk_alloc)
+        {
+          free_slice_buf_locked (slot->stream_chunk_alloc);
+          slot->stream_chunk_alloc = nullptr;
+          slot->stream_chunk_data = nullptr;
         }
 
       slot->state = ROB_SLOT_EMPTY;
@@ -3128,6 +3310,78 @@ worker_thread_func (void *arg)
       if (task.type == TASK_TYPE_TERMINATE)
         break;
 
+      if (task.type == TASK_TYPE_MMAP_SCAN)
+        {
+          struct chunk_file_state *state = task.shared_state;
+          size_t idx = task.chunk_idx;
+          char const *cbeg = task.chunk_data;
+          char const *clim = task.chunk_data + task.chunk_len;
+
+          state->chunk_nls[idx] = count_newlines (cbeg, clim);
+
+          idx_t match_size;
+          ptrdiff_t off = execute (compiled_pattern, cbeg, clim - cbeg, &match_size, nullptr);
+          bool matched = (off >= 0);
+          if (!out_invert && off >= 0 && cbeg + off == clim)
+            matched = false;
+          state->chunk_has_matches[idx] = matched ^ out_invert;
+
+          if (out_before > 0 || out_after > 0)
+            {
+              char const *nl_cursor = cbeg;
+              idx_t running_nl = 0;
+              for (char const *p = cbeg; p < clim; )
+                {
+                  ptrdiff_t mo = execute (compiled_pattern, p, clim - p, &match_size, nullptr);
+                  if (mo < 0)
+                    {
+                      if (!out_invert) break;
+                      mo = clim - p;
+                      match_size = 0;
+                    }
+                  char const *b = p + mo;
+                  char const *endp = b + match_size;
+                  if (!out_invert && b == clim) break;
+                  if (!out_invert || p < b)
+                    {
+                      char const *mbeg = out_invert ? p : b;
+                      char const *lbeg = mbeg;
+                      while (lbeg > cbeg && lbeg[-1] != eolbyte) lbeg--;
+                      char const *lend = memchr (mbeg, eolbyte, clim - mbeg);
+                      lend = lend ? lend + 1 : clim;
+
+                      if (out_line)
+                        {
+                          running_nl += count_newlines (nl_cursor, lbeg);
+                          nl_cursor = lbeg;
+                        }
+
+                      pthread_mutex_lock (&state->match_mutex);
+                      if (state->match_count < state->match_cap)
+                        {
+                          state->matches[state->match_count].chunk_idx = idx;
+                          state->matches[state->match_count].line_beg = lbeg;
+                          state->matches[state->match_count].line_end = lend;
+                          state->matches[state->match_count].rel_nl = running_nl;
+                          state->match_count++;
+                        }
+                      pthread_mutex_unlock (&state->match_mutex);
+                    }
+                  p = endp;
+                }
+            }
+
+          if (atomic_fetch_add (&state->chunks_completed, 1) == state->num_chunks - 1)
+            {
+              pthread_mutex_lock (&state->done_mutex);
+              pthread_cond_signal (&state->done_cv);
+              pthread_mutex_unlock (&state->done_mutex);
+            }
+
+          pthread_mutex_lock (&pool_mutex);
+          continue;
+        }
+
       membuf_reset (&tls_out);
       membuf_reset (&tls_err);
       tls_errseen = false;
@@ -3142,6 +3396,7 @@ worker_thread_func (void *arg)
       task_had_prtext = false;
 
       bool status = true;
+      intmax_t chunk_matched_cnt = 0;
 
       if (task.type == TASK_TYPE_STDIN)
         {
@@ -3156,6 +3411,154 @@ worker_thread_func (void *arg)
           status = grepfile (AT_FDCWD, task.filename, task.follow, task.command_line);
           free (task.filename);
         }
+      else if (task.type == TASK_TYPE_STREAM_CHUNK)
+        {
+          filename = label;
+          bufbeg = (char *) task.chunk_data;
+          buflim = (char *) task.chunk_data + task.chunk_len;
+          totalcc = task.chunk_totalcc;
+          totalnl = task.chunk_lineno_offset;
+          lastnl = bufbeg;
+
+          if (out_line && !out_quiet && !task.is_binary_stream && !count_matches && list_files == LISTFILES_NONE)
+            {
+              intmax_t chunk_nls = count_newlines (bufbeg, buflim);
+              if (!out_invert)
+                {
+                  idx_t match_size;
+                  ptrdiff_t mo = execute (compiled_pattern, bufbeg, buflim - bufbeg, &match_size, nullptr);
+                  if (mo < 0 || bufbeg + mo == buflim)
+                    {
+                      pthread_mutex_lock (&pool_mutex);
+                      free_slice_buf_locked ((char *) (task.chunk_data - 1));
+                      struct rob_slot *slot = &rob[task.seq % ROB_CAP];
+                      slot->is_chunk = true;
+                      slot->is_last_chunk = task.is_last_chunk;
+                      slot->is_stream_chunk = true;
+                      slot->chunk_nls = chunk_nls;
+                      slot->stream_chunk_alloc = nullptr;
+                      slot->stream_chunk_data = nullptr;
+                      slot->status = true;
+                      slot->state = ROB_SLOT_DONE;
+                      rob_try_commit_locked ();
+                      continue;
+                    }
+                  else
+                    {
+                      char *lbeg = bufbeg;
+                      intmax_t first_rel_nl = 0;
+                      if (out_before < 0 && out_after < 0)
+                        {
+                          lbeg = bufbeg + mo;
+                          while (lbeg > bufbeg && lbeg[-1] != eolbyte)
+                            lbeg--;
+                          first_rel_nl = count_newlines (bufbeg, lbeg);
+                        }
+
+                      pthread_mutex_lock (&pool_mutex);
+                      struct rob_slot *slot = &rob[task.seq % ROB_CAP];
+                      slot->is_chunk = true;
+                      slot->is_last_chunk = task.is_last_chunk;
+                      slot->is_stream_chunk = true;
+                      slot->chunk_nls = chunk_nls;
+                      slot->stream_chunk_alloc = (char *) (task.chunk_data - 1);
+                      slot->stream_chunk_data = bufbeg;
+                      slot->stream_chunk_len = task.chunk_len;
+                      slot->stream_first_lbeg = lbeg;
+                      slot->stream_first_rel_nl = first_rel_nl;
+                      slot->stream_totalcc = task.chunk_totalcc;
+                      slot->status = false;
+                      slot->state = ROB_SLOT_DONE;
+                      rob_try_commit_locked ();
+                      continue;
+                    }
+                }
+              else
+                {
+                  char *lbeg = bufbeg;
+                  intmax_t first_rel_nl = 0;
+
+                  pthread_mutex_lock (&pool_mutex);
+                  struct rob_slot *slot = &rob[task.seq % ROB_CAP];
+                  slot->is_chunk = true;
+                  slot->is_last_chunk = task.is_last_chunk;
+                  slot->is_stream_chunk = true;
+                  slot->chunk_nls = chunk_nls;
+                  slot->stream_chunk_alloc = (char *) (task.chunk_data - 1);
+                  slot->stream_chunk_data = bufbeg;
+                  slot->stream_chunk_len = task.chunk_len;
+                  slot->stream_first_lbeg = lbeg;
+                  slot->stream_first_rel_nl = first_rel_nl;
+                  slot->stream_totalcc = task.chunk_totalcc;
+                  slot->status = false;
+                  slot->state = ROB_SLOT_DONE;
+                  rob_try_commit_locked ();
+                  continue;
+                }
+            }
+          else if (task.is_binary_stream)
+            {
+              out_quiet = true;
+              done_on_match = true;
+              intmax_t lines_matched = grepbuf (bufbeg, buflim);
+              if (lines_matched > 0)
+                {
+                  task_error (0, _("%s: binary file matches"),
+                              label ? label : _("(standard input)"));
+                  status = false;
+                }
+              else
+                status = true;
+            }
+          else if (count_matches)
+            {
+              out_quiet = true;
+              chunk_matched_cnt = grepbuf (bufbeg, buflim);
+              status = (chunk_matched_cnt == 0);
+            }
+          else
+            {
+              intmax_t lines_matched = grepbuf (bufbeg, buflim);
+              status = (lines_matched == 0);
+            }
+        }
+      else if (task.type == TASK_TYPE_CHUNK)
+        {
+          filename = task.filename;
+          bufbeg = (char *) task.chunk_data;
+          buflim = (char *) task.chunk_data + task.chunk_len;
+          totalcc = task.chunk_totalcc;
+          totalnl = task.chunk_lineno_offset;
+          lastnl = (char *) task.chunk_data;
+
+          if (task.mode == CHUNK_MODE_COUNT)
+            {
+              struct chunk_file_state *state = task.shared_state;
+              if (atomic_load (&state->early_stop))
+                {
+                  status = true;
+                }
+              else
+                {
+                  out_quiet = true;
+                  intmax_t cnt = grepbuf (bufbeg, buflim);
+                  chunk_matched_cnt = cnt;
+                  if (cnt > 0)
+                    {
+                      atomic_store (&state->has_match, true);
+                      if (exit_on_match || list_files == LISTFILES_MATCHING)
+                        atomic_store (&state->early_stop, true);
+                    }
+                  status = (cnt == 0);
+                }
+            }
+          else
+            {
+              intmax_t lines_matched = grepbuf (bufbeg, buflim);
+              status = (lines_matched == 0);
+            }
+        }
+
       char *copy_out = nullptr;
       if (tls_out.len > sizeof rob[0].inline_out && tls_out.len <= 32768)
         {
@@ -3165,10 +3568,19 @@ worker_thread_func (void *arg)
 
       pthread_mutex_lock (&pool_mutex);
 
+      if (task.chunk_free_data)
+        free_slice_buf_locked ((char *) (task.chunk_data - 1));
+
       struct rob_slot *slot = &rob[task.seq % ROB_CAP];
       slot->status = status;
       slot->errseen = tls_errseen;
       slot->had_prtext = task_had_prtext;
+      slot->chunk_count = chunk_matched_cnt;
+      if (task.type == TASK_TYPE_CHUNK || task.type == TASK_TYPE_STREAM_CHUNK)
+        {
+          slot->is_chunk = true;
+          slot->is_last_chunk = task.is_last_chunk;
+        }
 
       if (tls_out.len > 0)
         {
@@ -3398,6 +3810,789 @@ producer_enqueue_errseen (void)
 }
 
 static void
+cleanup_chunk_file_state (void *arg)
+{
+  struct chunk_file_state *state = arg;
+  if (!state)
+    return;
+
+  if (state->base_addr && state->base_addr != MAP_FAILED)
+    munmap (state->base_addr, state->base_size);
+  else if (state->mmap_data && state->mmap_data != MAP_FAILED)
+    munmap (state->mmap_data, state->mmap_size);
+
+  if (state->close_fd && state->file_desc >= 0)
+    close (state->file_desc);
+  else if (!state->close_fd && state->file_desc >= 0)
+    {
+      if (!exit_on_match)
+        lseek (state->file_desc, state->mmap_size, SEEK_SET);
+    }
+
+  free (state->bounds);
+  free (state->chunk_nls);
+  free (state->prefix_nls);
+  free (state->chunk_has_matches);
+  free (state->matches);
+  if (state->fname_allocated)
+    free ((char *) state->fname);
+
+  pthread_mutex_destroy (&state->done_mutex);
+  pthread_cond_destroy (&state->done_cv);
+  pthread_mutex_destroy (&state->match_mutex);
+
+  free (state);
+}
+
+static int
+cmp_matches (void const *a, void const *b)
+{
+  struct match_record const *ma = a;
+  struct match_record const *mb = b;
+  if (ma->line_beg < mb->line_beg) return -1;
+  if (ma->line_beg > mb->line_beg) return 1;
+  return 0;
+}
+
+static void
+format_context_matches_to_rob (char const *fname, struct chunk_file_state *state)
+{
+  pthread_mutex_lock (&pool_mutex);
+  uint64_t seq = producer_alloc_slot_locked ();
+  struct rob_slot *slot = &rob[seq % ROB_CAP];
+  slot->is_chunk = true;
+  slot->is_last_chunk = true;
+  slot->cleanup_fn = cleanup_chunk_file_state;
+  slot->cleanup_arg = state;
+  slot->filename = xstrdup (fname);
+
+  if (state->match_count == 0)
+    {
+      slot->status = true;
+      slot->state = ROB_SLOT_DONE;
+      rob_try_commit_locked ();
+      pthread_mutex_unlock (&pool_mutex);
+      return;
+    }
+
+  /* Sort matches by line_beg */
+  qsort (state->matches, state->match_count, sizeof (struct match_record), cmp_matches);
+
+  /* Deduplicate matches by line_beg */
+  size_t unique_count = 0;
+  for (size_t i = 0; i < state->match_count; ++i)
+    {
+      if (unique_count == 0 || state->matches[i].line_beg != state->matches[unique_count - 1].line_beg)
+        {
+          state->matches[unique_count++] = state->matches[i];
+        }
+    }
+  state->match_count = unique_count;
+
+  /* Format output into a membuf */
+  struct membuf out;
+  membuf_init (&out, 64 * 1024);
+
+  struct membuf saved_out = tls_out;
+  bool saved_buffering = buffering_enabled;
+  tls_out = out;
+  buffering_enabled = true;
+
+  char const *saved_filename = filename;
+  filename = fname;
+  char *saved_bufbeg = bufbeg;
+  char *saved_buflim = buflim;
+  char const *saved_lastnl = lastnl;
+  char *saved_lastout = lastout;
+  intmax_t saved_totalcc = totalcc;
+  intmax_t saved_totalnl = totalnl;
+  intmax_t saved_pending = pending;
+  intmax_t saved_outleft = outleft;
+
+  bufbeg = state->mmap_data;
+  buflim = state->mmap_data + state->mmap_size;
+  lastnl = bufbeg;
+  lastout = nullptr;
+  totalcc = 0;
+  totalnl = 0;
+  pending = 0;
+  outleft = max_count;
+  file_used = false;
+
+  for (size_t i = 0; i < state->match_count; ++i)
+    {
+      struct match_record *m = &state->matches[i];
+      if (!out_quiet && pending > 0)
+        prpending ((char *) m->line_beg);
+
+      if (out_line && !out_invert)
+        {
+          intmax_t match_nl = state->prefix_nls[m->chunk_idx] + m->rel_nl;
+          char const *bp = lastout ? lastout : bufbeg;
+          char const *p = m->line_beg;
+          intmax_t k = 0;
+          if (!out_quiet)
+            {
+              for (; k < out_before && p > bp; ++k)
+                do
+                  --p;
+                while (p[-1] != eolbyte);
+            }
+          if (lastnl < p)
+            {
+              totalnl = match_nl - k;
+              lastnl = p;
+            }
+        }
+
+      prtext ((char *) m->line_beg, (char *) m->line_end);
+    }
+  if (pending > 0)
+    prpending (buflim);
+
+  out = tls_out;
+  tls_out = saved_out;
+  buffering_enabled = saved_buffering;
+  filename = saved_filename;
+  bufbeg = saved_bufbeg;
+  buflim = saved_buflim;
+  lastnl = saved_lastnl;
+  lastout = saved_lastout;
+  totalcc = saved_totalcc;
+  totalnl = saved_totalnl;
+  pending = saved_pending;
+  outleft = saved_outleft;
+
+  slot->status = false;
+  slot->had_prtext = true;
+  if (out.len <= sizeof slot->inline_out)
+    {
+      memcpy (slot->inline_out, out.data, out.len);
+      slot->stdout_buf = nullptr;
+      slot->stdout_len = out.len;
+      slot->stdout_cap = sizeof slot->inline_out;
+      slot->stdout_is_mmap = false;
+      membuf_free (&out);
+    }
+  else
+    {
+      slot->stdout_buf = out.data;
+      slot->stdout_len = out.len;
+      slot->stdout_cap = out.cap;
+      slot->stdout_is_mmap = out.is_mmap;
+    }
+  slot->state = ROB_SLOT_DONE;
+
+  rob_try_commit_locked ();
+  pthread_mutex_unlock (&pool_mutex);
+}
+
+static void stream_slicer_stdin (void);
+
+static void
+chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st_in)
+{
+  struct stat st;
+  if (st_in)
+    st = *st_in;
+  else if (fstat (fd, &st) != 0)
+    {
+      if (!suppress_errors)
+        producer_enqueue_error (errno, fname);
+      else
+        producer_enqueue_errseen ();
+      if (close_fd)
+        close (fd);
+      return;
+    }
+
+  if (!out_quiet && list_files == LISTFILES_NONE && 1 < max_count
+      && S_ISREG (st.st_mode) && SAME_INODE (st, out_stat))
+    {
+      if (close_fd)
+        close (fd);
+      producer_enqueue_msg (0, _("%s: input file is also the output"), fname);
+      producer_enqueue_errseen ();
+      return;
+    }
+
+  if (st.st_size == 0)
+    {
+      if (close_fd)
+        close (fd);
+      pthread_mutex_lock (&pool_mutex);
+      uint64_t seq = producer_alloc_slot_locked ();
+      struct rob_slot *slot = &rob[seq % ROB_CAP];
+      slot->status = true;
+      slot->errseen = false;
+      slot->had_prtext = false;
+      slot->is_chunk = true;
+      slot->is_last_chunk = true;
+      slot->filename = xstrdup (fname);
+      slot->state = ROB_SLOT_DONE;
+      rob_try_commit_locked ();
+      pthread_mutex_unlock (&pool_mutex);
+      return;
+    }
+
+  size_t file_size = (size_t) st.st_size;
+  size_t total_alloc = file_size + 2 * pagesize;
+  char *base = mmap (NULL, total_alloc, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (base == MAP_FAILED)
+    {
+      if (close_fd)
+        {
+          close (fd);
+          producer_enqueue_file (fname, true, true);
+        }
+      else
+        stream_slicer_stdin ();
+      return;
+    }
+
+  char *data = mmap (base + pagesize, file_size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_FIXED, fd, 0);
+  if (data == MAP_FAILED)
+    {
+      munmap (base, total_alloc);
+      if (close_fd)
+        {
+          close (fd);
+          producer_enqueue_file (fname, true, true);
+        }
+      else
+        stream_slicer_stdin ();
+      return;
+    }
+
+  data[-1] = eolbyte;
+  data[file_size] = eolbyte;
+  posix_madvise (data, file_size, POSIX_MADV_WILLNEED);
+
+  if (eolbyte && binary_files != TEXT_BINARY_FILES
+      && memchr (data, '\0', MIN (file_size, 64 * 1024)) != nullptr)
+    {
+      munmap (base, total_alloc);
+      if (close_fd)
+        {
+          close (fd);
+          producer_enqueue_file (fname, true, true);
+        }
+      else
+        stream_slicer_stdin ();
+      return;
+    }
+
+  size_t num_chunks = pool_nthreads * 4;
+  if (num_chunks < 8)
+    num_chunks = 8;
+  if (num_chunks > 128)
+    num_chunks = 128;
+  size_t min_chunk_size = 2 * 1024 * 1024;
+  if (file_size / num_chunks < min_chunk_size)
+    num_chunks = file_size / min_chunk_size;
+  if (num_chunks < 2)
+    num_chunks = 2;
+
+  size_t *bounds = xnmalloc (num_chunks + 1, sizeof *bounds);
+  bounds[0] = 0;
+  for (size_t k = 1; k < num_chunks; ++k)
+    {
+      size_t target = k * (file_size / num_chunks);
+      char const *nl = memchr (data + target, eolbyte, file_size - target);
+      if (nl)
+        bounds[k] = nl + 1 - data;
+      else
+        bounds[k] = file_size;
+    }
+  bounds[num_chunks] = file_size;
+
+  struct chunk_file_state *state = xzalloc (sizeof *state);
+  state->base_addr = base;
+  state->base_size = total_alloc;
+  state->mmap_data = data;
+  state->mmap_size = file_size;
+  state->file_desc = fd;
+  state->close_fd = close_fd;
+  state->fname = xstrdup (fname);
+  state->fname_allocated = true;
+  state->num_chunks = num_chunks;
+  state->bounds = bounds;
+  atomic_init (&state->chunks_completed, 0);
+  atomic_init (&state->total_count, 0);
+  atomic_init (&state->has_match, false);
+  atomic_init (&state->early_stop, false);
+  pthread_mutex_init (&state->done_mutex, NULL);
+  pthread_cond_init (&state->done_cv, NULL);
+  pthread_mutex_init (&state->match_mutex, NULL);
+
+  /* Case 1: Count / Early Stop / List Files */
+  if (count_matches || exit_on_match || list_files != LISTFILES_NONE)
+    {
+      for (size_t k = 0; k < num_chunks; ++k)
+        {
+          size_t c_beg = bounds[k];
+          size_t c_end = bounds[k + 1];
+          bool is_last = (k == num_chunks - 1);
+
+          pthread_mutex_lock (&pool_mutex);
+          uint64_t seq = producer_alloc_slot_locked ();
+          struct rob_slot *slot = &rob[seq % ROB_CAP];
+          slot->is_chunk = true;
+          slot->is_last_chunk = is_last;
+          if (is_last)
+            {
+              slot->cleanup_fn = cleanup_chunk_file_state;
+              slot->cleanup_arg = state;
+              slot->filename = xstrdup (fname);
+            }
+
+          while (q_count >= WORK_QUEUE_CAP && !pool_terminate)
+            {
+              rob_try_commit_locked ();
+              if (q_count < WORK_QUEUE_CAP)
+                break;
+              pthread_cond_wait (&q_not_full_cv, &pool_mutex);
+            }
+
+          if (pool_terminate)
+            {
+              pthread_mutex_unlock (&pool_mutex);
+              return;
+            }
+
+          struct work_task *t = &work_queue[q_tail];
+          t->type = TASK_TYPE_CHUNK;
+          t->seq = seq;
+          t->filename = (char *) state->fname;
+          t->mode = CHUNK_MODE_COUNT;
+          t->chunk_data = data + c_beg;
+          t->chunk_len = c_end - c_beg;
+          t->chunk_totalcc = c_beg;
+          t->chunk_lineno_offset = 0;
+          t->chunk_free_data = false;
+          t->is_last_chunk = is_last;
+          t->shared_state = state;
+
+          q_tail = (q_tail + 1) % WORK_QUEUE_CAP;
+          q_count++;
+
+          pthread_cond_signal (&q_not_empty_cv);
+          pthread_mutex_unlock (&pool_mutex);
+        }
+      return;
+    }
+
+  /* Case 2: Mode 2: Independent Chunks (!out_line && out_before <= 0 && out_after <= 0 && max_count == INTMAX_MAX) */
+  if (!out_line && out_before <= 0 && out_after <= 0 && max_count == INTMAX_MAX)
+    {
+      for (size_t k = 0; k < num_chunks; ++k)
+        {
+          size_t c_beg = bounds[k];
+          size_t c_end = bounds[k + 1];
+          bool is_last = (k == num_chunks - 1);
+
+          pthread_mutex_lock (&pool_mutex);
+          uint64_t seq = producer_alloc_slot_locked ();
+          struct rob_slot *slot = &rob[seq % ROB_CAP];
+          slot->is_chunk = true;
+          slot->is_last_chunk = is_last;
+          if (is_last)
+            {
+              slot->cleanup_fn = cleanup_chunk_file_state;
+              slot->cleanup_arg = state;
+              slot->filename = xstrdup (fname);
+            }
+
+          while (q_count >= WORK_QUEUE_CAP && !pool_terminate)
+            {
+              rob_try_commit_locked ();
+              if (q_count < WORK_QUEUE_CAP)
+                break;
+              pthread_cond_wait (&q_not_full_cv, &pool_mutex);
+            }
+
+          if (pool_terminate)
+            {
+              pthread_mutex_unlock (&pool_mutex);
+              return;
+            }
+
+          struct work_task *t = &work_queue[q_tail];
+          t->type = TASK_TYPE_CHUNK;
+          t->seq = seq;
+          t->filename = (char *) state->fname;
+          t->mode = CHUNK_MODE_STATELESS;
+          t->chunk_data = data + c_beg;
+          t->chunk_len = c_end - c_beg;
+          t->chunk_totalcc = c_beg;
+          t->chunk_lineno_offset = 0;
+          t->chunk_free_data = false;
+          t->is_last_chunk = is_last;
+          t->shared_state = state;
+
+          q_tail = (q_tail + 1) % WORK_QUEUE_CAP;
+          q_count++;
+
+          pthread_cond_signal (&q_not_empty_cv);
+          pthread_mutex_unlock (&pool_mutex);
+        }
+      return;
+    }
+
+  /* Case 3: Mode 3 (Line numbers and/or context) */
+  state->chunk_nls = xnmalloc (num_chunks, sizeof *state->chunk_nls);
+  state->prefix_nls = xnmalloc (num_chunks + 1, sizeof *state->prefix_nls);
+  state->chunk_has_matches = xnmalloc (num_chunks, sizeof *state->chunk_has_matches);
+  state->match_cap = 65536;
+  state->matches = xnmalloc (state->match_cap, sizeof *state->matches);
+  state->match_count = 0;
+
+  /* Pass 1: MMAP Scan tasks */
+  for (size_t k = 0; k < num_chunks; ++k)
+    {
+      pthread_mutex_lock (&pool_mutex);
+      while (q_count >= WORK_QUEUE_CAP && !pool_terminate)
+        {
+          rob_try_commit_locked ();
+          if (q_count < WORK_QUEUE_CAP)
+            break;
+          pthread_cond_wait (&q_not_full_cv, &pool_mutex);
+        }
+      if (pool_terminate)
+        {
+          pthread_mutex_unlock (&pool_mutex);
+          return;
+        }
+
+      struct work_task *t = &work_queue[q_tail];
+      t->type = TASK_TYPE_MMAP_SCAN;
+      t->seq = 0;
+      t->filename = (char *) state->fname;
+      t->chunk_data = data + bounds[k];
+      t->chunk_len = bounds[k + 1] - bounds[k];
+      t->chunk_idx = k;
+      t->shared_state = state;
+
+      q_tail = (q_tail + 1) % WORK_QUEUE_CAP;
+      q_count++;
+
+      pthread_cond_signal (&q_not_empty_cv);
+      pthread_mutex_unlock (&pool_mutex);
+    }
+
+  /* Wait for Pass 1 to finish */
+  pthread_mutex_lock (&state->done_mutex);
+  while (atomic_load (&state->chunks_completed) < num_chunks)
+    pthread_cond_wait (&state->done_cv, &state->done_mutex);
+  pthread_mutex_unlock (&state->done_mutex);
+
+  /* Prefix sum of newlines */
+  state->prefix_nls[0] = 0;
+  for (size_t k = 0; k < num_chunks; ++k)
+    state->prefix_nls[k + 1] = state->prefix_nls[k] + state->chunk_nls[k];
+
+  /* If context lines requested (Mode 3B) */
+  if (out_before > 0 || out_after > 0)
+    {
+      format_context_matches_to_rob (fname, state);
+      return;
+    }
+
+  /* Mode 3A: Line numbers without context */
+  for (size_t k = 0; k < num_chunks; ++k)
+    {
+      size_t c_beg = bounds[k];
+      size_t c_end = bounds[k + 1];
+      bool is_last = (k == num_chunks - 1);
+
+      pthread_mutex_lock (&pool_mutex);
+      uint64_t seq = producer_alloc_slot_locked ();
+      struct rob_slot *slot = &rob[seq % ROB_CAP];
+      slot->is_chunk = true;
+      slot->is_last_chunk = is_last;
+      if (is_last)
+        {
+          slot->cleanup_fn = cleanup_chunk_file_state;
+          slot->cleanup_arg = state;
+          slot->filename = xstrdup (fname);
+        }
+
+      if (!state->chunk_has_matches[k])
+        {
+          slot->status = true;
+          slot->state = ROB_SLOT_DONE;
+          rob_try_commit_locked ();
+          pthread_mutex_unlock (&pool_mutex);
+          continue;
+        }
+
+      while (q_count >= WORK_QUEUE_CAP && !pool_terminate)
+        {
+          rob_try_commit_locked ();
+          if (q_count < WORK_QUEUE_CAP)
+            break;
+          pthread_cond_wait (&q_not_full_cv, &pool_mutex);
+        }
+
+      if (pool_terminate)
+        {
+          pthread_mutex_unlock (&pool_mutex);
+          return;
+        }
+
+      struct work_task *t = &work_queue[q_tail];
+      t->type = TASK_TYPE_CHUNK;
+      t->seq = seq;
+      t->filename = (char *) state->fname;
+      t->mode = CHUNK_MODE_LINE_NUMBER;
+      t->chunk_data = data + c_beg;
+      t->chunk_len = c_end - c_beg;
+      t->chunk_totalcc = c_beg;
+      t->chunk_lineno_offset = state->prefix_nls[k];
+      t->chunk_free_data = false;
+      t->is_last_chunk = is_last;
+      t->shared_state = state;
+
+      q_tail = (q_tail + 1) % WORK_QUEUE_CAP;
+      q_count++;
+
+      pthread_cond_signal (&q_not_empty_cv);
+      pthread_mutex_unlock (&pool_mutex);
+    }
+}
+
+static void
+chunked_grep_file (char const *fname, struct stat const *st_in)
+{
+  int oflag = (O_RDONLY | O_NOCTTY
+               | (IGNORE_DUPLICATE_BRANCH_WARNING (binary ? O_BINARY : 0)));
+  int fd = openat_safer (AT_FDCWD, fname, oflag);
+  if (fd < 0)
+    {
+      if (!suppress_errors)
+        producer_enqueue_error (errno, fname);
+      else
+        producer_enqueue_errseen ();
+      return;
+    }
+  chunked_grep_fd (fd, true, fname, st_in);
+}
+
+static void
+stream_slicer_stdin (void)
+{
+#ifdef F_SETPIPE_SZ
+  fcntl (STDIN_FILENO, F_SETPIPE_SZ, 1024 * 1024);
+#endif
+  stream_commit_totalnl = 0;
+
+  struct stat st;
+  if (fstat (STDIN_FILENO, &st) == 0)
+    {
+      if (!out_quiet && list_files == LISTFILES_NONE && 1 < max_count
+          && S_ISREG (st.st_mode) && SAME_INODE (st, out_stat))
+        {
+          producer_enqueue_msg (0, _("%s: input file is also the output"),
+                                label ? label : _("(standard input)"));
+          producer_enqueue_errseen ();
+          return;
+        }
+    }
+
+  size_t residue_cap = 64 * 1024;
+  char *residue_buf = xmalloc (residue_cap);
+  size_t residue_len = 0;
+  intmax_t stream_totalcc = 0;
+  bool is_first_chunk = true;
+  bool is_binary = false;
+
+  while (true)
+    {
+      pthread_mutex_lock (&pool_mutex);
+      char *chunk_alloc = alloc_slice_buf_locked ();
+      pthread_mutex_unlock (&pool_mutex);
+
+      chunk_alloc[0] = eolbyte;
+      char *chunk_data = chunk_alloc + 1;
+
+      if (residue_len > 0)
+        memcpy (chunk_data, residue_buf, residue_len);
+
+      size_t total_in_buf = residue_len;
+      bool is_eof = false;
+
+      while (total_in_buf < SLICE_BUF_SIZE)
+        {
+          ssize_t nread = safe_read (STDIN_FILENO, chunk_data + total_in_buf,
+                                     SLICE_BUF_SIZE - total_in_buf);
+          if (nread <= 0)
+            {
+              if (nread < 0)
+                suppressible_error (errno);
+              is_eof = true;
+              break;
+            }
+          total_in_buf += nread;
+        }
+
+      if (total_in_buf == 0)
+        {
+          pthread_mutex_lock (&pool_mutex);
+          free_slice_buf_locked (chunk_alloc);
+          if (is_first_chunk)
+            {
+              uint64_t seq = producer_alloc_slot_locked ();
+              struct rob_slot *slot = &rob[seq % ROB_CAP];
+              slot->status = true;
+              slot->errseen = false;
+              slot->had_prtext = false;
+              slot->is_chunk = true;
+              slot->is_last_chunk = true;
+              slot->filename = label ? xstrdup (label) : nullptr;
+              slot->state = ROB_SLOT_DONE;
+              rob_try_commit_locked ();
+            }
+          pthread_mutex_unlock (&pool_mutex);
+          break;
+        }
+
+      if (is_first_chunk)
+        {
+          is_first_chunk = false;
+          if (eolbyte && binary_files != TEXT_BINARY_FILES
+              && buf_has_nulls (chunk_data, total_in_buf))
+            {
+              if (binary_files == WITHOUT_MATCH_BINARY_FILES)
+                {
+                  pthread_mutex_lock (&pool_mutex);
+                  free_slice_buf_locked (chunk_alloc);
+                  uint64_t seq = producer_alloc_slot_locked ();
+                  struct rob_slot *slot = &rob[seq % ROB_CAP];
+                  slot->status = true;
+                  slot->errseen = false;
+                  slot->had_prtext = false;
+                  slot->is_chunk = true;
+                  slot->is_last_chunk = true;
+                  slot->filename = label ? xstrdup (label) : nullptr;
+                  slot->state = ROB_SLOT_DONE;
+                  rob_try_commit_locked ();
+                  pthread_mutex_unlock (&pool_mutex);
+                  break;
+                }
+              is_binary = true;
+            }
+        }
+
+      if (is_binary)
+        zap_nuls (chunk_data, chunk_data + total_in_buf, eolbyte);
+
+      size_t chunk_len = 0;
+      size_t next_residue = 0;
+
+      if (is_eof)
+        {
+          if (total_in_buf > 0 && chunk_data[total_in_buf - 1] != eolbyte)
+            {
+              chunk_data[total_in_buf] = eolbyte;
+              total_in_buf++;
+            }
+          chunk_len = total_in_buf;
+          next_residue = 0;
+        }
+      else
+        {
+          char const *last_eol = memrchr (chunk_data, eolbyte, total_in_buf);
+          if (last_eol)
+            {
+              chunk_len = last_eol + 1 - chunk_data;
+              next_residue = total_in_buf - chunk_len;
+            }
+          else
+            {
+              chunk_len = total_in_buf;
+              next_residue = 0;
+            }
+        }
+
+      if (next_residue > 0)
+        {
+          if (next_residue > residue_cap)
+            {
+              residue_cap = next_residue + 4096;
+              residue_buf = xrealloc (residue_buf, residue_cap);
+            }
+          memcpy (residue_buf, chunk_data + chunk_len, next_residue);
+        }
+      residue_len = next_residue;
+
+      chunk_data[chunk_len] = eolbyte;
+      memset (chunk_data + chunk_len + 1, 0, uword_size);
+
+      pthread_mutex_lock (&pool_mutex);
+
+      while (next_seq - commit_seq >= 56 && !pool_terminate)
+        {
+          rob_try_commit_locked ();
+          if (next_seq - commit_seq < 56)
+            break;
+          rob_space_waiters++;
+          pthread_cond_wait (&rob_space_cv, &pool_mutex);
+          rob_space_waiters--;
+        }
+
+      uint64_t seq = producer_alloc_slot_locked ();
+      struct rob_slot *slot = &rob[seq % ROB_CAP];
+      slot->is_chunk = true;
+      slot->is_last_chunk = is_eof;
+      if (is_eof)
+        slot->filename = label ? xstrdup (label) : nullptr;
+
+      while (q_count >= WORK_QUEUE_CAP && !pool_terminate)
+        {
+          rob_try_commit_locked ();
+          if (q_count < WORK_QUEUE_CAP)
+            break;
+          pthread_cond_wait (&q_not_full_cv, &pool_mutex);
+        }
+
+      if (pool_terminate)
+        {
+          free_slice_buf_locked (chunk_alloc);
+          pthread_mutex_unlock (&pool_mutex);
+          break;
+        }
+
+      struct work_task *t = &work_queue[q_tail];
+      t->type = TASK_TYPE_STREAM_CHUNK;
+      t->seq = seq;
+      t->filename = nullptr;
+      t->chunk_data = chunk_data;
+      t->chunk_len = chunk_len;
+      t->chunk_totalcc = stream_totalcc;
+      t->chunk_lineno_offset = 0;
+      t->chunk_free_data = true;
+      t->is_last_chunk = is_eof;
+      t->is_binary_stream = is_binary;
+      t->shared_state = nullptr;
+
+      q_tail = (q_tail + 1) % WORK_QUEUE_CAP;
+      q_count++;
+
+      pthread_cond_signal (&q_not_empty_cv);
+      pthread_mutex_unlock (&pool_mutex);
+
+      stream_totalcc += chunk_len;
+
+      if (is_eof)
+        break;
+    }
+
+  free (residue_buf);
+}
+
+static void
 producer_grepdirent (FTS *fts, FTSENT *ent, bool command_line)
 {
   bool follow;
@@ -3469,6 +4664,13 @@ producer_grepdirent (FTS *fts, FTSENT *ent, bool command_line)
 
     case FTS_F:
     case FTS_SLNONE:
+      if (S_ISREG (ent->fts_statp->st_mode)
+          && ent->fts_statp->st_size >= 2 * 1024 * 1024 && pool_nthreads > 1
+          && (!out_invert || (out_before <= 0 && out_after <= 0)))
+        {
+          chunked_grep_file (fname, ent->fts_statp);
+          return;
+        }
       break;
 
     case FTS_SL:
@@ -3523,7 +4725,22 @@ producer_run (char *const *files)
     {
       if (STREQ (*f, "-"))
         {
-          producer_enqueue_stdin ();
+          struct stat st;
+          if (pool_nthreads > 1 && !isatty (STDIN_FILENO)
+              && fstat (STDIN_FILENO, &st) == 0
+              && S_ISREG (st.st_mode)
+              && st.st_size >= 2 * 1024 * 1024
+              && !SAME_INODE (st, out_stat)
+              && lseek (STDIN_FILENO, 0, SEEK_CUR) == 0
+              && (!out_invert || (out_before <= 0 && out_after <= 0)))
+            {
+              chunked_grep_fd (STDIN_FILENO, false, label ? label : _("(standard input)"), &st);
+            }
+          else if (pool_nthreads > 1 && !isatty (STDIN_FILENO)
+                   && out_before <= 0 && out_after <= 0 && max_count == INTMAX_MAX)
+            stream_slicer_stdin ();
+          else
+            producer_enqueue_stdin ();
         }
       else
         {
@@ -3535,6 +4752,9 @@ producer_run (char *const *files)
 
               if (S_ISDIR (st.st_mode) && directories == RECURSE_DIRECTORIES)
                 producer_recurse_dir (*f, true);
+              else if (S_ISREG (st.st_mode) && st.st_size >= 2 * 1024 * 1024 && pool_nthreads > 1
+                       && (!out_invert || (out_before <= 0 && out_after <= 0)))
+                chunked_grep_file (*f, &st);
               else
                 producer_enqueue_file (*f, true, true);
             }
@@ -3554,6 +4774,7 @@ start_worker_pool (int nthreads)
   commit_seq = 0;
   q_head = q_tail = q_count = 0;
   overall_status = true;
+  stream_commit_totalnl = 0;
 
   pthread_attr_t attr;
   pthread_attr_init (&attr);
@@ -3598,6 +4819,7 @@ finish_worker_pool (void)
   for (int i = 0; i < pool_nthreads; ++i)
     pthread_join (pool_threads[i], NULL);
 
+  cleanup_slice_freelist ();
 
   free (pool_threads);
   pool_threads = NULL;
@@ -4190,6 +5412,25 @@ main (int argc, char **argv)
   struct stat tmp_st;
   bool is_single_stdin = (num_operands == 0
                           || (num_operands == 1 && STREQ (*files, "-")));
+  struct stat in_st;
+  bool stdin_is_reg = (is_single_stdin && fstat (STDIN_FILENO, &in_st) == 0 && S_ISREG (in_st.st_mode));
+  bool stdin_is_large_reg = (stdin_is_reg
+                             && in_st.st_size >= 2 * 1024 * 1024
+                             && !SAME_INODE (in_st, out_stat)
+                             && lseek (STDIN_FILENO, 0, SEEK_CUR) == 0
+                             && (!out_invert || (out_before <= 0 && out_after <= 0)));
+  bool can_slice_stdin = (!isatty (STDIN_FILENO)
+                          && (!stdin_is_reg || (in_st.st_size >= 2 * 1024 * 1024 && !SAME_INODE (in_st, out_stat)))
+                          && out_before <= 0 && out_after <= 0
+                          && max_count == INTMAX_MAX);
+  bool can_parallelize_stdin = (!isatty (STDIN_FILENO)
+                                && (stdin_is_large_reg || can_slice_stdin));
+  bool is_single_large_file = (num_operands == 1
+                               && !STREQ (*files, "-")
+                               && stat (*files, &tmp_st) == 0
+                               && S_ISREG (tmp_st.st_mode)
+                               && tmp_st.st_size >= 2 * 1024 * 1024
+                               && (!out_invert || (out_before <= 0 && out_after <= 0)));
   bool is_dir_recurse = (num_operands == 1
                          && !STREQ (*files, "-")
                          && directories == RECURSE_DIRECTORIES
@@ -4198,8 +5439,8 @@ main (int argc, char **argv)
 
   if (nthreads <= 1
       || max_count < INTMAX_MAX
-      || is_single_stdin
-      || (num_operands == 1 && !is_dir_recurse))
+      || (is_single_stdin && !can_parallelize_stdin)
+      || (num_operands == 1 && !is_single_stdin && !is_single_large_file && !is_dir_recurse))
     {
       init_worker_buffer ();
       bool status = true;
