@@ -2834,6 +2834,776 @@ try_fgrep_pattern (int matcher, char *keys, idx_t *len_p)
   return result;
 }
 
+
+
+/* Number of threads to use.  */
+static int
+get_num_threads (void)
+{
+  char const *env = getenv ("GREP_THREADS");
+  if (env && *env)
+    {
+      char *end;
+      long val = strtol (env, &end, 10);
+      if (*end == '\0' && val > 0)
+        return (int) MIN (val, 256);
+    }
+
+#if defined CPU_COUNT
+  cpu_set_t set;
+  CPU_ZERO (&set);
+  if (sched_getaffinity (0, sizeof set, &set) == 0)
+    {
+      int count = CPU_COUNT (&set);
+      if (count > 0)
+        return MIN (count, 16);
+    }
+#endif
+
+#if defined _SC_NPROCESSORS_ONLN
+  long n = sysconf (_SC_NPROCESSORS_ONLN);
+  if (n > 0)
+    return (int) MIN (n, 16);
+#endif
+
+  return 1;
+}
+
+enum rob_slot_state
+{
+  ROB_SLOT_EMPTY = 0,
+  ROB_SLOT_IN_PROGRESS,
+  ROB_SLOT_DONE
+};
+
+struct rob_slot
+{
+  enum rob_slot_state state;
+  bool status;
+  bool errseen;
+  bool had_prtext;
+
+  char *stdout_buf;
+  size_t stdout_len;
+  size_t stdout_cap;
+  bool stdout_is_mmap;
+
+  char *stderr_buf;
+  size_t stderr_len;
+  size_t stderr_cap;
+  bool stderr_is_mmap;
+
+  bool is_chunk;
+  bool is_last_chunk;
+  intmax_t chunk_count;
+  void (*cleanup_fn) (void *);
+  void *cleanup_arg;
+  char *filename;
+
+  bool is_stream_chunk;
+  intmax_t chunk_nls;
+  char *stream_chunk_alloc;
+  char *stream_chunk_data;
+  size_t stream_chunk_len;
+  char *stream_first_lbeg;
+  intmax_t stream_first_rel_nl;
+  off_t stream_totalcc;
+
+  char inline_out[1024];
+};
+
+enum work_task_type
+{
+  TASK_TYPE_FILE,
+  TASK_TYPE_STDIN,
+  TASK_TYPE_CHUNK,
+  TASK_TYPE_STREAM_CHUNK,
+  TASK_TYPE_MMAP_SCAN,
+  TASK_TYPE_TERMINATE
+};
+
+enum chunk_mode
+{
+  CHUNK_MODE_STATELESS,
+  CHUNK_MODE_COUNT,
+  CHUNK_MODE_LINE_NUMBER
+};
+
+struct work_task
+{
+  enum work_task_type type;
+  uint64_t seq;
+  char *filename;
+  bool follow;
+  bool command_line;
+
+  enum chunk_mode mode;
+  char const *chunk_data;
+  size_t chunk_len;
+  intmax_t chunk_totalcc;
+  intmax_t chunk_lineno_offset;
+  bool chunk_free_data;
+  bool is_last_chunk;
+  bool is_binary_stream;
+  size_t chunk_idx;
+  void *shared_state;
+};
+
+enum { WORK_QUEUE_CAP = 256 };
+enum { ROB_CAP = 1024 };
+
+static struct rob_slot rob[ROB_CAP];
+static uint64_t next_seq;
+static uint64_t commit_seq;
+
+static struct work_task work_queue[WORK_QUEUE_CAP];
+static size_t q_head;
+static size_t q_tail;
+static size_t q_count;
+
+static pthread_mutex_t pool_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t q_not_empty_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t q_not_full_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t rob_space_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t rob_done_cv = PTHREAD_COND_INITIALIZER;
+
+static size_t rob_space_waiters = 0;
+static size_t rob_done_waiters = 0;
+
+static int pool_nthreads;
+static pthread_t *pool_threads;
+static bool overall_status = true;
+static bool pool_terminate;
+
+
+static void
+rob_try_commit_locked (void)
+{
+  bool saved_buffering = buffering_enabled;
+  buffering_enabled = false;
+  bool committed_any = false;
+
+  while (commit_seq < next_seq)
+    {
+      struct rob_slot *slot = &rob[commit_seq % ROB_CAP];
+      if (slot->state != ROB_SLOT_DONE)
+        break;
+
+      if (slot->filename)
+        filename = slot->filename;
+
+      /* Group separator logic across files */
+      if (slot->had_prtext)
+        {
+          if ((0 <= out_before || 0 <= out_after) && global_used && group_separator)
+            {
+              pr_sgr_start_if (sep_color);
+              fputs_errno (group_separator);
+              pr_sgr_end_if (sep_color);
+              putchar_errno ('\n');
+            }
+          global_used = true;
+        }
+
+      if (slot->stdout_len > 0)
+        fwrite_errno (slot->stdout_buf ? slot->stdout_buf : slot->inline_out, 1, slot->stdout_len);
+
+      if (slot->stderr_len > 0)
+        fwrite (slot->stderr_buf, 1, slot->stderr_len, stderr);
+
+      if (line_buffered)
+        fflush_errno ();
+
+      if (stdout_errno)
+        die (EXIT_TROUBLE, stdout_errno, _("write error"));
+
+      overall_status &= slot->status;
+      if (slot->errseen)
+        errseen = true;
+
+      if (slot->stdout_buf)
+        {
+          if (slot->stdout_is_mmap)
+            munmap (slot->stdout_buf, slot->stdout_cap);
+          else
+            free (slot->stdout_buf);
+          slot->stdout_buf = nullptr;
+        }
+
+      if (slot->stderr_buf)
+        {
+          if (slot->stderr_is_mmap)
+            munmap (slot->stderr_buf, slot->stderr_cap);
+          else
+            free (slot->stderr_buf);
+          slot->stderr_buf = nullptr;
+        }
+
+      if (slot->cleanup_fn)
+        {
+          slot->cleanup_fn (slot->cleanup_arg);
+          slot->cleanup_fn = nullptr;
+          slot->cleanup_arg = nullptr;
+        }
+
+      if (slot->filename)
+        {
+          free (slot->filename);
+          slot->filename = nullptr;
+          filename = nullptr;
+        }
+
+      slot->state = ROB_SLOT_EMPTY;
+      commit_seq++;
+      committed_any = true;
+
+      if (exit_on_match && !slot->status)
+        {
+          if (line_buffered)
+            fflush_errno ();
+          exit (EXIT_SUCCESS);
+        }
+    }
+
+  if (committed_any)
+    {
+      if (rob_space_waiters > 0)
+        pthread_cond_signal (&rob_space_cv);
+      if (rob_done_waiters > 0)
+        pthread_cond_broadcast (&rob_done_cv);
+    }
+
+  buffering_enabled = saved_buffering;
+}
+
+static uint64_t
+producer_alloc_slot_locked (void)
+{
+  while (next_seq - commit_seq >= ROB_CAP && !pool_terminate)
+    {
+      rob_try_commit_locked ();
+      if (next_seq - commit_seq < ROB_CAP)
+        break;
+      rob_space_waiters++;
+      pthread_cond_wait (&rob_space_cv, &pool_mutex);
+      rob_space_waiters--;
+    }
+
+  uint64_t seq = next_seq++;
+  struct rob_slot *slot = &rob[seq % ROB_CAP];
+  memset (slot, 0, sizeof *slot);
+  slot->state = ROB_SLOT_IN_PROGRESS;
+  return seq;
+}
+
+static void *
+worker_thread_func (void *arg)
+{
+  (void) arg;
+
+  compiled_pattern = clone_compiled_pattern ();
+  buffering_enabled = true;
+  membuf_init (&tls_out, 64 * 1024);
+  membuf_init (&tls_err, 4096);
+
+  pthread_mutex_lock (&pool_mutex);
+
+  while (true)
+    {
+      while (q_count == 0 && !pool_terminate)
+        pthread_cond_wait (&q_not_empty_cv, &pool_mutex);
+
+      if (pool_terminate && q_count == 0)
+        {
+          pthread_mutex_unlock (&pool_mutex);
+          break;
+        }
+
+      struct work_task task = work_queue[q_head];
+      q_head = (q_head + 1) % WORK_QUEUE_CAP;
+      q_count--;
+      pthread_cond_signal (&q_not_full_cv);
+      pthread_mutex_unlock (&pool_mutex);
+
+      if (task.type == TASK_TYPE_TERMINATE)
+        break;
+
+      membuf_reset (&tls_out);
+      membuf_reset (&tls_err);
+      tls_errseen = false;
+      out_quiet = initial_out_quiet;
+      done_on_match = initial_done_on_match;
+      totalcc = 0;
+      lastnl = nullptr;
+      lastout = nullptr;
+      outleft = max_count;
+      pending = 0;
+      file_used = false;
+      task_had_prtext = false;
+
+      bool status = true;
+
+      if (task.type == TASK_TYPE_STDIN)
+        {
+          filename = label;
+          if (binary)
+            xset_binary_mode (STDIN_FILENO, O_BINARY);
+          status = grepdesc (STDIN_FILENO, true);
+        }
+      else if (task.type == TASK_TYPE_FILE)
+        {
+          filename = task.filename;
+          status = grepfile (AT_FDCWD, task.filename, task.follow, task.command_line);
+          free (task.filename);
+        }
+      char *copy_out = nullptr;
+      if (tls_out.len > sizeof rob[0].inline_out && tls_out.len <= 32768)
+        {
+          copy_out = ximalloc (tls_out.len);
+          memcpy (copy_out, tls_out.data, tls_out.len);
+        }
+
+      pthread_mutex_lock (&pool_mutex);
+
+      struct rob_slot *slot = &rob[task.seq % ROB_CAP];
+      slot->status = status;
+      slot->errseen = tls_errseen;
+      slot->had_prtext = task_had_prtext;
+
+      if (tls_out.len > 0)
+        {
+          if (tls_out.len <= sizeof slot->inline_out)
+            {
+              memcpy (slot->inline_out, tls_out.data, tls_out.len);
+              slot->stdout_buf = nullptr;
+              slot->stdout_len = tls_out.len;
+              slot->stdout_cap = sizeof slot->inline_out;
+              slot->stdout_is_mmap = false;
+              tls_out.len = 0;
+            }
+          else if (copy_out)
+            {
+              slot->stdout_buf = copy_out;
+              slot->stdout_len = tls_out.len;
+              slot->stdout_cap = tls_out.len;
+              slot->stdout_is_mmap = false;
+              tls_out.len = 0;
+            }
+          else
+            {
+              slot->stdout_buf = tls_out.data;
+              slot->stdout_len = tls_out.len;
+              slot->stdout_cap = tls_out.cap;
+              slot->stdout_is_mmap = tls_out.is_mmap;
+              tls_out.data = nullptr;
+              tls_out.len = 0;
+              tls_out.cap = 0;
+              tls_out.is_mmap = false;
+              membuf_init (&tls_out, 64 * 1024);
+            }
+        }
+
+      if (tls_err.len > 0)
+        {
+          slot->stderr_buf = tls_err.data;
+          slot->stderr_len = tls_err.len;
+          slot->stderr_cap = tls_err.cap;
+          slot->stderr_is_mmap = tls_err.is_mmap;
+          tls_err.data = nullptr;
+          tls_err.len = 0;
+          tls_err.cap = 0;
+          tls_err.is_mmap = false;
+          membuf_init (&tls_err, 4096);
+        }
+
+      slot->state = ROB_SLOT_DONE;
+      rob_try_commit_locked ();
+    }
+
+  membuf_free (&tls_out);
+  membuf_free (&tls_err);
+  free_worker_buffer ();
+  if (compiled_pattern)
+    {
+      free_compiled_pattern (compiled_pattern);
+      compiled_pattern = NULL;
+    }
+  return NULL;
+}
+
+static void
+producer_enqueue_file (char const *fname, bool follow, bool command_line)
+{
+  pthread_mutex_lock (&pool_mutex);
+
+  uint64_t seq = producer_alloc_slot_locked ();
+  if (pool_terminate)
+    {
+      pthread_mutex_unlock (&pool_mutex);
+      return;
+    }
+
+  while (q_count >= WORK_QUEUE_CAP && !pool_terminate)
+    {
+      rob_try_commit_locked ();
+      if (q_count < WORK_QUEUE_CAP)
+        break;
+      pthread_cond_wait (&q_not_full_cv, &pool_mutex);
+    }
+
+  if (pool_terminate)
+    {
+      pthread_mutex_unlock (&pool_mutex);
+      return;
+    }
+
+  struct work_task *t = &work_queue[q_tail];
+  t->type = TASK_TYPE_FILE;
+  t->seq = seq;
+  t->filename = xstrdup (fname);
+  t->follow = follow;
+  t->command_line = command_line;
+
+  q_tail = (q_tail + 1) % WORK_QUEUE_CAP;
+  q_count++;
+
+  pthread_cond_signal (&q_not_empty_cv);
+  pthread_mutex_unlock (&pool_mutex);
+}
+
+static void
+producer_enqueue_stdin (void)
+{
+  pthread_mutex_lock (&pool_mutex);
+
+  uint64_t seq = producer_alloc_slot_locked ();
+  if (pool_terminate)
+    {
+      pthread_mutex_unlock (&pool_mutex);
+      return;
+    }
+
+  while (q_count >= WORK_QUEUE_CAP && !pool_terminate)
+    {
+      rob_try_commit_locked ();
+      if (q_count < WORK_QUEUE_CAP)
+        break;
+      pthread_cond_wait (&q_not_full_cv, &pool_mutex);
+    }
+
+  if (pool_terminate)
+    {
+      pthread_mutex_unlock (&pool_mutex);
+      return;
+    }
+
+  struct work_task *t = &work_queue[q_tail];
+  t->type = TASK_TYPE_STDIN;
+  t->seq = seq;
+  t->filename = nullptr;
+  t->follow = false;
+  t->command_line = true;
+
+  q_tail = (q_tail + 1) % WORK_QUEUE_CAP;
+  q_count++;
+
+  pthread_cond_signal (&q_not_empty_cv);
+  pthread_mutex_unlock (&pool_mutex);
+}
+
+static void
+producer_enqueue_error (int errnum, char const *fname)
+{
+  pthread_mutex_lock (&pool_mutex);
+  uint64_t seq = producer_alloc_slot_locked ();
+  struct rob_slot *slot = &rob[seq % ROB_CAP];
+
+  slot->status = true;
+  slot->errseen = true;
+  slot->had_prtext = false;
+
+  if (!suppress_errors)
+    {
+      char errbuf[2048];
+      int len;
+      if (errnum)
+        len = snprintf (errbuf, sizeof errbuf, "%s: %s: %s\n",
+                        getprogname (), fname, strerror (errnum));
+      else
+        len = snprintf (errbuf, sizeof errbuf, "%s: %s\n",
+                        getprogname (), fname);
+      if (len > 0)
+        {
+          slot->stderr_buf = ximemdup0 (errbuf, len);
+          slot->stderr_len = len;
+          slot->stderr_cap = len + 1;
+          slot->stderr_is_mmap = false;
+        }
+    }
+
+  slot->state = ROB_SLOT_DONE;
+  rob_try_commit_locked ();
+  pthread_mutex_unlock (&pool_mutex);
+}
+
+static void
+producer_enqueue_msg (int errnum, char const *fmt, char const *fname)
+{
+  pthread_mutex_lock (&pool_mutex);
+  uint64_t seq = producer_alloc_slot_locked ();
+  struct rob_slot *slot = &rob[seq % ROB_CAP];
+
+  slot->status = true;
+  slot->errseen = false;
+  slot->had_prtext = false;
+
+  if (!suppress_errors)
+    {
+      char msg[1024];
+      snprintf (msg, sizeof msg, fmt, fname);
+      char errbuf[2048];
+      int len;
+      if (errnum)
+        len = snprintf (errbuf, sizeof errbuf, "%s: %s: %s\n",
+                        getprogname (), msg, strerror (errnum));
+      else
+        len = snprintf (errbuf, sizeof errbuf, "%s: %s\n",
+                        getprogname (), msg);
+      if (len > 0)
+        {
+          slot->stderr_buf = ximemdup0 (errbuf, len);
+          slot->stderr_len = len;
+          slot->stderr_cap = len + 1;
+          slot->stderr_is_mmap = false;
+        }
+    }
+
+  slot->state = ROB_SLOT_DONE;
+  rob_try_commit_locked ();
+  pthread_mutex_unlock (&pool_mutex);
+}
+
+static void
+producer_enqueue_errseen (void)
+{
+  pthread_mutex_lock (&pool_mutex);
+  uint64_t seq = producer_alloc_slot_locked ();
+  struct rob_slot *slot = &rob[seq % ROB_CAP];
+  slot->status = true;
+  slot->errseen = true;
+  slot->had_prtext = false;
+  slot->state = ROB_SLOT_DONE;
+  rob_try_commit_locked ();
+  pthread_mutex_unlock (&pool_mutex);
+}
+
+static void
+producer_grepdirent (FTS *fts, FTSENT *ent, bool command_line)
+{
+  bool follow;
+  command_line &= ent->fts_level == FTS_ROOTLEVEL;
+
+  if (ent->fts_info == FTS_DP)
+    return;
+
+  if (!command_line
+      && skipped_file (ent->fts_name, false,
+                       (ent->fts_info == FTS_D || ent->fts_info == FTS_DC
+                        || ent->fts_info == FTS_DNR)))
+    {
+      fts_set (fts, ent, FTS_SKIP);
+      return;
+    }
+
+  char const *fname = ent->fts_path;
+  if (omit_dot_slash && fname[1])
+    fname += 2;
+  follow = (fts->fts_options & FTS_LOGICAL
+            || (fts->fts_options & FTS_COMFOLLOW && command_line));
+
+  switch (ent->fts_info)
+    {
+    case FTS_D:
+      if (directories == RECURSE_DIRECTORIES)
+        return;
+      fts_set (fts, ent, FTS_SKIP);
+      return;
+
+    case FTS_DC:
+      if (!suppress_errors)
+        producer_enqueue_msg (0, _("%s: warning: recursive directory loop"), fname);
+      return;
+
+    case FTS_DNR:
+    case FTS_ERR:
+    case FTS_NS:
+      if (!suppress_errors)
+        producer_enqueue_error (ent->fts_errno, fname);
+      else
+        producer_enqueue_errseen ();
+      return;
+
+    case FTS_DEFAULT:
+    case FTS_NSOK:
+      if (skip_devices (command_line))
+        {
+          struct stat *st = ent->fts_statp;
+          struct stat st1;
+          if (! st->st_mode)
+            {
+              int flag = follow ? 0 : AT_SYMLINK_NOFOLLOW;
+              if (fstatat (fts->fts_cwd_fd, ent->fts_accpath, &st1, flag) != 0)
+                {
+                  if (!suppress_errors)
+                    producer_enqueue_error (errno, fname);
+                  else
+                    producer_enqueue_errseen ();
+                  return;
+                }
+              st = &st1;
+            }
+          if (is_device_mode (st->st_mode))
+            return;
+        }
+      break;
+
+    case FTS_F:
+    case FTS_SLNONE:
+      break;
+
+    case FTS_SL:
+    case FTS_W:
+      return;
+
+    default:
+      abort ();
+    }
+
+  producer_enqueue_file (fname, follow, command_line);
+}
+
+static void
+producer_recurse_dir (char const *dir, bool command_line)
+{
+  FTS *fts;
+  FTSENT *ent;
+  int opts = fts_options & ~(command_line ? 0 : FTS_COMFOLLOW);
+  char *fts_arg[2];
+
+  fts_arg[0] = (char *) dir;
+  fts_arg[1] = nullptr;
+  fts = fts_open (fts_arg, opts, nullptr);
+  if (!fts)
+    xalloc_die ();
+
+  while ((ent = fts_read (fts)))
+    {
+      producer_grepdirent (fts, ent, command_line);
+    }
+  if (errno)
+    {
+      if (!suppress_errors)
+        producer_enqueue_error (errno, dir);
+      else
+        producer_enqueue_errseen ();
+    }
+  if (fts_close (fts) != 0)
+    {
+      if (!suppress_errors)
+        producer_enqueue_error (errno, dir);
+      else
+        producer_enqueue_errseen ();
+    }
+}
+
+static void
+producer_run (char *const *files)
+{
+  for (char *const *f = files; *f; ++f)
+    {
+      if (STREQ (*f, "-"))
+        {
+          producer_enqueue_stdin ();
+        }
+      else
+        {
+          struct stat st;
+          if (stat (*f, &st) == 0)
+            {
+              if (skipped_file (*f, true, S_ISDIR (st.st_mode) != 0))
+                continue;
+
+              if (S_ISDIR (st.st_mode) && directories == RECURSE_DIRECTORIES)
+                producer_recurse_dir (*f, true);
+              else
+                producer_enqueue_file (*f, true, true);
+            }
+          else
+            producer_enqueue_file (*f, true, true);
+        }
+    }
+}
+
+static void
+start_worker_pool (int nthreads)
+{
+  pool_nthreads = nthreads;
+  pool_threads = xnmalloc (pool_nthreads, sizeof *pool_threads);
+  pool_terminate = false;
+  next_seq = 0;
+  commit_seq = 0;
+  q_head = q_tail = q_count = 0;
+  overall_status = true;
+
+  pthread_attr_t attr;
+  pthread_attr_init (&attr);
+  pthread_attr_setstacksize (&attr, 1024 * 1024);
+
+  int created = 0;
+  for (int i = 0; i < pool_nthreads; ++i)
+    {
+      if (pthread_create (&pool_threads[i], &attr, worker_thread_func, NULL) == 0)
+        created++;
+      else
+        break;
+    }
+  pthread_attr_destroy (&attr);
+
+  if (created == 0 && pool_nthreads > 0)
+    pool_nthreads = 0;
+  else
+    pool_nthreads = created;
+}
+
+static void
+finish_worker_pool (void)
+{
+  pthread_mutex_lock (&pool_mutex);
+  while (commit_seq < next_seq)
+    {
+      rob_try_commit_locked ();
+      if (commit_seq >= next_seq)
+        break;
+      rob_done_waiters++;
+      pthread_cond_wait (&rob_done_cv, &pool_mutex);
+      rob_done_waiters--;
+    }
+
+  pool_terminate = true;
+  pthread_cond_broadcast (&q_not_empty_cv);
+  pthread_cond_broadcast (&q_not_full_cv);
+  pthread_cond_broadcast (&rob_space_cv);
+  pthread_mutex_unlock (&pool_mutex);
+
+  for (int i = 0; i < pool_nthreads; ++i)
+    pthread_join (pool_threads[i], NULL);
+
+
+  free (pool_threads);
+  pool_threads = NULL;
+  pool_nthreads = 0;
+}
+
 int
 main (int argc, char **argv)
 {
@@ -3384,12 +4154,8 @@ main (int argc, char **argv)
   if (! (0 < psize && psize <= (IDX_MAX - uword_size) / 2))
     abort ();
   pagesize = psize;
-
   if (fts_options & FTS_LOGICAL && devices == READ_COMMAND_LINE_DEVICES)
     devices = READ_DEVICES;
-
-  initial_out_quiet = out_quiet;
-  initial_done_on_match = done_on_match;
 
   char *const *files;
   if (0 < num_operands)
@@ -3408,15 +4174,45 @@ main (int argc, char **argv)
       files = stdin_only;
     }
 
-  bool status = true;
-  do
-    status &= grep_command_line_arg (*files++);
-  while (*files);
+  if (out_file < 0)
+    {
+      struct stat st;
+      if (files[0] && stat (files[0], &st) == 0)
+        out_file = !!S_ISDIR (st.st_mode);
+      else
+        out_file = 0;
+    }
 
-  membuf_init (&tls_out, 1024);
-  membuf_reset (&tls_out);
-  membuf_free (&tls_out);
-  free_compiled_pattern (compiled_pattern);
-  free_worker_buffer ();
-  return errseen ? EXIT_TROUBLE : status;
+  initial_out_quiet = out_quiet;
+  initial_done_on_match = done_on_match;
+
+  int nthreads = get_num_threads ();
+  struct stat tmp_st;
+  bool is_single_stdin = (num_operands == 0
+                          || (num_operands == 1 && STREQ (*files, "-")));
+  bool is_dir_recurse = (num_operands == 1
+                         && !STREQ (*files, "-")
+                         && directories == RECURSE_DIRECTORIES
+                         && stat (*files, &tmp_st) == 0
+                         && S_ISDIR (tmp_st.st_mode));
+
+  if (nthreads <= 1
+      || max_count < INTMAX_MAX
+      || is_single_stdin
+      || (num_operands == 1 && !is_dir_recurse))
+    {
+      init_worker_buffer ();
+      bool status = true;
+      do
+        status &= grep_command_line_arg (*files++);
+      while (*files);
+
+      return errseen ? EXIT_TROUBLE : status;
+    }
+
+  start_worker_pool (nthreads);
+  producer_run (files);
+  finish_worker_pool ();
+
+  return errseen ? EXIT_TROUBLE : overall_status;
 }
