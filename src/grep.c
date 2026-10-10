@@ -25,6 +25,13 @@
 #include <stdckdint.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <sched.h>
+#include <sys/mman.h>
+#if defined __AVX2__
+# include <immintrin.h>
+#endif
 #include "system.h"
 
 #include "argmatch.h"
@@ -779,11 +786,11 @@ buf_has_encoding_errors (char *buf, idx_t size)
 /* Return true if BUF, of size SIZE, has a null byte.
    BUF must be followed by at least one byte,
    which may be arbitrarily written to or read from.  */
-static bool
+static bool _GL_ATTRIBUTE_PURE
 buf_has_nulls (char *buf, idx_t size)
 {
   buf[size] = 0;
-  return strlen (buf) != size;
+  return memchr (buf, '\0', size) != nullptr;
 }
 
 /* Return true if a file is known to contain null bytes.
@@ -868,20 +875,21 @@ skipped_file (char const *name, bool command_line, bool is_dir)
    all reads aligned on a page boundary and multiples of the
    page size, unless a read yields a partial page.  */
 
-static char *buffer;		/* Base of buffer. */
-static idx_t bufalloc;		/* Allocated buffer size, counting slop. */
-static int bufdesc;		/* File descriptor. */
-static char *bufbeg;		/* Beginning of user-visible stuff. */
-static char *buflim;		/* Limit of user-visible stuff. */
+static _Thread_local char *buffer;		/* Base of buffer. */
+static _Thread_local idx_t bufalloc;		/* Allocated buffer size, counting slop. */
+static _Thread_local int bufdesc;		/* File descriptor. */
+static _Thread_local char *bufbeg;		/* Beginning of user-visible stuff. */
+static _Thread_local char *buflim;		/* Limit of user-visible stuff. */
 static idx_t pagesize;		/* alignment of memory pages */
-static idx_t good_readsize;	/* good size to pass to 'read' */
-static off_t bufoffset;		/* Read offset.  */
-static off_t after_last_match;	/* Pointer after last matching line that
+static _Thread_local idx_t good_readsize;	/* good size to pass to 'read' */
+static _Thread_local off_t bufoffset;		/* Read offset.  */
+static _Thread_local off_t after_last_match;	/* Pointer after last matching line that
                                    would have been output if we were
                                    outputting characters. */
-static bool skip_nuls;		/* Skip '\0' in data.  */
+static _Thread_local bool skip_nuls;		/* Skip ' ' in data.  */
 static bool skip_empty_lines;	/* Skip empty lines in data.  */
-static intmax_t totalnl;	/* Total newline count before lastnl. */
+static _Thread_local intmax_t totalnl;	/* Total newline count before lastnl. */
+static _Thread_local bool buffer_is_mmap;
 
 /* Minimum value for good_readsize.
    If it's too small, there are more syscalls;
@@ -900,6 +908,54 @@ enum { GOOD_READSIZE_MIN = 96 * 1024 };
    ? (val) \
    : (val) + ((alignment) - (uintptr_t) (val) % (alignment)))
 
+static void
+init_worker_buffer (void)
+{
+  if (buffer)
+    return;
+
+  size_t target_sizes[] = {
+    16 * 1024 * 1024,
+    2 * 1024 * 1024
+  };
+
+  for (size_t i = 0; i < sizeof target_sizes / sizeof target_sizes[0]; ++i)
+    {
+      size_t slab = target_sizes[i];
+      size_t alloc_sz = slab + pagesize + uword_size;
+      void *ptr = mmap (NULL, alloc_sz, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+      if (ptr != MAP_FAILED)
+        {
+          buffer = ptr;
+          bufalloc = alloc_sz;
+          buffer_is_mmap = true;
+          good_readsize = ALIGN_TO (GOOD_READSIZE_MIN, pagesize);
+          return;
+        }
+    }
+
+  good_readsize = ALIGN_TO (GOOD_READSIZE_MIN, pagesize);
+  bufalloc = 2 * good_readsize + pagesize + uword_size;
+  buffer = ximalloc (bufalloc);
+  buffer_is_mmap = false;
+}
+
+static void
+free_worker_buffer (void)
+{
+  if (buffer)
+    {
+      if (buffer_is_mmap)
+        munmap (buffer, bufalloc);
+      else
+        free (buffer);
+      buffer = nullptr;
+      bufalloc = 0;
+      buffer_is_mmap = false;
+    }
+}
+
 /* Add two numbers that count input bytes or lines, and report an
    error if the addition overflows.  */
 static intmax_t
@@ -912,12 +968,41 @@ add_count (intmax_t a, idx_t b)
 }
 
 /* Return true if BUF (of size SIZE) is all zeros.  */
-static bool
+static bool _GL_ATTRIBUTE_PURE
 all_zeros (char const *buf, idx_t size)
 {
-  for (char const *p = buf; p < buf + size; p++)
-    if (*p)
-      return false;
+  char const *p = buf;
+  char const *lim = buf + size;
+
+#if defined __AVX2__
+  while (lim - p >= 128)
+    {
+      __m256i v0 = _mm256_loadu_si256 ((__m256i const *) (void const *) (p + 0));
+      __m256i v1 = _mm256_loadu_si256 ((__m256i const *) (void const *) (p + 32));
+      __m256i v2 = _mm256_loadu_si256 ((__m256i const *) (void const *) (p + 64));
+      __m256i v3 = _mm256_loadu_si256 ((__m256i const *) (void const *) (p + 96));
+      __m256i or01 = _mm256_or_si256 (v0, v1);
+      __m256i or23 = _mm256_or_si256 (v2, v3);
+      __m256i orall = _mm256_or_si256 (or01, or23);
+      if (!_mm256_testz_si256 (orall, orall))
+        return false;
+      p += 128;
+    }
+  while (lim - p >= 32)
+    {
+      __m256i v = _mm256_loadu_si256 ((__m256i const *) (void const *) p);
+      if (!_mm256_testz_si256 (v, v))
+        return false;
+      p += 32;
+    }
+#endif
+
+  while (p < lim)
+    {
+      if (*p != 0)
+        return false;
+      p++;
+    }
   return true;
 }
 
@@ -926,9 +1011,14 @@ all_zeros (char const *buf, idx_t size)
 static bool
 reset (int fd, struct stat const *st)
 {
+  init_worker_buffer ();
   bufbeg = buflim = ALIGN_TO (buffer + 1, pagesize);
   bufbeg[-1] = eolbyte;
   bufdesc = fd;
+#ifdef F_SETPIPE_SZ
+  if (fd == STDIN_FILENO)
+    fcntl (STDIN_FILENO, F_SETPIPE_SZ, 1024 * 1024);
+#endif
   bufoffset = fd == STDIN_FILENO ? lseek (fd, 0, SEEK_CUR) : 0;
   seek_failed = bufoffset < 0;
 
@@ -975,6 +1065,7 @@ fillbuf (idx_t save, struct stat const *st)
          be read aft.  */
       ptrdiff_t incr_min = minsize - bufalloc + min_after_buflim;
 
+      idx_t old_bufalloc = bufalloc;
       if (incr_min <= 0)
         newbuf = buffer;
       else
@@ -1002,7 +1093,11 @@ fillbuf (idx_t save, struct stat const *st)
       memmove (readbuf - moved, buflim - moved, moved);
       if (0 < incr_min)
         {
-          free (buffer);
+          if (buffer_is_mmap)
+            munmap (buffer, old_bufalloc);
+          else
+            free (buffer);
+          buffer_is_mmap = false;
           buffer = newbuf;
         }
     }
@@ -1109,17 +1204,56 @@ static bool exit_on_match;	/* Exit on first match.  */
 static bool dev_null_output;	/* Stdout is known to be /dev/null.  */
 static bool binary;		/* Use binary rather than text I/O.  */
 
-static void
-nlscan (char const *lim)
+static idx_t _GL_ATTRIBUTE_PURE
+count_newlines (char const *beg, char const *lim)
 {
   idx_t newlines = 0;
-  for (char const *beg = lastnl; beg < lim; beg++)
+
+#if defined __AVX2__
+  if (lim - beg >= 128)
+    {
+      __m256i match_eol = _mm256_set1_epi8 (eolbyte);
+      while (lim - beg >= 128)
+        {
+          __m256i v0 = _mm256_loadu_si256 ((__m256i const *) (void const *) (beg + 0));
+          __m256i v1 = _mm256_loadu_si256 ((__m256i const *) (void const *) (beg + 32));
+          __m256i v2 = _mm256_loadu_si256 ((__m256i const *) (void const *) (beg + 64));
+          __m256i v3 = _mm256_loadu_si256 ((__m256i const *) (void const *) (beg + 96));
+          unsigned int m0 = _mm256_movemask_epi8 (_mm256_cmpeq_epi8 (v0, match_eol));
+          unsigned int m1 = _mm256_movemask_epi8 (_mm256_cmpeq_epi8 (v1, match_eol));
+          unsigned int m2 = _mm256_movemask_epi8 (_mm256_cmpeq_epi8 (v2, match_eol));
+          unsigned int m3 = _mm256_movemask_epi8 (_mm256_cmpeq_epi8 (v3, match_eol));
+          newlines += __builtin_popcount (m0) + __builtin_popcount (m1)
+                    + __builtin_popcount (m2) + __builtin_popcount (m3);
+          beg += 128;
+        }
+    }
+  while (lim - beg >= 32)
+    {
+      __m256i v = _mm256_loadu_si256 ((__m256i const *) (void const *) beg);
+      __m256i match_eol = _mm256_set1_epi8 (eolbyte);
+      unsigned int m = _mm256_movemask_epi8 (_mm256_cmpeq_epi8 (v, match_eol));
+      newlines += __builtin_popcount (m);
+      beg += 32;
+    }
+#endif
+
+  while (beg < lim)
     {
       beg = memchr (beg, eolbyte, lim - beg);
       if (!beg)
         break;
       newlines++;
+      beg++;
     }
+
+  return newlines;
+}
+
+static void
+nlscan (char const *lim)
+{
+  idx_t newlines = count_newlines (lastnl, lim);
   totalnl = add_count (totalnl, newlines);
   lastnl = lim;
 }
@@ -3003,9 +3137,6 @@ main (int argc, char **argv)
   if (! (0 < psize && psize <= (IDX_MAX - uword_size) / 2))
     abort ();
   pagesize = psize;
-  good_readsize = ALIGN_TO (GOOD_READSIZE_MIN, pagesize);
-  bufalloc = good_readsize + pagesize + uword_size;
-  buffer = ximalloc (bufalloc);
 
   if (fts_options & FTS_LOGICAL && devices == READ_COMMAND_LINE_DEVICES)
     devices = READ_DEVICES;
@@ -3032,5 +3163,6 @@ main (int argc, char **argv)
     status &= grep_command_line_arg (*files++);
   while (*files);
 
+  free_worker_buffer ();
   return errseen ? EXIT_TROUBLE : status;
 }
