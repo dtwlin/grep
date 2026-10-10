@@ -3000,7 +3000,8 @@ struct chunk_file_state
   struct match_record *matches;
   size_t match_count;
   size_t match_cap;
-  bool match_overflow;
+  _Atomic bool match_overflow;
+  int offset_width;
 };
 
 enum { WORK_QUEUE_CAP = 256 };
@@ -3033,6 +3034,8 @@ static char *slice_freelist[SLICE_POOL_CAP];
 static int slice_freelist_cnt = 0;
 static pthread_cond_t slice_avail_cv = PTHREAD_COND_INITIALIZER;
 
+static _Atomic bool binary_stream_reported;
+
 static char *
 alloc_slice_buf_locked (void)
 {
@@ -3043,7 +3046,12 @@ alloc_slice_buf_locked (void)
   void *p = mmap (NULL, buf_sz, PROT_READ | PROT_WRITE,
                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
   if (p == MAP_FAILED)
-    p = xmalloc (buf_sz);
+    {
+      p = mmap (NULL, buf_sz, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      if (p == MAP_FAILED)
+        xalloc_die ();
+    }
   return p;
 }
 
@@ -3353,7 +3361,7 @@ worker_thread_func (void *arg)
           bool matched = (off >= 0);
           if (!out_invert && off >= 0 && cbeg + off == clim)
             matched = false;
-          state->chunk_has_matches[idx] = matched ^ out_invert;
+          state->chunk_has_matches[idx] = out_invert ? true : matched;
 
           if (state->chunk_has_matches[idx] && !out_invert && !count_matches
               && list_files == LISTFILES_NONE)
@@ -3364,6 +3372,9 @@ worker_thread_func (void *arg)
 
               while (p < clim)
                 {
+                  if (out_before <= 0 && out_after <= 0 && atomic_load (&state->match_overflow))
+                    break;
+
                   ptrdiff_t mo;
                   if (p == cbeg && off >= 0 && !out_invert)
                     mo = off;
@@ -3394,8 +3405,14 @@ worker_thread_func (void *arg)
                         }
 
                       pthread_mutex_lock (&state->match_mutex);
-                      if (state->match_count < state->match_cap)
+                      if (out_before > 0 || out_after > 0)
                         {
+                          if (state->match_count >= state->match_cap)
+                            {
+                              state->match_cap *= 2;
+                              state->matches = xrealloc (state->matches,
+                                                         state->match_cap * sizeof *state->matches);
+                            }
                           state->matches[state->match_count].chunk_idx = idx;
                           state->matches[state->match_count].line_beg = lbeg;
                           state->matches[state->match_count].line_end = lend;
@@ -3403,7 +3420,18 @@ worker_thread_func (void *arg)
                           state->match_count++;
                         }
                       else
-                        state->match_overflow = true;
+                        {
+                          if (state->match_count < state->match_cap)
+                            {
+                              state->matches[state->match_count].chunk_idx = idx;
+                              state->matches[state->match_count].line_beg = lbeg;
+                              state->matches[state->match_count].line_end = lend;
+                              state->matches[state->match_count].rel_nl = running_nl;
+                              state->match_count++;
+                            }
+                          else
+                            atomic_store (&state->match_overflow, true);
+                        }
                       pthread_mutex_unlock (&state->match_mutex);
                     }
                   p = endp;
@@ -3458,6 +3486,15 @@ worker_thread_func (void *arg)
           totalcc = task.chunk_totalcc;
           totalnl = task.chunk_lineno_offset;
           lastnl = bufbeg;
+
+          offset_width = 0;
+          if (align_tabs)
+            {
+              intmax_t num = INTMAX_MAX;
+              do
+                offset_width++;
+              while ((num /= 10) != 0);
+            }
 
           if (out_line && !out_quiet && !task.is_binary_stream && !count_matches && list_files == LISTFILES_NONE)
             {
@@ -3542,8 +3579,9 @@ worker_thread_func (void *arg)
               intmax_t lines_matched = grepbuf (bufbeg, buflim);
               if (lines_matched > 0)
                 {
-                  task_error (0, _("%s: binary file matches"),
-                              label ? label : _("(standard input)"));
+                  if (!atomic_exchange (&binary_stream_reported, true))
+                    task_error (0, _("%s: binary file matches"),
+                                label ? label : _("(standard input)"));
                   status = false;
                 }
               else
@@ -3570,6 +3608,13 @@ worker_thread_func (void *arg)
           totalnl = task.chunk_lineno_offset;
           lastnl = (char *) task.chunk_data;
 
+          if (task.shared_state)
+            offset_width = ((struct chunk_file_state *) task.shared_state)->offset_width;
+          else
+            offset_width = 0;
+
+          encoding_error_output = false;
+
           if (task.mode == CHUNK_MODE_COUNT)
             {
               struct chunk_file_state *state = task.shared_state;
@@ -3595,6 +3640,8 @@ worker_thread_func (void *arg)
             {
               intmax_t lines_matched = grepbuf (bufbeg, buflim);
               status = (lines_matched == 0);
+              if (binary_files == BINARY_BINARY_FILES && !out_quiet && encoding_error_output)
+                task_error (0, _("%s: binary file matches"), input_filename ());
             }
         }
 
@@ -4023,6 +4070,10 @@ format_context_matches_to_rob (char const *fname, struct chunk_file_state *state
   outleft = max_count;
   file_used = false;
 
+  int saved_offset_width = offset_width;
+  offset_width = state->offset_width;
+  encoding_error_output = false;
+
   for (size_t i = 0; i < state->match_count; ++i)
     {
       if (outleft == 0)
@@ -4055,6 +4106,11 @@ format_context_matches_to_rob (char const *fname, struct chunk_file_state *state
     }
   if (pending > 0)
     prpending (buflim);
+
+  if (binary_files == BINARY_BINARY_FILES && !out_quiet && encoding_error_output)
+    task_error (0, _("%s: binary file matches"), fname);
+
+  offset_width = saved_offset_width;
 
   out = tls_out;
   tls_out = saved_out;
@@ -4176,7 +4232,8 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
   data[file_size] = eolbyte;
 
   if (eolbyte && binary_files != TEXT_BINARY_FILES
-      && memchr (data, '\0', MIN (file_size, 64 * 1024)) != nullptr)
+      && (memchr (data, '\0', MIN (file_size, 64 * 1024)) != nullptr
+          || file_must_have_nulls (0, fd, &st)))
     {
       munmap (base, total_alloc);
       if (close_fd)
@@ -4224,6 +4281,15 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
   state->fname_allocated = true;
   state->num_chunks = num_chunks;
   state->bounds = bounds;
+  state->offset_width = 0;
+  if (align_tabs)
+    {
+      intmax_t num = usable_st_size (&st) ? st.st_size : INTMAX_MAX;
+      num += out_line && num < INTMAX_MAX;
+      do
+        state->offset_width++;
+      while ((num /= 10) != 0);
+    }
   atomic_init (&state->chunks_completed, 0);
   atomic_init (&state->total_count, 0);
   atomic_init (&state->has_match, false);
@@ -4350,10 +4416,10 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
   state->chunk_nls = xnmalloc (num_chunks, sizeof *state->chunk_nls);
   state->prefix_nls = xnmalloc (num_chunks + 1, sizeof *state->prefix_nls);
   state->chunk_has_matches = xnmalloc (num_chunks, sizeof *state->chunk_has_matches);
-  state->match_cap = 65536;
+  state->match_cap = (out_before > 0 || out_after > 0) ? 65536 : 4096;
   state->matches = xnmalloc (state->match_cap, sizeof *state->matches);
   state->match_count = 0;
-  state->match_overflow = false;
+  atomic_init (&state->match_overflow, false);
 
   /* Pass 1: MMAP Scan tasks */
   pthread_mutex_lock (&pool_mutex);
@@ -4399,7 +4465,7 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
   /* Sparse match fast-path (context lines or rare matches with line numbers/byte offsets) */
   if ((out_before > 0 || out_after > 0)
       || (!out_invert && !count_matches && list_files == LISTFILES_NONE
-          && !state->match_overflow && state->match_count < state->match_cap))
+          && !atomic_load (&state->match_overflow) && state->match_count < state->match_cap))
     {
       format_context_matches_to_rob (fname, state);
       return;
