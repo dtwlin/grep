@@ -166,6 +166,10 @@ find_must_literal (char const *pat, idx_t size, idx_t *out_len)
   if (memchr (pat, '|', size))
     return nullptr;
 
+  for (idx_t i = 0; i + 1 < size; ++i)
+    if (pat[i] == '\\' && (pat[i+1] == 'Q' || pat[i+1] == 'E' || pat[i+1] == 'c'))
+      return nullptr;
+
   char const *best_str = nullptr;
   idx_t best_len = 0;
   idx_t p = 0;
@@ -174,6 +178,16 @@ find_must_literal (char const *pat, idx_t size, idx_t *out_len)
     {
       if (pat[p] == '(')
         {
+          if (p + 1 < size && pat[p + 1] == '?')
+            {
+              bool ok = false;
+              if (p + 2 < size && (pat[p + 2] == ':' || pat[p + 2] == '='))
+                ok = true;
+              else if (p + 3 < size && pat[p + 2] == '<' && pat[p + 3] == '=')
+                ok = true;
+              if (!ok)
+                return nullptr;
+            }
           int depth = 1;
           p++;
           while (p < size && depth > 0)
@@ -193,8 +207,20 @@ find_must_literal (char const *pat, idx_t size, idx_t *out_len)
               else
                 p++;
             }
-          while (p < size && (pat[p] == '*' || pat[p] == '?'))
-            p++;
+          while (p < size)
+            {
+              if (pat[p] == '*' || pat[p] == '?' || pat[p] == '+')
+                p++;
+              else if (pat[p] == '{')
+                {
+                  while (p < size && pat[p] != '}')
+                    p++;
+                  if (p < size && pat[p] == '}')
+                    p++;
+                }
+              else
+                break;
+            }
           continue;
         }
 
@@ -212,8 +238,20 @@ find_must_literal (char const *pat, idx_t size, idx_t *out_len)
             }
           if (p < size && pat[p] == ']')
             p++;
-          while (p < size && (pat[p] == '*' || pat[p] == '?'))
-            p++;
+          while (p < size)
+            {
+              if (pat[p] == '*' || pat[p] == '?' || pat[p] == '+')
+                p++;
+              else if (pat[p] == '{')
+                {
+                  while (p < size && pat[p] != '}')
+                    p++;
+                  if (p < size && pat[p] == '}')
+                    p++;
+                }
+              else
+                break;
+            }
           continue;
         }
 
@@ -232,7 +270,7 @@ find_must_literal (char const *pat, idx_t size, idx_t *out_len)
       idx_t run_start = p;
       while (p < size && is_lit_char (pat[p]))
         {
-          if (p + 1 < size && (pat[p + 1] == '*' || pat[p + 1] == '?'))
+          if (p + 1 < size && (pat[p + 1] == '*' || pat[p + 1] == '?' || pat[p + 1] == '{'))
             break;
           p++;
         }
@@ -244,9 +282,20 @@ find_must_literal (char const *pat, idx_t size, idx_t *out_len)
           best_str = pat + run_start;
         }
 
-      if (p < size && is_lit_char (pat[p]) && p + 1 < size &&
-          (pat[p + 1] == '*' || pat[p + 1] == '?'))
-        p += 2;
+      if (p < size && is_lit_char (pat[p]) && p + 1 < size
+          && (pat[p + 1] == '*' || pat[p + 1] == '?' || pat[p + 1] == '{'))
+        {
+          p++;
+          if (pat[p] == '{')
+            {
+              while (p < size && pat[p] != '}')
+                p++;
+              if (p < size && pat[p] == '}')
+                p++;
+            }
+          else
+            p++;
+        }
     }
 
   if (best_len >= 2)
@@ -376,13 +425,13 @@ Pcompile (char *pattern, idx_t size, reg_syntax_t ignored, bool exact)
 
   pc->must_kwset = nullptr;
   pc->is_clone = false;
-  if (!match_lines && !match_words && (!match_icase || MB_CUR_MAX == 1))
+  if (!match_lines && !match_words && (!match_icase || !localeinfo.multibyte))
     {
       idx_t lit_len = 0;
       char *lit = find_must_literal (pattern, size, &lit_len);
       if (lit)
         {
-          kwset_t kws = kwsinit (false);
+          kwset_t kws = kwsinit (true);
           kwsincr (kws, lit, lit_len);
           kwsprep (kws);
           pc->must_kwset = kws;

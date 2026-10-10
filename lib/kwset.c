@@ -476,6 +476,44 @@ collect_prefixes_l0 (struct tree const *node, struct prefix_collector *coll)
     collect_prefixes_l1 (node->trie->links, node->label, coll);
   collect_prefixes_l0 (node->rlink, coll);
 }
+
+static bool
+compute_simd_byte_mask (char const *trans, uint8_t target_byte,
+                        uint8_t *out_mask, uint8_t *out_val)
+{
+  if (!trans)
+    {
+      *out_mask = 0xFF;
+      *out_val = target_byte;
+      return true;
+    }
+  int count = 0;
+  uint8_t m0 = 0, m1 = 0;
+  for (int b = 0; b < NCHAR; b++)
+    if ((uint8_t) trans[b] == target_byte)
+      {
+        if (count == 0) m0 = (uint8_t) b;
+        else if (count == 1) m1 = (uint8_t) b;
+        count++;
+      }
+  if (count == 1)
+    {
+      *out_mask = 0xFF;
+      *out_val = m0;
+      return true;
+    }
+  if (count == 2)
+    {
+      uint8_t diff = m0 ^ m1;
+      if ((diff & (diff - 1)) == 0)
+        {
+          *out_mask = (uint8_t) ~diff;
+          *out_val = (uint8_t) (m0 & ~diff);
+          return true;
+        }
+    }
+  return false;
+}
 #endif
 
 void
@@ -655,40 +693,12 @@ kwsprep (kwset_t kwset)
       uint8_t c0 = (uint8_t) kwset->target[0];
       uint8_t c1 = (uint8_t) kwset->target[len - 1];
 
-      if (trans)
+      if (compute_simd_byte_mask (trans, c0, &kwset->simd_first_mask, &kwset->simd_first_val)
+          && compute_simd_byte_mask (trans, c1, &kwset->simd_last_mask, &kwset->simd_last_val))
         {
-          if (('A' <= c0 && c0 <= 'Z') || ('a' <= c0 && c0 <= 'z'))
-            {
-              kwset->simd_first_mask = 0xDF;
-              kwset->simd_first_val = (uint8_t) toupper (c0);
-            }
-          else
-            {
-              kwset->simd_first_mask = 0xFF;
-              kwset->simd_first_val = (uint8_t) tr (trans, c0);
-            }
-
-          if (('A' <= c1 && c1 <= 'Z') || ('a' <= c1 && c1 <= 'z'))
-            {
-              kwset->simd_last_mask = 0xDF;
-              kwset->simd_last_val = (uint8_t) toupper (c1);
-            }
-          else
-            {
-              kwset->simd_last_mask = 0xFF;
-              kwset->simd_last_val = (uint8_t) tr (trans, c1);
-            }
+          kwset->simd_last_offset = len - 1;
+          kwset->simd_pair_ready = true;
         }
-      else
-        {
-          kwset->simd_first_mask = 0xFF;
-          kwset->simd_first_val = c0;
-          kwset->simd_last_mask = 0xFF;
-          kwset->simd_last_val = c1;
-        }
-
-      kwset->simd_last_offset = len - 1;
-      kwset->simd_pair_ready = true;
     }
   else if (!reverse && kwset->words <= 32 && kwset->mind >= 2)
     {
@@ -707,20 +717,19 @@ kwsprep (kwset_t kwset)
               unsigned char b0 = coll.b0[p];
               unsigned char b1 = coll.b1[p];
 
-              t0_lo[b0 & 0x0F] |= bit;
-              t0_hi[(b0 >> 4) & 0x0F] |= bit;
-              t1_lo[b1 & 0x0F] |= bit;
-              t1_hi[(b1 >> 4) & 0x0F] |= bit;
-
-              if (trans)
+              for (int b = 0; b < NCHAR; b++)
                 {
-                  unsigned char b0_alt = isupper (b0) ? tolower (b0) : (islower (b0) ? toupper (b0) : b0);
-                  t0_lo[b0_alt & 0x0F] |= bit;
-                  t0_hi[(b0_alt >> 4) & 0x0F] |= bit;
-
-                  unsigned char b1_alt = isupper (b1) ? tolower (b1) : (islower (b1) ? toupper (b1) : b1);
-                  t1_lo[b1_alt & 0x0F] |= bit;
-                  t1_hi[(b1_alt >> 4) & 0x0F] |= bit;
+                  unsigned char tb = trans ? U(trans[b]) : (unsigned char) b;
+                  if (tb == b0)
+                    {
+                      t0_lo[b & 0x0F] |= bit;
+                      t0_hi[(b >> 4) & 0x0F] |= bit;
+                    }
+                  if (tb == b1)
+                    {
+                      t1_lo[b & 0x0F] |= bit;
+                      t1_hi[(b >> 4) & 0x0F] |= bit;
+                    }
                 }
             }
 
@@ -1048,16 +1057,23 @@ acexec_trans (kwset_t kwset, char const *text, idx_t len,
       unsigned char c;
       int gc1 = kwset->gc1;
 
+#if defined __AVX2__
+      __m256i mask_0f, t0_lo, t0_hi, t1_lo, t1_hi;
+      if (kwset->teddy_active)
+        {
+          mask_0f = _mm256_set1_epi8 (0x0F);
+          t0_lo = _mm256_loadu_si256 ((const __m256i *) (const void *) kwset->teddy_t0_lo);
+          t0_hi = _mm256_loadu_si256 ((const __m256i *) (const void *) kwset->teddy_t0_hi);
+          t1_lo = _mm256_loadu_si256 ((const __m256i *) (const void *) kwset->teddy_t1_lo);
+          t1_hi = _mm256_loadu_si256 ((const __m256i *) (const void *) kwset->teddy_t1_hi);
+        }
+#endif
+
       while (true)
         {
 #if defined __AVX2__
           if (kwset->teddy_active && lim - tp >= 34)
             {
-              __m256i mask_0f = _mm256_set1_epi8 (0x0F);
-              __m256i t0_lo = _mm256_loadu_si256 ((const __m256i *) (const void *) kwset->teddy_t0_lo);
-              __m256i t0_hi = _mm256_loadu_si256 ((const __m256i *) (const void *) kwset->teddy_t0_hi);
-              __m256i t1_lo = _mm256_loadu_si256 ((const __m256i *) (const void *) kwset->teddy_t1_lo);
-              __m256i t1_hi = _mm256_loadu_si256 ((const __m256i *) (const void *) kwset->teddy_t1_hi);
               while (lim - tp >= 34)
                 {
                   __m256i v0 = _mm256_loadu_si256 ((const __m256i *) (const void *) tp);
@@ -1075,7 +1091,15 @@ acexec_trans (kwset_t kwset, char const *text, idx_t len,
                   if (_mm256_testz_si256 (match, match))
                     tp += 32;
                   else
-                    break;
+                    {
+                      uint32_t mask = ~(uint32_t) _mm256_movemask_epi8 (_mm256_cmpeq_epi8 (match, _mm256_setzero_si256 ()));
+                      tp += __builtin_ctz (mask);
+                      c = tr (trans, *tp++);
+                      trie = kwset->next[c];
+                      if (!trie)
+                        continue;
+                      goto have_first_trie;
+                    }
                 }
             }
 #endif
@@ -1094,6 +1118,7 @@ acexec_trans (kwset_t kwset, char const *text, idx_t len,
               trie = kwset->next[c];
             }
 
+        have_first_trie:
           while (true)
             {
               if (trie->accepting)

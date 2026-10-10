@@ -357,10 +357,10 @@ static char *
 safe_dfaexec (struct dfa *d, char const *begin, char *end,
               char const *buflim, idx_t *count, bool *backref)
 {
-  if (end < buflim)
+  idx_t len = end - begin;
+  if (end < buflim && *(unsigned char const *) end == (unsigned char) eolbyte)
     return dfaexec (d, begin, end, 0, count, backref);
 
-  idx_t len = end - begin;
   char stackbuf[4096];
 
   if (len >= sizeof stackbuf && end > begin + 1)
@@ -369,12 +369,14 @@ safe_dfaexec (struct dfa *d, char const *begin, char *end,
       if (prev_nl)
         {
           char *split = prev_nl + 1;
-          /* split < buflim is strictly inside this worker's chunk, so dfaexec can safely write *split = eol */
-          char *r1 = dfaexec (d, begin, split, 0, count, backref);
-          if (r1 && r1 < split)
-            return r1;
-          begin = split;
-          len = end - begin;
+          if (split < buflim)
+            {
+              char *r1 = dfaexec (d, begin, split, 0, count, backref);
+              if (r1 && r1 < split)
+                return r1;
+              begin = split;
+              len = end - begin;
+            }
         }
     }
 
