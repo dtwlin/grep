@@ -946,17 +946,34 @@ buf_has_encoding_errors (char *buf, idx_t size)
   if (! unibyte_mask)
     return false;
 
+  /* Fast path: if the line contains only ASCII / easy bytes, it cannot have encoding errors.
+     Scan without modifying buf to avoid CoW page dirtying. */
+  char const *p = buf;
+  char const *lim = buf + size;
+  while (p < lim && ! (to_uchar (*p) & unibyte_mask))
+    p++;
+  if (p == lim)
+    return false;
+
   mbstate_t mbs; mbszero (&mbs);
   ptrdiff_t clen;
 
-  buf[size] = -1;
-  for (char const *p = buf; (p = skip_easy_bytes (p)) < buf + size; p += clen)
+  char saved = buf[size];
+  if (saved != -1)
+    buf[size] = -1;
+  for (p = buf; (p = skip_easy_bytes (p)) < buf + size; p += clen)
     {
       clen = imbrlen (p, buf + size - p, &mbs);
       if (clen < 0)
-        return true;
+        {
+          if (saved != -1)
+            buf[size] = saved;
+          return true;
+        }
     }
 
+  if (saved != -1)
+    buf[size] = saved;
   return false;
 }
 
@@ -1481,11 +1498,9 @@ print_offset (intmax_t pos, const char *color)
 static bool
 print_line_head (char *beg, idx_t len, char const *lim, char sep)
 {
-  if (binary_files != TEXT_BINARY_FILES)
+  if (binary_files != TEXT_BINARY_FILES && unibyte_mask)
     {
-      char ch = beg[len];
       bool encoding_errors = buf_has_encoding_errors (beg, len);
-      beg[len] = ch;
       if (encoding_errors)
         {
           encoding_error_output = true;
@@ -3008,39 +3023,52 @@ static pthread_cond_t rob_done_cv = PTHREAD_COND_INITIALIZER;
 static size_t rob_space_waiters = 0;
 static size_t rob_done_waiters = 0;
 
+static bool pool_terminate;
+static void rob_try_commit_locked (void);
+
 enum { SLICE_BUF_SIZE = 4 * 1024 * 1024 };
-static char *slice_freelist[64];
+enum { SLICE_POOL_CAP = 32 };
+static char *slice_freelist[SLICE_POOL_CAP];
 static int slice_freelist_cnt = 0;
+static pthread_cond_t slice_avail_cv = PTHREAD_COND_INITIALIZER;
 
 static char *
 alloc_slice_buf_locked (void)
 {
   if (slice_freelist_cnt > 0)
     return slice_freelist[--slice_freelist_cnt];
-  return xmalloc (SLICE_BUF_SIZE + 2 + uword_size);
+
+  size_t buf_sz = SLICE_BUF_SIZE + 2 + uword_size;
+  void *p = mmap (NULL, buf_sz, PROT_READ | PROT_WRITE,
+                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+  if (p == MAP_FAILED)
+    p = xmalloc (buf_sz);
+  return p;
 }
 
 static void
 free_slice_buf_locked (char *ptr)
 {
-  if (slice_freelist_cnt < 64)
-    slice_freelist[slice_freelist_cnt++] = ptr;
+  if (slice_freelist_cnt < SLICE_POOL_CAP)
+    {
+      slice_freelist[slice_freelist_cnt++] = ptr;
+      pthread_cond_signal (&slice_avail_cv);
+    }
   else
-    free (ptr);
+    munmap (ptr, SLICE_BUF_SIZE + 2 + uword_size);
 }
 
 static void
 cleanup_slice_freelist (void)
 {
   for (int i = 0; i < slice_freelist_cnt; ++i)
-    free (slice_freelist[i]);
+    munmap (slice_freelist[i], SLICE_BUF_SIZE + 2 + uword_size);
   slice_freelist_cnt = 0;
 }
 
 static int pool_nthreads;
 static pthread_t *pool_threads;
 static bool overall_status = true;
-static bool pool_terminate;
 
 static intmax_t chunk_accumulated_count = 0;
 static bool chunk_has_any_match = false;
@@ -3643,49 +3671,96 @@ worker_thread_func (void *arg)
   return NULL;
 }
 
+enum { PRODUCER_BATCH_SIZE = 32 };
+
+struct producer_batch_item
+{
+  char *filename;
+  bool follow;
+  bool command_line;
+};
+
+static struct producer_batch_item producer_batch[PRODUCER_BATCH_SIZE];
+static size_t producer_batch_count = 0;
+
+static void
+producer_flush_batch (void)
+{
+  if (producer_batch_count == 0)
+    return;
+
+  pthread_mutex_lock (&pool_mutex);
+
+  for (size_t i = 0; i < producer_batch_count; ++i)
+    {
+      if (pool_terminate)
+        {
+          for (size_t j = i; j < producer_batch_count; ++j)
+            free (producer_batch[j].filename);
+          producer_batch_count = 0;
+          pthread_mutex_unlock (&pool_mutex);
+          return;
+        }
+
+      uint64_t seq = producer_alloc_slot_locked ();
+      if (pool_terminate)
+        {
+          for (size_t j = i; j < producer_batch_count; ++j)
+            free (producer_batch[j].filename);
+          producer_batch_count = 0;
+          pthread_mutex_unlock (&pool_mutex);
+          return;
+        }
+
+      while (q_count >= WORK_QUEUE_CAP && !pool_terminate)
+        {
+          rob_try_commit_locked ();
+          if (q_count < WORK_QUEUE_CAP)
+            break;
+          pthread_cond_wait (&q_not_full_cv, &pool_mutex);
+        }
+
+      if (pool_terminate)
+        {
+          for (size_t j = i; j < producer_batch_count; ++j)
+            free (producer_batch[j].filename);
+          producer_batch_count = 0;
+          pthread_mutex_unlock (&pool_mutex);
+          return;
+        }
+
+      struct work_task *t = &work_queue[q_tail];
+      t->type = TASK_TYPE_FILE;
+      t->seq = seq;
+      t->filename = producer_batch[i].filename;
+      t->follow = producer_batch[i].follow;
+      t->command_line = producer_batch[i].command_line;
+
+      q_tail = (q_tail + 1) % WORK_QUEUE_CAP;
+      q_count++;
+    }
+
+  producer_batch_count = 0;
+  pthread_cond_broadcast (&q_not_empty_cv);
+  pthread_mutex_unlock (&pool_mutex);
+}
+
 static void
 producer_enqueue_file (char const *fname, bool follow, bool command_line)
 {
-  pthread_mutex_lock (&pool_mutex);
+  producer_batch[producer_batch_count].filename = xstrdup (fname);
+  producer_batch[producer_batch_count].follow = follow;
+  producer_batch[producer_batch_count].command_line = command_line;
+  producer_batch_count++;
 
-  uint64_t seq = producer_alloc_slot_locked ();
-  if (pool_terminate)
-    {
-      pthread_mutex_unlock (&pool_mutex);
-      return;
-    }
-
-  while (q_count >= WORK_QUEUE_CAP && !pool_terminate)
-    {
-      rob_try_commit_locked ();
-      if (q_count < WORK_QUEUE_CAP)
-        break;
-      pthread_cond_wait (&q_not_full_cv, &pool_mutex);
-    }
-
-  if (pool_terminate)
-    {
-      pthread_mutex_unlock (&pool_mutex);
-      return;
-    }
-
-  struct work_task *t = &work_queue[q_tail];
-  t->type = TASK_TYPE_FILE;
-  t->seq = seq;
-  t->filename = xstrdup (fname);
-  t->follow = follow;
-  t->command_line = command_line;
-
-  q_tail = (q_tail + 1) % WORK_QUEUE_CAP;
-  q_count++;
-
-  pthread_cond_signal (&q_not_empty_cv);
-  pthread_mutex_unlock (&pool_mutex);
+  if (producer_batch_count == PRODUCER_BATCH_SIZE)
+    producer_flush_batch ();
 }
 
 static void
 producer_enqueue_stdin (void)
 {
+  producer_flush_batch ();
   pthread_mutex_lock (&pool_mutex);
 
   uint64_t seq = producer_alloc_slot_locked ();
@@ -3726,6 +3801,7 @@ producer_enqueue_stdin (void)
 static void
 producer_enqueue_error (int errnum, char const *fname)
 {
+  producer_flush_batch ();
   pthread_mutex_lock (&pool_mutex);
   uint64_t seq = producer_alloc_slot_locked ();
   struct rob_slot *slot = &rob[seq % ROB_CAP];
@@ -3761,6 +3837,7 @@ producer_enqueue_error (int errnum, char const *fname)
 static void
 producer_enqueue_msg (int errnum, char const *fmt, char const *fname)
 {
+  producer_flush_batch ();
   pthread_mutex_lock (&pool_mutex);
   uint64_t seq = producer_alloc_slot_locked ();
   struct rob_slot *slot = &rob[seq % ROB_CAP];
@@ -3798,6 +3875,7 @@ producer_enqueue_msg (int errnum, char const *fmt, char const *fname)
 static void
 producer_enqueue_errseen (void)
 {
+  producer_flush_batch ();
   pthread_mutex_lock (&pool_mutex);
   uint64_t seq = producer_alloc_slot_locked ();
   struct rob_slot *slot = &rob[seq % ROB_CAP];
@@ -3809,6 +3887,8 @@ producer_enqueue_errseen (void)
   pthread_mutex_unlock (&pool_mutex);
 }
 
+static _Atomic uint64_t retained_mmap_bytes = 0;
+
 static void
 cleanup_chunk_file_state (void *arg)
 {
@@ -3816,10 +3896,23 @@ cleanup_chunk_file_state (void *arg)
   if (!state)
     return;
 
-  if (state->base_addr && state->base_addr != MAP_FAILED)
-    munmap (state->base_addr, state->base_size);
-  else if (state->mmap_data && state->mmap_data != MAP_FAILED)
-    munmap (state->mmap_data, state->mmap_size);
+  bool skip_munmap = false;
+  if (state->mmap_size >= (16 << 20))
+    {
+      uint64_t prev = atomic_fetch_add_explicit (&retained_mmap_bytes,
+                                                 state->base_size ? state->base_size : state->mmap_size,
+                                                 memory_order_relaxed);
+      if (prev + (state->base_size ? state->base_size : state->mmap_size) <= (4ULL << 30))
+        skip_munmap = true;
+    }
+
+  if (!skip_munmap)
+    {
+      if (state->base_addr && state->base_addr != MAP_FAILED)
+        munmap (state->base_addr, state->base_size);
+      else if (state->mmap_data && state->mmap_data != MAP_FAILED)
+        munmap (state->mmap_data, state->mmap_size);
+    }
 
   if (state->close_fd && state->file_desc >= 0)
     close (state->file_desc);
@@ -4068,7 +4161,6 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
 
   data[-1] = eolbyte;
   data[file_size] = eolbyte;
-  posix_madvise (data, file_size, POSIX_MADV_WILLNEED);
 
   if (eolbyte && binary_files != TEXT_BINARY_FILES
       && memchr (data, '\0', MIN (file_size, 64 * 1024)) != nullptr)
@@ -4084,11 +4176,11 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
       return;
     }
 
-  size_t num_chunks = pool_nthreads * 4;
-  if (num_chunks < 8)
-    num_chunks = 8;
-  if (num_chunks > 128)
-    num_chunks = 128;
+  size_t num_chunks = pool_nthreads * 2;
+  if (num_chunks < 2)
+    num_chunks = 2;
+  if (num_chunks > 64)
+    num_chunks = 64;
   size_t min_chunk_size = 2 * 1024 * 1024;
   if (file_size / num_chunks < min_chunk_size)
     num_chunks = file_size / min_chunk_size;
@@ -4668,6 +4760,7 @@ producer_grepdirent (FTS *fts, FTSENT *ent, bool command_line)
           && ent->fts_statp->st_size >= 2 * 1024 * 1024 && pool_nthreads > 1
           && (!out_invert || (out_before <= 0 && out_after <= 0)))
         {
+          producer_flush_batch ();
           chunked_grep_file (fname, ent->fts_statp);
           return;
         }
@@ -4702,6 +4795,7 @@ producer_recurse_dir (char const *dir, bool command_line)
     {
       producer_grepdirent (fts, ent, command_line);
     }
+  producer_flush_batch ();
   if (errno)
     {
       if (!suppress_errors)
@@ -4762,6 +4856,7 @@ producer_run (char *const *files)
             producer_enqueue_file (*f, true, true);
         }
     }
+  producer_flush_batch ();
 }
 
 static void
@@ -4799,6 +4894,7 @@ start_worker_pool (int nthreads)
 static void
 finish_worker_pool (void)
 {
+  producer_flush_batch ();
   pthread_mutex_lock (&pool_mutex);
   while (commit_seq < next_seq)
     {
@@ -4814,6 +4910,7 @@ finish_worker_pool (void)
   pthread_cond_broadcast (&q_not_empty_cv);
   pthread_cond_broadcast (&q_not_full_cv);
   pthread_cond_broadcast (&rob_space_cv);
+  pthread_cond_broadcast (&slice_avail_cv);
   pthread_mutex_unlock (&pool_mutex);
 
   for (int i = 0; i < pool_nthreads; ++i)
