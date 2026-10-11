@@ -101,6 +101,9 @@ struct trie
   idx_t depth;                  /* Depth of this node from the root.  */
   idx_t shift;                  /* Shift function for search failures.  */
   idx_t maxshift;               /* Max shift of self and descendants.  */
+  uint32_t dfa_state;           /* State number of this node in the dense
+                                   automaton, if any.  */
+  unsigned char label;          /* Label on the edge from the parent.  */
 };
 
 /* Structure returned opaquely to the caller, containing everything.  */
@@ -108,6 +111,7 @@ struct kwset
 {
   struct obstack obstack;       /* Obstack for node allocation.  */
   idx_t words;                  /* Number of words in the trie.  */
+  idx_t nodes;                  /* Number of nodes in the trie.  */
   struct trie *trie;            /* The trie itself.  */
   idx_t mind;                   /* Minimum depth of an accepting node.  */
   unsigned char delta[NCHAR];   /* Delta table for rapid search.  */
@@ -154,6 +158,19 @@ struct kwset
   uint8_t teddy_t1_hi[32];
 #endif
 
+  /* Dense Aho-Corasick automaton for two or more keywords, or null.
+     DFA_TRANS[S + DFA_CLASS[B]] is the state that follows state S on
+     the text byte B.  A state is represented by the offset of its row
+     in DFA_TRANS, i.e., by its number times DFA_NCLASSES.  The root is
+     state 0, and the states at or above DFA_ACCEPT are exactly those
+     whose trie nodes are accepting.  DFA_NODE[S / DFA_NCLASSES] is the
+     trie node of state S.  */
+  uint32_t *dfa_trans;
+  struct trie const **dfa_node;
+  uint32_t dfa_nclasses;
+  uint32_t dfa_accept;
+  unsigned char dfa_class[NCHAR];
+
   /* kwsexec implementation.  */
   ptrdiff_t (*kwsexec) (kwset_t, char const *, idx_t, struct kwsmatch *, bool);
 };
@@ -167,6 +184,8 @@ tr (char const *trans, char c)
 
 static ptrdiff_t acexec (kwset_t, char const *, idx_t,
                          struct kwsmatch *, bool);
+static ptrdiff_t acexec_dfa (kwset_t, char const *, idx_t,
+                             struct kwsmatch *, bool);
 static ptrdiff_t bmexec (kwset_t, char const *, idx_t,
                          struct kwsmatch *, bool);
 
@@ -177,6 +196,7 @@ kwsalloc (char const *trans)
 
   obstack_init (&kwset->obstack);
   kwset->words = 0;
+  kwset->nodes = 1;
   kwset->trie = obstack_alloc (&kwset->obstack, sizeof *kwset->trie);
   kwset->trie->accepting = 0;
   kwset->trie->links = nullptr;
@@ -194,6 +214,9 @@ kwsalloc (char const *trans)
   kwset->simd_pair_ready = false;
   kwset->teddy_active = false;
 #endif
+
+  kwset->dfa_trans = nullptr;
+  kwset->dfa_node = nullptr;
 
   return kwset;
 }
@@ -255,8 +278,10 @@ kwsincr (kwset_t kwset, char const *text, idx_t len)
           cur->trie->fail = nullptr;
           cur->trie->depth = trie->depth + 1;
           cur->trie->shift = 0;
+          cur->trie->label = label;
           cur->label = label;
           cur->balance = 0;
+          kwset->nodes++;
 
           /* Install the new tree node in its parent.  */
           if (dirs[--depth] == L)
@@ -516,6 +541,101 @@ compute_simd_byte_mask (char const *trans, uint8_t target_byte,
 }
 #endif
 
+#if defined __GNUC__ || defined __clang__
+# define kws_unlikely(x) __builtin_expect (!!(x), 0)
+#else
+# define kws_unlikely(x) (x)
+#endif
+
+/* The dense automaton is not built if it would need more than this
+   many transitions.  */
+enum { DFA_MAX_ENTRIES = 1 << 27 };
+
+/* Store into ROW the transitions along the edges in TREE, given the
+   class of each label.  */
+static void
+dfa_set_children (struct tree const *tree, uint32_t *row,
+                  unsigned char const label_class[], uint32_t nclasses)
+{
+  if (!tree)
+    return;
+  row[label_class[tree->label]] = tree->trie->dfa_state * nclasses;
+  dfa_set_children (tree->llink, row, label_class, nclasses);
+  dfa_set_children (tree->rlink, row, label_class, nclasses);
+}
+
+/* Build the dense automaton of KWSET, whose trie and failure function
+   have been computed for Aho-Corasick and whose root is not accepting.
+   Return true if successful, false if the automaton would be too large
+   or if it might not track the trie search exactly.  */
+static bool
+kwsprep_dfa (kwset_t kwset)
+{
+  char const *trans = kwset->trans;
+
+  /* The trie search translates a byte that starts a keyword twice, so
+     the automaton is equivalent only if TRANS is idempotent.  */
+  if (trans)
+    for (int i = 0; i < NCHAR; i++)
+      if (trans[U(trans[i])] != trans[i])
+        return false;
+
+  idx_t nstates = kwset->nodes;
+  if (DFA_MAX_ENTRIES < nstates)
+    return false;
+
+  /* Number the states in level order, accepting states last, and find
+     the labels in use.  */
+  struct trie const **node = xinmalloc (nstates, sizeof *node);
+  bool used[NCHAR] = { false };
+  idx_t nonaccepting = 0, accepting = nstates;
+  for (struct trie *t = kwset->trie; t; t = t->next)
+    {
+      idx_t n = t->accepting ? --accepting : nonaccepting++;
+      t->dfa_state = n;
+      node[n] = t;
+      if (t->parent)
+        used[t->label] = true;
+    }
+
+  /* Bytes that label no edge share one class, which leads back to the
+     root from every state; each label has a class of its own.  */
+  bool some_unused = false;
+  for (int b = 0; b < NCHAR; b++)
+    some_unused |= !used[b];
+  unsigned char label_class[NCHAR];
+  uint32_t nclasses = some_unused;
+  for (int b = 0; b < NCHAR; b++)
+    label_class[b] = used[b] ? nclasses++ : 0;
+  if (DFA_MAX_ENTRIES / nclasses < nstates)
+    {
+      free (node);
+      return false;
+    }
+
+  /* A state's row is that of its failure state, except along its own
+     edges.  Level order computes each failure state's row first.  */
+  uint32_t *dtrans = xinmalloc (nstates, nclasses * sizeof *dtrans);
+  for (struct trie const *t = kwset->trie; t; t = t->next)
+    {
+      uint32_t *row = dtrans + t->dfa_state * nclasses;
+      if (t->fail)
+        memcpy (row, dtrans + t->fail->dfa_state * nclasses,
+                nclasses * sizeof *row);
+      else
+        memset (row, 0, nclasses * sizeof *row);
+      dfa_set_children (t->links, row, label_class, nclasses);
+    }
+
+  for (int b = 0; b < NCHAR; b++)
+    kwset->dfa_class[b] = label_class[trans ? U(trans[b]) : b];
+  kwset->dfa_trans = dtrans;
+  kwset->dfa_node = node;
+  kwset->dfa_nclasses = nclasses;
+  kwset->dfa_accept = nonaccepting * nclasses;
+  return true;
+}
+
 void
 kwsprep (kwset_t kwset)
 {
@@ -745,6 +865,14 @@ kwsprep (kwset_t kwset)
         }
     }
 #endif
+
+  /* For two or more keywords, search with a dense automaton.  */
+  if (!reverse && 0 < kwset->mind
+#if defined __AVX2__
+      && !kwset->teddy_active
+#endif
+      && kwsprep_dfa (kwset))
+    kwset->kwsexec = acexec_dfa;
 }
 
 /* Delta2 portion of a Boyer-Moore search.  *TP is the string text
@@ -1037,6 +1165,62 @@ bmexec (kwset_t kwset, char const *text, idx_t size,
   return ret;
 }
 
+/* Report a match found by a multiple string search of TEXT, whose end
+   is LIM.  TRIE is the accepting node that the Aho-Corasick search is
+   in just before TP, and TRANS is KWSET->trans.  If LONGEST, look for
+   the longest match that starts at the leftmost position.  Store
+   details in *KWSMATCH and return the offset of the match.  */
+static inline ptrdiff_t
+ac_match (kwset_t kwset, char const *trans, char const *text,
+          char const *lim, char const *tp, struct trie const *trie,
+          bool longest, struct kwsmatch *kwsmatch)
+{
+  struct trie const *accept = trie;
+  while (accept->accepting < 0)
+    accept = accept->fail;
+  char const *left = tp - accept->depth;
+
+  /* Try left-most longest match.  */
+  if (longest)
+    {
+      while (tp < lim)
+        {
+          unsigned char c = tr (trans, *tp++);
+
+          struct tree const *tree;
+          do
+            {
+              tree = trie->links;
+              while (tree && c != tree->label)
+                tree = c < tree->label ? tree->llink : tree->rlink;
+            }
+          while (!tree && (trie = trie->fail) && accept->depth <= trie->depth);
+
+          if (!tree)
+            break;
+          trie = tree->trie;
+          if (trie->accepting)
+            {
+              struct trie const *accept1 = trie;
+              while (accept1->accepting < 0)
+                accept1 = accept1->fail;
+              char const *left1 = tp - accept1->depth;
+              if (left1 <= left)
+                {
+                  left = left1;
+                  accept = accept1;
+                }
+            }
+        }
+    }
+
+  kwsmatch->index = accept->accepting >> 1;
+  kwsmatch->offset = left - text;
+  kwsmatch->size = accept->depth;
+
+  return left - text;
+}
+
 /* Hairy multiple string search with the Aho-Corasick algorithm.
    (inlinable version)  */
 static inline ptrdiff_t
@@ -1158,51 +1342,8 @@ acexec_trans (kwset_t kwset, char const *text, idx_t len,
         }
     }
 
- match: ;
-  struct trie const *accept = trie;
-  while (accept->accepting < 0)
-    accept = accept->fail;
-  char const *left = tp - accept->depth;
-
-  /* Try left-most longest match.  */
-  if (longest)
-    {
-      while (tp < lim)
-        {
-          unsigned char c = tr (trans, *tp++);
-
-          struct tree const *tree;
-          do
-            {
-              tree = trie->links;
-              while (tree && c != tree->label)
-                tree = c < tree->label ? tree->llink : tree->rlink;
-            }
-          while (!tree && (trie = trie->fail) && accept->depth <= trie->depth);
-
-          if (!tree)
-            break;
-          trie = tree->trie;
-          if (trie->accepting)
-            {
-              struct trie const *accept1 = trie;
-              while (accept1->accepting < 0)
-                accept1 = accept1->fail;
-              char const *left1 = tp - accept1->depth;
-              if (left1 <= left)
-                {
-                  left = left1;
-                  accept = accept1;
-                }
-            }
-        }
-    }
-
-  kwsmatch->index = accept->accepting >> 1;
-  kwsmatch->offset = left - text;
-  kwsmatch->size = accept->depth;
-
-  return left - text;
+ match:
+  return ac_match (kwset, trans, text, lim, tp, trie, longest, kwsmatch);
 }
 
 /* Hairy multiple string search with Aho-Corasick algorithm.  */
@@ -1219,6 +1360,58 @@ acexec (kwset_t kwset, char const *text, idx_t size,
            : acexec_trans (kwset, text, size, kwsmatch, longest)));
 }
 
+/* Multiple string search with the dense automaton.  This finds the
+   same match as acexec, as the automaton is in the same state as the
+   Aho-Corasick search after every byte.  */
+static ptrdiff_t
+acexec_dfa (kwset_t kwset, char const *text, idx_t len,
+            struct kwsmatch *kwsmatch, bool longest)
+{
+  assume (0 <= len);
+  if (len < kwset->mind)
+    return -1;
+
+  uint32_t const *dtrans = kwset->dfa_trans;
+  unsigned char const *dclass = kwset->dfa_class;
+  uint32_t accept = kwset->dfa_accept;
+  idx_t i = 0;
+  uint32_t s = 0;
+
+  /* As the trie search does, skip bytes that leave the automaton at
+     the root.  */
+  while (i < len)
+    {
+      if (kwset->gc1 < 0)
+        {
+          while (!kwset->next[U(text[i])])
+            if (++i == len)
+              return -1;
+        }
+      else
+        {
+          char const *tp = memchr_kwset (text + i, len - i, kwset);
+          if (!tp)
+            return -1;
+          i = tp - text;
+        }
+
+      s = 0;
+      do
+        {
+          s = dtrans[s + dclass[U(text[i++])]];
+          if (kws_unlikely (accept <= s))
+            goto found;
+        }
+      while (s != 0 && i < len);
+    }
+  return -1;
+
+ found:
+  return ac_match (kwset, kwset->trans, text, text + len, text + i,
+                   kwset->dfa_node[s / kwset->dfa_nclasses], longest,
+                   kwsmatch);
+}
+
 ptrdiff_t
 kwsexec (kwset_t kwset, char const *text, idx_t size,
          struct kwsmatch *kwsmatch, bool longest)
@@ -1229,6 +1422,8 @@ kwsexec (kwset_t kwset, char const *text, idx_t size,
 void
 kwsfree (kwset_t kwset)
 {
+  free (kwset->dfa_trans);
+  free (kwset->dfa_node);
   obstack_free (&kwset->obstack, nullptr);
   free (kwset);
 }
