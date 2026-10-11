@@ -2973,6 +2973,15 @@ try_fgrep_pattern (int matcher, char *keys, idx_t *len_p)
   return result;
 }
 
+/* Without GREP_THREADS, use as many threads as there are usable
+   processors, but at most this many.  On a machine with 32 cores and
+   64 hardware threads, traversals of a source tree ran fastest with 32
+   threads and searches of a 1.6 GB file with 24 to 48; 16 threads took
+   22-32% and 10-16% longer.  Threads beyond the number of cores did not
+   help traversals, and slowed them down when they outnumbered the
+   usable hardware threads.  */
+enum { DEFAULT_MAX_THREADS = 16 };
+
 /* Number of threads to use.  */
 static int
 get_num_threads (void)
@@ -2993,14 +3002,14 @@ get_num_threads (void)
     {
       int count = CPU_COUNT (&set);
       if (count > 0)
-        return MIN (count, 16);
+        return MIN (count, DEFAULT_MAX_THREADS);
     }
 #endif
 
 #if defined _SC_NPROCESSORS_ONLN
   long n = sysconf (_SC_NPROCESSORS_ONLN);
   if (n > 0)
-    return (int) MIN (n, 16);
+    return (int) MIN (n, DEFAULT_MAX_THREADS);
 #endif
 
   return 1;
