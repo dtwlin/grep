@@ -1216,6 +1216,12 @@ init_worker_buffer (void)
                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
       if (ptr != MAP_FAILED)
         {
+#ifdef MADV_NOHUGEPAGE
+          /* Reads slide through the start of the buffer, so huge pages
+             would not save page faults; they would only make the first
+             read of each thread clear 2 MiB.  */
+          madvise (ptr, alloc_sz, MADV_NOHUGEPAGE);
+#endif
           buffer = ptr;
           bufalloc = alloc_sz;
           buffer_is_mmap = true;
@@ -7609,43 +7615,42 @@ main (int argc, char **argv)
   initial_out_quiet = out_quiet;
   initial_done_on_match = done_on_match;
 
-  int nthreads = get_num_threads ();
-
-  /* Each thread may hold a file open, so stay well within the limit on
-     open files.  */
-  struct rlimit nofile;
-  if (getrlimit (RLIMIT_NOFILE, &nofile) == 0
-      && nofile.rlim_cur != RLIM_INFINITY)
-    nthreads = MIN (nthreads, MAX (1, ((long) nofile.rlim_cur - 16) / 2));
-
-  struct stat tmp_st;
+  /* Look at standard input only if it is the only operand, and at most
+     once at a single other operand.  */
   bool single_operand = files[0] && !files[1];
   bool is_single_stdin = single_operand && STREQ (*files, "-");
-  struct stat in_st;
-  bool stdin_is_reg = (is_single_stdin && fstat (STDIN_FILENO, &in_st) == 0 && S_ISREG (in_st.st_mode));
-  bool stdin_is_large_reg = (stdin_is_reg
-                             && in_st.st_size >= 2 * 1024 * 1024
-                             && !SAME_INODE (in_st, out_stat)
-                             && lseek (STDIN_FILENO, 0, SEEK_CUR) == 0
-                             && (!out_invert || (out_before <= 0 && out_after <= 0)));
-  bool can_slice_stdin = (!isatty (STDIN_FILENO)
-                          && (!stdin_is_reg || (in_st.st_size >= 2 * 1024 * 1024 && !SAME_INODE (in_st, out_stat)))
-                          && out_before <= 0 && out_after <= 0
-                          && max_count == INTMAX_MAX
-                          && binary_files != WITHOUT_MATCH_BINARY_FILES);
-  bool can_parallelize_stdin = (!isatty (STDIN_FILENO)
-                                && (stdin_is_large_reg || can_slice_stdin));
-  bool is_single_large_file = (single_operand
-                               && !STREQ (*files, "-")
-                               && stat (*files, &tmp_st) == 0
-                               && S_ISREG (tmp_st.st_mode)
-                               && tmp_st.st_size >= 2 * 1024 * 1024
-                               && (!out_invert || (out_before <= 0 && out_after <= 0)));
-  bool is_dir_recurse = (single_operand
-                         && !STREQ (*files, "-")
-                         && directories == RECURSE_DIRECTORIES
-                         && stat (*files, &tmp_st) == 0
-                         && S_ISDIR (tmp_st.st_mode));
+  bool can_parallelize_stdin = false;
+  if (is_single_stdin && !isatty (STDIN_FILENO))
+    {
+      struct stat in_st;
+      bool stdin_is_reg = (fstat (STDIN_FILENO, &in_st) == 0
+                           && S_ISREG (in_st.st_mode));
+      bool stdin_is_large_reg = (stdin_is_reg
+                                 && in_st.st_size >= 2 * 1024 * 1024
+                                 && !SAME_INODE (in_st, out_stat)
+                                 && lseek (STDIN_FILENO, 0, SEEK_CUR) == 0
+                                 && (!out_invert
+                                     || (out_before <= 0 && out_after <= 0)));
+      bool can_slice_stdin = ((!stdin_is_reg
+                               || (in_st.st_size >= 2 * 1024 * 1024
+                                   && !SAME_INODE (in_st, out_stat)))
+                              && out_before <= 0 && out_after <= 0
+                              && max_count == INTMAX_MAX
+                              && binary_files != WITHOUT_MATCH_BINARY_FILES);
+      can_parallelize_stdin = stdin_is_large_reg || can_slice_stdin;
+    }
+  bool is_single_large_file = false;
+  bool is_dir_recurse = false;
+  struct stat tmp_st;
+  if (single_operand && !is_single_stdin && stat (*files, &tmp_st) == 0)
+    {
+      is_single_large_file = (S_ISREG (tmp_st.st_mode)
+                              && tmp_st.st_size >= 2 * 1024 * 1024
+                              && (!out_invert
+                                  || (out_before <= 0 && out_after <= 0)));
+      is_dir_recurse = (directories == RECURSE_DIRECTORIES
+                        && S_ISDIR (tmp_st.st_mode));
+    }
 
   /* Search single-threaded if an operand is the output file that grep
      will read; directory traversals defer such a file instead.  */
@@ -7661,11 +7666,28 @@ main (int argc, char **argv)
 
   /* A maximum count applies to each file separately, so files can be
      searched in parallel even then, but not in chunks.  */
-  if (nthreads <= 1
-      || output_is_operand
-      || (max_count < INTMAX_MAX && single_operand && !is_dir_recurse)
-      || (is_single_stdin && !can_parallelize_stdin)
-      || (single_operand && !is_single_stdin && !is_single_large_file && !is_dir_recurse))
+  bool serial = (output_is_operand
+                 || (max_count < INTMAX_MAX && single_operand
+                     && !is_dir_recurse)
+                 || (is_single_stdin && !can_parallelize_stdin)
+                 || (single_operand && !is_single_stdin
+                     && !is_single_large_file && !is_dir_recurse));
+
+  /* Count the usable processors only if threads could help.  */
+  int nthreads = 1;
+  if (!serial)
+    {
+      nthreads = get_num_threads ();
+
+      /* Each thread may hold a file open, so stay well within the limit
+         on open files.  */
+      struct rlimit nofile;
+      if (getrlimit (RLIMIT_NOFILE, &nofile) == 0
+          && nofile.rlim_cur != RLIM_INFINITY)
+        nthreads = MIN (nthreads, MAX (1, ((long) nofile.rlim_cur - 16) / 2));
+    }
+
+  if (nthreads <= 1)
     {
       init_worker_buffer ();
       bool status = true;
