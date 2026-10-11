@@ -7,7 +7,7 @@
 | `B-01` | rare literal ($BIG) | 0 | 0 | `577b9115903a48ea...` | `577b9115903a48ea...` | **PASS** |
 | `B-03` | moderate, line numbers ($BIG) | 0 | 0 | `a4ee27abab3ee2db...` | `a4ee27abab3ee2db...` | **PASS** |
 | `B-04` | DFA regex ($BIG) | 0 | 0 | `417f066225890de5...` | `417f066225890de5...` | **PASS** |
-| `B-13` | FIFO pipe (cat $BIG |) | 0 | 0 | `a4ee27abab3ee2db...` | `a4ee27abab3ee2db...` | **PASS** |
+| `B-13` | FIFO pipe (cat $BIG \|) | 0 | 0 | `a4ee27abab3ee2db...` | `a4ee27abab3ee2db...` | **PASS** |
 | `L-00` | harness floor (/bin/true) | 0 | 0 | `e3b0c44298fc1c14...` | `e3b0c44298fc1c14...` | **PASS** |
 | `L-01` | one small file (init/main.c) | 0 | 0 | `b26f4931fbf919dc...` | `b26f4931fbf919dc...` | **PASS** |
 | `M-02` | 1,000 literals, tree | 0 | 0 | `bb127c7e0c72ff9b...` | `bb127c7e0c72ff9b...` | **PASS** |
@@ -30,7 +30,7 @@
 | `B-01` | rare literal ($BIG) | PASS | PASS | PASS | Sorted match |
 | `B-03` | moderate, line numbers ($BIG) | PASS | PASS | PASS | Sorted match |
 | `B-04` | DFA regex ($BIG) | PASS | PASS | PASS | Sorted match |
-| `B-13` | FIFO pipe (cat $BIG |) | PASS | PASS | N/A | Sorted match |
+| `B-13` | FIFO pipe (cat $BIG \|) | PASS | PASS | N/A | Sorted match |
 | `L-00` | harness floor (/bin/true) | PASS | PASS | PASS | Exit code 0 vs 0 |
 | `L-01` | one small file (init/main.c) | PASS | PASS | PASS | Sorted match |
 | `M-02` | 1,000 literals, tree | PASS | PASS | SOFT_DIFF | Sorted match |

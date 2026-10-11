@@ -229,7 +229,7 @@ class ReportGenerator:
                 "stdout_sorted_sha256": recs[-1].get("stdout_sorted_sha256", ""),
                 "exit_code": recs[-1].get("exit_code", 0),
                 "timed_out": any(r.get("timed_out", False) for r in recs),
-                "description": recs[0].get("description", ""),
+                "description": recs[0].get("description", "").replace("|", "\\|"),
                 "category": recs[0].get("category", ""),
                 "equiv_mode": recs[0].get("equiv_mode", "sorted_lines"),
             }
@@ -299,7 +299,7 @@ class ReportGenerator:
             g2 = self.get_stat(sid, "G2")
             x1 = self.get_stat(sid, "X1")
 
-            desc = (g1 or g0 or r0 or g2 or x1 or {}).get("description", "")
+            desc = (g1 or g0 or r0 or g2 or x1 or {}).get("description", "").replace("|", "\\|")
 
             g0_ms = g0["median_ms"] if g0 else None
             g1_ms = g1["median_ms"] if g1 else None
@@ -394,7 +394,7 @@ class ReportGenerator:
             g2 = self.get_stat(sid, "G2")
             x1 = self.get_stat(sid, "X1")
 
-            desc = (g1 or g0 or r0 or g2 or x1 or {}).get("description", "")
+            desc = (g1 or g0 or r0 or g2 or x1 or {}).get("description", "").replace("|", "\\|")
             g0_ms = g0["median_ms"] if g0 else None
             g1_ms = g1["median_ms"] if g1 else None
             r0_ms = r0["median_ms"] if r0 else None
@@ -510,7 +510,7 @@ class ReportGenerator:
             g2 = self.get_stat(sid, "G2")
             x1 = self.get_stat(sid, "X1")
 
-            desc = (g1 or g0 or {}).get("description", "")
+            desc = (g1 or g0 or {}).get("description", "").replace("|", "\\|")
 
             def get_net(st, t):
                 if not st:
@@ -564,7 +564,7 @@ class ReportGenerator:
             x1_u = self.get_stat(sid, "X1", locale="en_US.UTF-8")
             x1_c = self.get_stat(sid, "X1", locale="C")
 
-            desc = (g1_u or g0_u or {}).get("description", "")
+            desc = (g1_u or g0_u or {}).get("description", "").replace("|", "\\|")
 
             def calc_ratio(u, c):
                 if u and c and c["median_ms"] > 0:
@@ -609,7 +609,7 @@ class ReportGenerator:
                 c_st = self.get_stat(sid, tool, locale="en_US.UTF-8", cache_state="cold")
                 if not c_st:
                     continue
-                desc = c_st.get("description", "")
+                desc = c_st.get("description", "").replace("|", "\\|")
                 w_ms = w_st["median_ms"] if w_st else None
                 c_ms = c_st["median_ms"]
                 ratio_str = f"{c_ms / w_ms:.2f}×" if (w_ms and w_ms > 0) else "—"
@@ -973,7 +973,7 @@ class ReportGenerator:
             g1 = self.get_stat(sid, "G1")
             if not g0 or not g1:
                 continue
-            desc = g1.get("description", "")
+            desc = g1.get("description", "").replace("|", "\\|")
             g0_exit = g0["exit_code"]
             g1_exit = g1["exit_code"]
             g0_sha = g0["stdout_sha256"][:16] + "..." if g0["stdout_sha256"] else "empty"
@@ -999,7 +999,7 @@ class ReportGenerator:
 
         for sid in self.scenarios:
             g0 = self.get_stat(sid, "G0")
-            desc = (g0 or {}).get("description", "")
+            desc = (g0 or {}).get("description", "").replace("|", "\\|")
             r0_v, r0_note = self.check_gate_b(sid, "R0")
             g2_v, g2_note = self.check_gate_b(sid, "G2")
             x1_v, x1_note = self.check_gate_b(sid, "X1")
@@ -1051,7 +1051,7 @@ class ReportGenerator:
                 shas = set(r["stdout_sha256"] for r in th_recs)
                 passed = (len(shas) == 1)
                 th_list = [str(r.get("threads")) for r in th_recs]
-                lines.append(f"| `{sid}` | {(th_recs[0] or {}).get('description', '')} | {', '.join(th_list)} | {'YES' if passed else 'NO'} | {'**PASS**' if passed else '❌ FAIL'} |")
+                lines.append(f"| `{sid}` | {(th_recs[0] or {}).get('description', '').replace('|', '\\|')} | {', '.join(th_list)} | {'YES' if passed else 'NO'} | {'**PASS**' if passed else '❌ FAIL'} |")
 
         lines.append("")
         with open(out_path, "w", encoding="utf-8") as f:

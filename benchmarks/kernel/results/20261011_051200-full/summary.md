@@ -32,7 +32,7 @@
 | `B-10` | only-matching ($BIG) | 803.4 ms | invalid (exit 2) | 252.9 ms | 848.0 ms | 10.09 s | **—** | 3.18× | **—** | 0.06 | 0.26 | 0.85 | 10.19 | 137M | 1391M | 37M | 1393M | ❌ FAIL | PASS |
 | `B-11` | inverted count ($BIG) | 1.01 s | 92.8 ms | 1.52 s | 998.2 ms | 3.50 s | **10.86×** | 0.66× | **16.42×** | 1.05 | 1.52 | 1.00 | 3.49 | 1381M | 1391M | 37M | 1392M | **PASS** | PASS |
 | `B-12` | stdin redirect (< $BIG) | 564.9 ms | 27.3 ms | 290.6 ms | 565.2 ms | — | **20.69×** | 1.94× | **10.65×** | 0.30 | 0.29 | 0.56 | — | 1381M | 37M | 37M | — | **PASS** | PASS |
-| `B-13` | FIFO pipe (cat $BIG |) | 1.16 s | 732.0 ms | 1.04 s | 1.17 s | — | **1.59×** | 1.11× | **1.43×** | 0.96 | 0.71 | 1.14 | — | 37M | 37M | 37M | — | **PASS** | PASS |
+| `B-13` | FIFO pipe (cat $BIG \|) | 1.16 s | 732.0 ms | 1.04 s | 1.17 s | — | **1.59×** | 1.11× | **1.43×** | 0.96 | 0.71 | 1.14 | — | 37M | 37M | 37M | — | **PASS** | PASS |
 | `B-14` | real 24 MB header (big-24M.h) | 49.2 ms | 18.2 ms | 43.2 ms | 49.3 ms | 79.1 ms | **2.71×** | 1.14× | **2.37×** | 0.07 | 0.04 | 0.05 | 0.11 | 37M | 37M | 37M | 41M | **PASS** | PASS |
 | `L-00` | harness floor (/bin/true) | 1.5 ms | 1.5 ms | 1.5 ms | 1.5 ms | 1.5 ms | **1.00×** | 1.00× | **1.00×** | 0.00 | 0.00 | 0.00 | 0.00 | 37M | 37M | 37M | 37M | **PASS** | PASS |
 | `L-01` | one small file (init/main.c) | 2.7 ms | 2.7 ms | 4.8 ms | 2.7 ms | 34.1 ms | **1.00×** | 0.57× | **1.77×** | 0.00 | 0.00 | 0.00 | 0.06 | 37M | 37M | 37M | 37M | **PASS** | PASS |
@@ -75,7 +75,7 @@
 | `T-28` | sub-scope kernel mm fs | 172.9 ms | 19.2 ms | 19.4 ms | 169.7 ms | 83.0 ms | **9.01×** | 8.89× | **1.01×** | 0.18 | 0.16 | 0.17 | 0.86 | 38M | 38M | 38M | 38M | **PASS** | PASS |
 | `U-01` | out-of-the-box UX | 4.41 s | 493.2 ms | 393.8 ms | 4.44 s | — | **8.94×** | 11.20× | **0.80×** | 5.19 | 4.60 | 4.43 | — | 180M | 38M | 38M | — | **PASS** | PASS |
 | `U-02` | naive invocation (scans 6 GB .git) | 6.02 s | 918.2 ms | 392.6 ms* | 6.03 s | — | **6.56×** | 15.34× | **0.43×** | 5.83 | 4.59 | 6.03 | — | 197M | 38M | 38M | — | **PASS** | N/A |
-| `X-01` | git ls-files | xargs | 2.6 ms | 5.9 ms | 51.6 ms | 2.7 ms | — | **0.44×** | 0.05× | **8.76×** | 0.01 | 0.52 | 0.00 | — | 38M | 38M | 38M | — | **PASS** | SOFT_DIFF |
+| `X-01` | git ls-files \| xargs | 2.6 ms | 5.9 ms | 51.6 ms | 2.7 ms | — | **0.44×** | 0.05× | **8.76×** | 0.01 | 0.52 | 0.00 | — | 38M | 38M | 38M | — | **PASS** | SOFT_DIFF |
 | `P-01` | backreference (\b([a-z]{4,})_\1\b) | 41.42 s | 2.93 s | 834.7 ms | 53.61 s | 1.62 s | **14.16×** | 49.63× | **0.29×** | 45.74 | 9.91 | 53.79 | 19.95 | 172M | 38M | 38M | 282M | **PASS** | PASS |
 | `P-02` | 1,000-way regex alternation | 15.01 s | 1.41 s | 1.18 s | 14.42 s | 227.72 s | **10.62×** | 12.71× | **0.84×** | 20.76 | 13.69 | 14.41 | 2788.12 | 309M | 134M | 38M | 2795M | **PASS** | PASS |
 | `P-03` | dot-star heavy (.*_lock.*_unlock) | 3.81 s | 476.8 ms | 348.1 ms | 3.80 s | 9.56 s | **8.00×** | 10.96× | **0.73×** | 4.97 | 4.05 | 3.80 | 122.18 | 192M | 38M | 38M | 338M | **PASS** | PASS |
@@ -145,7 +145,7 @@ Detailed equivalence records are available in [equivalence.md](./equivalence.md)
 | `B-10` | only-matching ($BIG) | 803.4 ms | invalid (exit 2) | 252.9 ms | 848.0 ms | 10.09 s | **—** | **—** | 0.06 | 0.26 | 0.85 | 10.19 | 137M | 1391M | 37M | 1393M | ❌ FAIL |
 | `B-11` | inverted count ($BIG) | 1.01 s | 92.8 ms | 1.52 s | 998.2 ms | 3.50 s | **10.86×** | **16.42×** | 1.05 | 1.52 | 1.00 | 3.49 | 1381M | 1391M | 37M | 1392M | **PASS** |
 | `B-12` | stdin redirect (< $BIG) | 564.9 ms | 27.3 ms | 290.6 ms | 565.2 ms | — | **20.69×** | **10.65×** | 0.30 | 0.29 | 0.56 | — | 1381M | 37M | 37M | — | **PASS** |
-| `B-13` | FIFO pipe (cat $BIG |) | 1.16 s | 732.0 ms | 1.04 s | 1.17 s | — | **1.59×** | **1.43×** | 0.96 | 0.71 | 1.14 | — | 37M | 37M | 37M | — | **PASS** |
+| `B-13` | FIFO pipe (cat $BIG \|) | 1.16 s | 732.0 ms | 1.04 s | 1.17 s | — | **1.59×** | **1.43×** | 0.96 | 0.71 | 1.14 | — | 37M | 37M | 37M | — | **PASS** |
 | `B-14` | real 24 MB header (big-24M.h) | 49.2 ms | 18.2 ms | 43.2 ms | 49.3 ms | 79.1 ms | **2.71×** | **2.37×** | 0.07 | 0.04 | 0.05 | 0.11 | 37M | 37M | 37M | 41M | **PASS** |
 
 > \* **Note on Gate A Failures**: Scenarios `B-10` failed Gate A conformance against G0 and are marked as invalid. (Fixed in commit `aa02aff`).
@@ -212,7 +212,7 @@ Detailed equivalence records are available in [equivalence.md](./equivalence.md)
 
 | Scenario | Description | G0 (ms) | G1 (ms) | R0 (ms) | G2 (ms) | X1 (ms) | Speedup (vs G0) | G1 vs R0 | G1 CPU | R0 CPU | G2 CPU | X1 CPU | G1 RSS | R0 RSS | G2 RSS | X1 RSS | Gate A |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
-| `X-01` | git ls-files | xargs | 2.6 ms | 5.9 ms | 51.6 ms | 2.7 ms | — | **0.44×** | **8.76×** | 0.01 | 0.52 | 0.00 | — | 38M | 38M | 38M | — | **PASS** |
+| `X-01` | git ls-files \| xargs | 2.6 ms | 5.9 ms | 51.6 ms | 2.7 ms | — | **0.44×** | **8.76×** | 0.01 | 0.52 | 0.00 | — | 38M | 38M | 38M | — | **PASS** |
 
 ### Category P — Pathological / Complex Regexes
 
@@ -234,7 +234,7 @@ Detailed equivalence records are available in [equivalence.md](./equivalence.md)
 | `B-03` | moderate, line numbers ($BIG) | 968.7 ms | 966.5 ms | **1.00×** | 52.4 ms | 54.5 ms | **0.96×** | 305.9 ms | 304.7 ms | **1.00×** | 1.00× | 0.70× |
 | `B-04` | DFA regex ($BIG) | 466.3 ms | 466.6 ms | **1.00×** | 29.7 ms | 28.7 ms | **1.03×** | 233.1 ms | 233.5 ms | **1.00×** | 1.01× | 4.22× |
 | `B-05` | case-insensitive dense ($BIG) | 2.01 s | 1.33 s | **1.50×** | 222.3 ms | 52.9 ms | **4.20×** | 364.9 ms | 367.7 ms | **0.99×** | 1.51× | 0.78× |
-| `B-13` | FIFO pipe (cat $BIG |) | 1.16 s | 1.13 s | **1.03×** | 732.0 ms | 631.3 ms | **1.16×** | 1.04 s | 953.7 ms | **1.09×** | 1.08× | — |
+| `B-13` | FIFO pipe (cat $BIG \|) | 1.16 s | 1.13 s | **1.03×** | 732.0 ms | 631.3 ms | **1.16×** | 1.04 s | 953.7 ms | **1.09×** | 1.08× | — |
 | `L-00` | harness floor (/bin/true) | 1.5 ms | 1.5 ms | **1.03×** | 1.5 ms | 1.5 ms | **1.00×** | 1.5 ms | 1.7 ms | **0.92×** | 1.00× | 0.89× |
 | `L-01` | one small file (init/main.c) | 2.7 ms | 2.7 ms | **1.01×** | 2.7 ms | 2.7 ms | **1.02×** | 4.8 ms | 4.8 ms | **1.00×** | 1.02× | 1.06× |
 | `M-02` | 1,000 literals, tree | 14.07 s | 13.99 s | **1.01×** | 1.02 s | 1.03 s | **0.99×** | 717.3 ms | 711.6 ms | **1.01×** | 1.00× | 1.00× |

@@ -32,7 +32,7 @@
 | `B-10` | only-matching ($BIG) | 762.7 ms | 40.3 ms | 214.6 ms | — | — | **18.91×** | 3.55× | **5.32×** | 0.60 | 0.21 | — | — | 1376M | 1391M | — | — | **PASS** | PASS |
 | `B-11` | inverted count ($BIG) | 975.6 ms | 46.6 ms | 1.49 s | — | — | **20.96×** | 0.65× | **32.08×** | 1.02 | 1.49 | — | — | 1374M | 1391M | — | — | **PASS** | PASS |
 | `B-12` | stdin redirect (< $BIG) | 527.0 ms | 18.7 ms | 250.1 ms | — | — | **28.20×** | 2.11× | **13.38×** | 0.39 | 0.25 | — | — | 1375M | 33M | — | — | **PASS** | PASS |
-| `B-13` | FIFO pipe (cat $BIG |) | 1.10 s | 654.5 ms | 881.4 ms | — | — | **1.68×** | 1.25× | **1.35×** | 0.87 | 0.62 | — | — | 33M | 33M | — | — | **PASS** | PASS |
+| `B-13` | FIFO pipe (cat $BIG \|) | 1.10 s | 654.5 ms | 881.4 ms | — | — | **1.68×** | 1.25× | **1.35×** | 0.87 | 0.62 | — | — | 33M | 33M | — | — | **PASS** | PASS |
 | `B-14` | real 24 MB header (big-24M.h) | 51.5 ms | 17.1 ms | 43.0 ms | — | — | **3.01×** | 1.20× | **2.51×** | 0.07 | 0.04 | — | — | 34M | 34M | — | — | **PASS** | PASS |
 | `L-00` | harness floor (/bin/true) | 1.5 ms | 1.6 ms | 1.6 ms | — | — | **0.93×** | 0.93× | **1.00×** | 0.00 | 0.00 | — | — | 34M | 34M | — | — | **PASS** | PASS |
 | `L-01` | one small file (init/main.c) | 2.6 ms | 2.9 ms | 3.7 ms | — | — | **0.92×** | 0.72× | **1.27×** | 0.00 | 0.00 | — | — | 34M | 34M | — | — | **PASS** | PASS |
@@ -75,7 +75,7 @@
 | `T-28` | sub-scope kernel mm fs | 171.6 ms | 21.6 ms | 20.1 ms | — | — | **7.95×** | 8.53× | **0.93×** | 0.19 | 0.16 | — | — | 59M | 59M | — | — | **PASS** | PASS |
 | `U-01` | out-of-the-box UX | 4.39 s | 249.6 ms | 394.0 ms | — | — | **17.59×** | 11.14× | **1.58×** | 4.67 | 4.60 | — | — | 85M | 59M | — | — | **PASS** | PASS |
 | `U-02` | naive invocation (scans 6 GB .git) | 5.99 s | 976.0 ms | 391.6 ms* | — | — | **6.13×** | 15.29× | **0.40×** | 5.43 | 4.57 | — | — | 109M | 59M | — | — | **PASS** | N/A |
-| `X-01` | git ls-files | xargs | 4.21 s | 962.6 ms | 1.08 s | — | — | **4.37×** | 3.89× | **1.12×** | 7.65 | 5.18 | — | — | 59M | 59M | — | — | **PASS** | PASS |
+| `X-01` | git ls-files \| xargs | 4.21 s | 962.6 ms | 1.08 s | — | — | **4.37×** | 3.89× | **1.12×** | 7.65 | 5.18 | — | — | 59M | 59M | — | — | **PASS** | PASS |
 | `P-01` | backreference (\b([a-z]{4,})_\1\b) | 41.50 s | 2.04 s | 830.9 ms | — | — | **20.39×** | 49.95× | **0.41×** | 46.50 | 9.87 | — | — | 91M | 59M | — | — | **PASS** | PASS |
 | `P-02` | 1,000-way regex alternation | 14.96 s | 1.05 s | 1.18 s | — | — | **14.29×** | 12.73× | **1.12×** | 21.57 | 13.73 | — | — | 321M | 134M | — | — | **PASS** | PASS |
 | `P-03` | dot-star heavy (.*_lock.*_unlock) | 3.76 s | 240.4 ms | 347.5 ms | — | — | **15.62×** | 10.81× | **1.45×** | 4.61 | 4.06 | — | — | 87M | 59M | — | — | **PASS** | PASS |
@@ -141,7 +141,7 @@ Detailed equivalence records are available in [equivalence.md](./equivalence.md)
 | `B-10` | only-matching ($BIG) | 762.7 ms | 40.3 ms | 214.6 ms | — | — | **18.91×** | **5.32×** | 0.60 | 0.21 | — | — | 1376M | 1391M | — | — | **PASS** |
 | `B-11` | inverted count ($BIG) | 975.6 ms | 46.6 ms | 1.49 s | — | — | **20.96×** | **32.08×** | 1.02 | 1.49 | — | — | 1374M | 1391M | — | — | **PASS** |
 | `B-12` | stdin redirect (< $BIG) | 527.0 ms | 18.7 ms | 250.1 ms | — | — | **28.20×** | **13.38×** | 0.39 | 0.25 | — | — | 1375M | 33M | — | — | **PASS** |
-| `B-13` | FIFO pipe (cat $BIG |) | 1.10 s | 654.5 ms | 881.4 ms | — | — | **1.68×** | **1.35×** | 0.87 | 0.62 | — | — | 33M | 33M | — | — | **PASS** |
+| `B-13` | FIFO pipe (cat $BIG \|) | 1.10 s | 654.5 ms | 881.4 ms | — | — | **1.68×** | **1.35×** | 0.87 | 0.62 | — | — | 33M | 33M | — | — | **PASS** |
 | `B-14` | real 24 MB header (big-24M.h) | 51.5 ms | 17.1 ms | 43.0 ms | — | — | **3.01×** | **2.51×** | 0.07 | 0.04 | — | — | 34M | 34M | — | — | **PASS** |
 
 ### Category M — Multi-Pattern Sets
@@ -198,7 +198,7 @@ Detailed equivalence records are available in [equivalence.md](./equivalence.md)
 
 | Scenario | Description | G0 (ms) | G1 (ms) | R0 (ms) | G2 (ms) | X1 (ms) | Speedup (vs G0) | G1 vs R0 | G1 CPU | R0 CPU | G2 CPU | X1 CPU | G1 RSS | R0 RSS | G2 RSS | X1 RSS | Gate A |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
-| `X-01` | git ls-files | xargs | 4.21 s | 962.6 ms | 1.08 s | — | — | **4.37×** | **1.12×** | 7.65 | 5.18 | — | — | 59M | 59M | — | — | **PASS** |
+| `X-01` | git ls-files \| xargs | 4.21 s | 962.6 ms | 1.08 s | — | — | **4.37×** | **1.12×** | 7.65 | 5.18 | — | — | 59M | 59M | — | — | **PASS** |
 
 ### Category P — Pathological / Complex Regexes
 
@@ -317,7 +317,7 @@ Direct before-and-after comparison on identical hardware pinned to NUMA node 0 (
 | **B-10** | B | only-matching ($BIG) | invalid (exit 2) | 40.3 | — | 214.6 | 5.32× | ❌ FAIL | **PASS** |
 | **B-11** | B | inverted count ($BIG) | 92.8 | 46.6 | 1.99× | 1.49 s | 32.08× | **PASS** | **PASS** |
 | **B-12** | B | stdin redirect (< $BIG) | 27.3 | 18.7 | 1.46× | 250.1 | 13.38× | **PASS** | **PASS** |
-| **B-13** | B | FIFO pipe (cat $BIG |) | 732.0 | 654.5 | 1.12× | 881.4 | 1.35× | **PASS** | **PASS** |
+| **B-13** | B | FIFO pipe (cat $BIG \|) | 732.0 | 654.5 | 1.12× | 881.4 | 1.35× | **PASS** | **PASS** |
 | **B-14** | B | real 24 MB header (big-24M.h) | 18.2 | 17.1 | 1.06× | 43.0 | 2.51× | **PASS** | **PASS** |
 | **L-00** | L | harness floor (/bin/true) | 1.53 | 1.60 | 0.96× | 1.60 | 1.00× | **PASS** | **PASS** |
 | **L-01** | L | one small file (init/main.c) | 2.73 | 2.88 | 0.95× | 3.65 | 1.27× | **PASS** | **PASS** |
@@ -360,7 +360,7 @@ Direct before-and-after comparison on identical hardware pinned to NUMA node 0 (
 | **T-28** | T | sub-scope kernel mm fs | 19.2 | 21.6 | 0.89× | 20.1 | 0.93× | **PASS** | **PASS** |
 | **U-01** | U | out-of-the-box UX | 493.2 | 249.6 | 1.98× | 394.0 | 1.58× | **PASS** | **PASS** |
 | **U-02** | U | naive invocation (scans 6 GB .git) | 918.2 | 976.0 | 0.94× | 391.6 | 0.40× | **PASS** | **PASS** |
-| **X-01** | X | git ls-files | xargs | 5.89 | 962.6 | 0.01× | 1.08 s | 1.12× | **PASS** | **PASS** |
+| **X-01** | X | git ls-files \| xargs | 5.89 | 962.6 | 0.01× | 1.08 s | 1.12× | **PASS** | **PASS** |
 | **P-01** | P | backreference (\b([a-z]{4,})_\1\b) | 2.93 s | 2.04 s | 1.44× | 830.9 | 0.41× | **PASS** | **PASS** |
 | **P-02** | P | 1,000-way regex alternation | 1.41 s | 1.05 s | 1.35× | 1.18 s | 1.12× | **PASS** | **PASS** |
 | **P-03** | P | dot-star heavy (.*_lock.*_unlock) | 476.8 | 240.4 | 1.98× | 347.5 | 1.45× | **PASS** | **PASS** |

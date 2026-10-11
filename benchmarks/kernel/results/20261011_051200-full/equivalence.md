@@ -16,7 +16,7 @@
 | `B-10` | only-matching ($BIG) | 0 | 2 | `9af5628abd8a637c...` | `e3b0c44298fc1c14...` | ❌ FAIL |
 | `B-11` | inverted count ($BIG) | 0 | 0 | `492efdd7b0a16d22...` | `492efdd7b0a16d22...` | **PASS** |
 | `B-12` | stdin redirect (< $BIG) | 0 | 0 | `577b9115903a48ea...` | `577b9115903a48ea...` | **PASS** |
-| `B-13` | FIFO pipe (cat $BIG |) | 0 | 0 | `a4ee27abab3ee2db...` | `a4ee27abab3ee2db...` | **PASS** |
+| `B-13` | FIFO pipe (cat $BIG \|) | 0 | 0 | `a4ee27abab3ee2db...` | `a4ee27abab3ee2db...` | **PASS** |
 | `B-14` | real 24 MB header (big-24M.h) | 0 | 0 | `3862b23249847b1a...` | `3862b23249847b1a...` | **PASS** |
 | `L-00` | harness floor (/bin/true) | 0 | 0 | `e3b0c44298fc1c14...` | `e3b0c44298fc1c14...` | **PASS** |
 | `L-01` | one small file (init/main.c) | 0 | 0 | `b26f4931fbf919dc...` | `b26f4931fbf919dc...` | **PASS** |
@@ -59,7 +59,7 @@
 | `T-28` | sub-scope kernel mm fs | 0 | 0 | `e69324c9b04f6387...` | `e69324c9b04f6387...` | **PASS** |
 | `U-01` | out-of-the-box UX | 0 | 0 | `de0565f1650b325b...` | `de0565f1650b325b...` | **PASS** |
 | `U-02` | naive invocation (scans 6 GB .git) | 0 | 0 | `de0565f1650b325b...` | `de0565f1650b325b...` | **PASS** |
-| `X-01` | git ls-files | xargs | 1 | 1 | `e3b0c44298fc1c14...` | `e3b0c44298fc1c14...` | **PASS** |
+| `X-01` | git ls-files \| xargs | 1 | 1 | `e3b0c44298fc1c14...` | `e3b0c44298fc1c14...` | **PASS** |
 | `P-01` | backreference (\b([a-z]{4,})_\1\b) | 0 | 0 | `1ac62cb0ce208e32...` | `1ac62cb0ce208e32...` | **PASS** |
 | `P-02` | 1,000-way regex alternation | 0 | 0 | `236038c5dd5034ab...` | `236038c5dd5034ab...` | **PASS** |
 | `P-03` | dot-star heavy (.*_lock.*_unlock) | 0 | 0 | `0a219b2dfbf3747f...` | `0a219b2dfbf3747f...` | **PASS** |
@@ -82,7 +82,7 @@
 | `B-10` | only-matching ($BIG) | PASS | PASS | PASS | Sorted match |
 | `B-11` | inverted count ($BIG) | PASS | PASS | PASS | Sorted match |
 | `B-12` | stdin redirect (< $BIG) | PASS | PASS | N/A | Sorted match |
-| `B-13` | FIFO pipe (cat $BIG |) | PASS | PASS | N/A | Sorted match |
+| `B-13` | FIFO pipe (cat $BIG \|) | PASS | PASS | N/A | Sorted match |
 | `B-14` | real 24 MB header (big-24M.h) | PASS | PASS | PASS | Sorted match |
 | `L-00` | harness floor (/bin/true) | PASS | PASS | PASS | Exit code 0 vs 0 |
 | `L-01` | one small file (init/main.c) | PASS | PASS | PASS | Sorted match |
@@ -125,7 +125,7 @@
 | `T-28` | sub-scope kernel mm fs | PASS | PASS | PASS | Sorted match |
 | `U-01` | out-of-the-box UX | PASS | PASS | N/A | Sorted match |
 | `U-02` | naive invocation (scans 6 GB .git) | N/A | N/A | N/A | Intentionally divergent |
-| `X-01` | git ls-files | xargs | SOFT_DIFF | PASS | N/A | Diff / binary formatting |
+| `X-01` | git ls-files \| xargs | SOFT_DIFF | PASS | N/A | Diff / binary formatting |
 | `P-01` | backreference (\b([a-z]{4,})_\1\b) | PASS | PASS | PASS | Sorted match |
 | `P-02` | 1,000-way regex alternation | PASS | PASS | PASS | Sorted match |
 | `P-03` | dot-star heavy (.*_lock.*_unlock) | PASS | PASS | PASS | Sorted match |
