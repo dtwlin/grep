@@ -3038,6 +3038,11 @@ struct rob_slot
   bool is_chunk;
   bool is_last_chunk;
   intmax_t chunk_count;
+
+  /* True if the chunk's output omitted a line because of an encoding
+     error, so that a "binary file matches" message must follow the
+     output of the file's last chunk.  */
+  bool enc_error;
   void (*cleanup_fn) (void *);
   void *cleanup_arg;
   char *filename;
@@ -3224,6 +3229,7 @@ static bool overall_status = true;
 
 static intmax_t chunk_accumulated_count = 0;
 static bool chunk_has_any_match = false;
+static bool chunk_enc_error = false;
 static intmax_t stream_commit_totalnl = 0;
 
 /* Output the group separator, as prtext does.  */
@@ -3420,6 +3426,9 @@ rob_try_commit_locked (void)
               intmax_t saved_outleft = outleft;
               idx_t saved_pending = pending;
               bool saved_buffering_enabled = buffering_enabled;
+              bool saved_out_quiet = out_quiet;
+              bool saved_done_on_match = done_on_match;
+              bool saved_encoding_error_output = encoding_error_output;
 
               buffering_enabled = false;
               filename = label;
@@ -3431,11 +3440,16 @@ rob_try_commit_locked (void)
               lastout = nullptr;
               outleft = max_count;
               pending = 0;
+              out_quiet = initial_out_quiet;
+              done_on_match = initial_done_on_match;
+              encoding_error_output = false;
 
               intmax_t mcnt = grepbuf (slot->stream_first_lbeg, buflim);
               slot->status = (mcnt == 0);
               if (mcnt > 0)
                 slot->had_prtext = true;
+              slot->enc_error |= (binary_files == BINARY_BINARY_FILES
+                                  && !out_quiet && encoding_error_output);
 
               filename = saved_filename;
               bufbeg = saved_bufbeg;
@@ -3447,6 +3461,9 @@ rob_try_commit_locked (void)
               outleft = saved_outleft;
               pending = saved_pending;
               buffering_enabled = saved_buffering_enabled;
+              out_quiet = saved_out_quiet;
+              done_on_match = saved_done_on_match;
+              encoding_error_output = saved_encoding_error_output;
 
               free_slice_buf_locked (slot->stream_chunk_alloc);
               slot->stream_chunk_alloc = nullptr;
@@ -3457,11 +3474,13 @@ rob_try_commit_locked (void)
           slot->chunk_nls = 0;
         }
 
+      bool binary_message = false;
       if (slot->is_chunk)
         {
           chunk_accumulated_count += slot->chunk_count;
           if (slot->chunk_count > 0 || !slot->status)
             chunk_has_any_match = true;
+          chunk_enc_error |= slot->enc_error;
 
           if (slot->is_last_chunk)
             {
@@ -3501,8 +3520,10 @@ rob_try_commit_locked (void)
                 }
 
               slot->status = !chunk_has_any_match;
+              binary_message = chunk_enc_error;
               chunk_accumulated_count = 0;
               chunk_has_any_match = false;
+              chunk_enc_error = false;
             }
           else
             {
@@ -3514,6 +3535,12 @@ rob_try_commit_locked (void)
       commit_output (slot->stdout_buf ? slot->stdout_buf : slot->inline_out,
                      slot->stdout_len, slot->stderr_buf, slot->stderr_len,
                      slot->big, slot->nbig, want_sep);
+
+      /* Like single-threaded grep, report omitted lines once, after all
+         the output of the file.  */
+      if (binary_message)
+        error (0, 0, _("%s: binary file matches"),
+               slot->filename ? slot->filename : _("(standard input)"));
 
       if (line_buffered)
         fflush_errno ();
@@ -3754,6 +3781,7 @@ worker_thread_func (void *arg)
       bool status = true;
       char *defer_name = nullptr;
       intmax_t chunk_matched_cnt = 0;
+      bool enc_error = false;
 
       if (task.type == TASK_TYPE_STDIN)
         {
@@ -3890,8 +3918,11 @@ worker_thread_func (void *arg)
             }
           else
             {
+              encoding_error_output = false;
               intmax_t lines_matched = grepbuf (bufbeg, buflim);
               status = (lines_matched == 0);
+              enc_error = (binary_files == BINARY_BINARY_FILES && !out_quiet
+                           && encoding_error_output);
             }
         }
       else if (task.type == TASK_TYPE_CHUNK)
@@ -3935,8 +3966,8 @@ worker_thread_func (void *arg)
             {
               intmax_t lines_matched = grepbuf (bufbeg, buflim);
               status = (lines_matched == 0);
-              if (binary_files == BINARY_BINARY_FILES && !out_quiet && encoding_error_output)
-                task_error (0, _("%s: binary file matches"), input_filename ());
+              enc_error = (binary_files == BINARY_BINARY_FILES && !out_quiet
+                           && encoding_error_output);
             }
         }
 
@@ -3958,6 +3989,7 @@ worker_thread_func (void *arg)
       slot->had_prtext = task_had_prtext;
       slot->sep = task_sep;
       slot->chunk_count = chunk_matched_cnt;
+      slot->enc_error = enc_error;
       if (defer_name)
         {
           slot->defer_name = defer_name;

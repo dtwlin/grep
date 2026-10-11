@@ -71,6 +71,13 @@ EXTRA_OPTION_SETS = [
 # Option sets run with stdout and stderr sent to the same file.
 COMBINED_OPTION_SETS = [[], ["-n"], ["-c"], ["-l"], ["-C2"], ["-s"]]
 
+# Option sets for the large files, which are searched in chunks.
+LARGE_OPTION_SETS = [
+    [], ["-n"], ["-o"], ["-b"], ["-c"], ["-v"], ["-v", "-n"], ["-c", "-v"],
+    ["--color=always"], ["-w"], ["-l"], ["-L"], ["-q"], ["-A0"],
+    ["--binary-files=without-match"], ["-a"], ["-o", "-b"],
+]
+
 PATTERN = "needle"
 
 
@@ -262,6 +269,53 @@ def build_many_tree(root, count=48):
         write_file(os.path.join(root, f"f{i:03d}.txt"), "".join(lines))
 
 
+def large_base_lines(count=200000, seed=7):
+    """About 11 MiB of text lines, with a matching line now and then."""
+    lines = []
+    x = seed
+    for i in range(count):
+        x = (x * 1103515245 + 12345) & 0x7fffffff
+        word = "abcdefghijklmnopqrstuvwxyz"[x % 26] * ((20 + x % 90) // 2)
+        if i % 997 == 0:
+            lines.append(f"line {i} has a needle and {word}\n".encode())
+        elif i % 991 == 0:
+            lines.append(b"needle\n")
+        else:
+            lines.append(f"line {i} {word} plain text\n".encode())
+    return lines
+
+
+# Large files, searched in chunks by several threads.  Each entry maps
+# a file name to the lines that replace lines of the base text.
+LARGE_FILES = {
+    "clean.txt": {},
+    # Encoding errors (in UTF-8) in matching lines early and late, and
+    # in a line that only -v outputs.
+    "enc.txt": {997 * 20: b"line x has a needle \xff in it\n",
+                60000: b"plain line with a bad byte \xfe here\n",
+                997 * 140: b"another needle \xc3( bad\n"},
+    "enc_late_nomatch.txt": {120001: b"no match but bad \xff byte\n"},
+}
+
+
+def build_large_files(root):
+    """Create the files of LARGE_FILES that do not exist yet."""
+    os.makedirs(root, exist_ok=True)
+    base = None
+    for name, edits in LARGE_FILES.items():
+        path = os.path.join(root, name)
+        if os.path.exists(path):
+            continue
+        if base is None:
+            base = large_base_lines()
+        lines = list(base)
+        for i, data in edits.items():
+            lines[i] = data
+        with open(path + ".tmp", "wb") as f:
+            f.writelines(lines)
+        os.rename(path + ".tmp", path)
+
+
 def fix_perms_for_removal(root):
     for dirpath, dirnames, filenames in os.walk(root):
         for d in dirnames:
@@ -309,7 +363,7 @@ class Runner:
 
     def run(self, binary, opts, roots, threads=None, cwd=None,
             stdout_path=None, timeout=300, argv0=ARGV0, combined=False,
-            pattern=None, nofile=None):
+            pattern=None, nofile=None, stdin_path=None, pipe_path=None):
         env = dict(self.env)
         if threads is not None:
             env["GREP_THREADS"] = str(threads)
@@ -317,23 +371,50 @@ class Runner:
         # start with argv[0]) are comparable byte for byte.
         cmd = [argv0] + opts + ["-e", pattern or self.pattern] + roots
         out_f = open(stdout_path, "wb") if stdout_path else subprocess.PIPE
+        in_f = subprocess.DEVNULL
+        if stdin_path:
+            in_f = open(os.path.join(cwd or ".", stdin_path), "rb")
+        elif pipe_path:
+            in_f = subprocess.PIPE
         try:
             limit = None
             if nofile:
                 limit = lambda: resource.setrlimit(resource.RLIMIT_NOFILE,
                                                    (nofile, nofile))
-            p = subprocess.run(cmd, executable=binary, stdout=out_f,
-                               preexec_fn=limit,
-                               stderr=(subprocess.STDOUT if combined
-                                       else subprocess.PIPE),
-                               stdin=subprocess.DEVNULL, env=env, cwd=cwd,
-                               timeout=timeout)
+            p = subprocess.Popen(cmd, executable=binary, stdout=out_f,
+                                 preexec_fn=limit,
+                                 stderr=(subprocess.STDOUT if combined
+                                         else subprocess.PIPE),
+                                 stdin=in_f, env=env, cwd=cwd)
+            feeder = None
+            if pipe_path:
+                # Feed the pipe in pieces, as cat would.
+                stdin_pipe, p.stdin = p.stdin, None
+                def feed(src=os.path.join(cwd or ".", pipe_path)):
+                    try:
+                        with open(src, "rb") as f:
+                            while chunk := f.read(128 * 1024):
+                                stdin_pipe.write(chunk)
+                    except BrokenPipeError:
+                        pass
+                    finally:
+                        try:
+                            stdin_pipe.close()
+                        except BrokenPipeError:
+                            pass
+                feeder = threading.Thread(target=feed)
+                feeder.start()
+            pout, perr = p.communicate(timeout=timeout)
+            if feeder:
+                feeder.join()
         finally:
             if stdout_path:
                 out_f.close()
+            if stdin_path:
+                in_f.close()
         self.runs += 1
-        out = p.stdout
-        err = b"" if combined else p.stderr
+        out = pout
+        err = b"" if combined else perr
         if stdout_path:
             with open(stdout_path, "rb") as f:
                 out = f.read()
@@ -341,7 +422,7 @@ class Runner:
 
     def compare(self, label, opts, roots, cwd=None, stdout_path=None,
                 fifo=None, argv0=ARGV0, combined=False, pattern=None,
-                nofile=None):
+                nofile=None, stdin_path=None, pipe_path=None):
         if self.args.only and not any(o in label for o in self.args.only):
             return True
         def go(binary, threads):
@@ -352,7 +433,8 @@ class Runner:
                 fifo.arm()
             r = self.run(binary, opts, roots, threads, cwd, stdout_path,
                          argv0=argv0, combined=combined, pattern=pattern,
-                         nofile=nofile)
+                         nofile=nofile, stdin_path=stdin_path,
+                         pipe_path=pipe_path)
             if fifo:
                 fifo.disarm()
             return r
@@ -522,6 +604,21 @@ def main():
             r.compare("many-operands", opts, many_files, cwd=wd)
         for opts in (["-o"], ["-n"]):
             r.compare("many-r", ["-r"] + opts, ["many"], cwd=wd)
+
+        # Large files, which several threads search in chunks: as an
+        # operand, as standard input redirected from the file, and
+        # through a pipe.
+        log(f"[{wd}] large files")
+        large = os.path.join(wd, "large")
+        build_large_files(large)
+        for name in LARGE_FILES:
+            rel = os.path.join("large", name)
+            for opts in LARGE_OPTION_SETS:
+                r.compare(f"large-{name}", opts, [rel], cwd=wd)
+                r.compare(f"large-{name}-stdin", opts, [], cwd=wd,
+                          stdin_path=rel)
+                r.compare(f"large-{name}-pipe", opts, [], cwd=wd,
+                          pipe_path=rel)
         sets = BASE_OPTION_SETS + ([] if args.quick else EXTRA_OPTION_SETS)
         for mode in ("-r", "-R"):
             log(f"[{wd}] adversarial tree, {mode}")
