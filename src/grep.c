@@ -3246,7 +3246,7 @@ print_group_separator (void)
    decision to the committer (see TASK_SEP).  Like the static variable
    USED of single-threaded grep, GLOBAL_USED becomes true after any
    prtext call, even one that output nothing.  */
-static bool
+static bool _GL_ATTRIBUTE_PURE
 need_group_separator (bool had_prtext, bool sep)
 {
   return (had_prtext && sep && (0 <= out_before || 0 <= out_after)
