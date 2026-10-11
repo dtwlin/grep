@@ -29,6 +29,11 @@
 #include <stdatomic.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
+#include <dirent.h>
+#if defined __linux__ && HAVE_SYS_VFS_H && HAVE_FSTATFS
+# include <sys/vfs.h>
+#endif
 #ifdef __GLIBC__
 # include <stdio_ext.h>
 #endif
@@ -3096,7 +3101,8 @@ enum work_task_type
   TASK_TYPE_CHUNK,
   TASK_TYPE_STREAM_CHUNK,
   TASK_TYPE_MMAP_SCAN,
-  TASK_TYPE_TERMINATE
+  TASK_TYPE_TERMINATE,
+  TASK_TYPE_WALK
 };
 
 enum chunk_mode
@@ -3634,6 +3640,9 @@ producer_alloc_slot_locked (void)
   return seq;
 }
 
+static void walk_participate (unsigned int);
+static void walk_free_thread_buffers (void);
+
 static void *
 worker_thread_func (void *arg)
 {
@@ -3665,6 +3674,13 @@ worker_thread_func (void *arg)
 
       if (task.type == TASK_TYPE_TERMINATE)
         break;
+
+      if (task.type == TASK_TYPE_WALK)
+        {
+          walk_participate (task.seq);
+          pthread_mutex_lock (&pool_mutex);
+          continue;
+        }
 
       if (task.type == TASK_TYPE_MMAP_SCAN)
         {
@@ -4046,8 +4062,9 @@ worker_thread_func (void *arg)
 
   membuf_free (&tls_out);
   membuf_free (&tls_err);
-  membuf_free (&tls_big);
   free_worker_buffer ();
+  walk_free_thread_buffers ();
+  membuf_free (&tls_big);
   if (compiled_pattern)
     {
       free_compiled_pattern (compiled_pattern);
@@ -5104,133 +5121,1312 @@ stream_slicer_stdin (void)
   free (residue_buf);
 }
 
-static void
-producer_grepdirent (FTS *fts, FTSENT *ent, bool command_line)
+/* Parallel ordered directory traversal.
+
+   A directory operand of a recursive search is traversed by tasks that
+   any thread may run: a task either reads one directory or searches a
+   batch of files of one directory.  Output is nevertheless committed in
+   exactly the order of grep's fts-based traversal.  Each directory node
+   keeps its entries in fts order, and a single commit cursor walks the
+   tree of nodes depth first, committing the results of each entry once
+   they are ready.  Tasks are run in that same order as far as possible,
+   so that the cursor seldom waits and little output is held back.
+
+   The traversal reproduces what grep observes from fts with the options
+   it uses, FTS_CWDFD | FTS_NOSTAT | FTS_TIGHT_CYCLE_CHECK plus either
+   FTS_PHYSICAL | FTS_COMFOLLOW (-r) or FTS_LOGICAL (-R):
+
+   - Entries are visited in readdir order, except that fts sorts each
+     batch of more than 10,000 entries by inode number, unless it knows
+     that the file system does not benefit; it knows the file system
+     type only with FTS_CWDFD.
+   - A directory whose device and inode numbers equal those of one of its
+     ancestors is a loop.
+   - With -r, entries are opened relative to their directory, so file
+     names may be longer than PATH_MAX.  With -R, which implies
+     FTS_NOCHDIR, entries are accessed by their full names.
+   - Diagnostics appear where fts-based grep issues them, after the same
+     checks for exclusion patterns, devices and symbolic links.  */
+
+/* Maximum number of files searched by one task.  */
+enum { WALK_BATCH = 32 };
+
+/* gnulib fts reads at most this many entries of a directory at a time,
+   and sorts a batch by inode number if it has more than
+   WALK_INODE_SORT_MIN entries.  */
+enum { WALK_READDIR_BATCH = 100000 };
+enum { WALK_INODE_SORT_MIN = 10000 };
+
+enum walk_kind
 {
-  bool follow;
-  command_line &= ent->fts_level == FTS_ROOTLEVEL;
+  WALK_SKIP,                    /* nothing to search */
+  WALK_FILE,                    /* a file to search */
+  WALK_DIR,                     /* a directory to read and descend into */
+};
 
-  if (ent->fts_info == FTS_DP)
-    return;
+/* Output captured for one entry: OUTLEN bytes of standard output,
+   ERRLEN bytes of diagnostic records (see struct errrec) and NBIG
+   recorded large writes (see TLS_BIG).  */
+struct walk_out
+{
+  size_t outlen, errlen, nbig;
+  /* NBIG pairs of offsets and lengths, followed by the output and the
+     diagnostic records.  */
+  size_t big[];
+};
 
-  if (!command_line
-      && skipped_file (ent->fts_name, false,
-                       (ent->fts_info == FTS_D || ent->fts_info == FTS_DC
-                        || ent->fts_info == FTS_DNR)))
+struct walk_dir;
+
+/* An entry of a directory.  Entries are kept in fts order.  */
+struct walk_ent
+{
+  char const *name;
+  ino_t ino;                    /* d_ino, for sorting */
+  struct walk_out *out;         /* output to commit, or null */
+  struct walk_dir *sub;         /* WALK_DIR: the directory, once read */
+  unsigned char type;           /* d_type */
+  unsigned char kind;           /* enum walk_kind */
+  bool status;                  /* true if no lines were selected */
+  bool errseen;                 /* an error was diagnosed */
+  bool used;                    /* prtext was called */
+  bool sep;                     /* see TASK_SEP */
+  bool defer;                   /* the output file; see TLS_MAY_DEFER */
+  atomic_bool done;             /* the entry can be committed */
+};
+
+/* A directory being traversed.  */
+struct walk_dir
+{
+  struct walk_dir *parent;      /* null for the holder of the root */
+  size_t pindex;                /* index of this directory in PARENT */
+  size_t depth;                 /* 0 for the holder of the root */
+  struct walk_ent *ents;
+  size_t nents;
+  size_t cpos;                  /* position of the commit cursor */
+  char *path;                   /* fts_path of this directory */
+  size_t pathlen;
+  char *names;                  /* storage for the names of ENTS */
+  struct walk_out *post;        /* diagnostic to output after ENTS */
+  dev_t dev;
+  ino_t ino;
+  atomic_int fd;                /* open descriptor, or -1 */
+  atomic_int fd_users;          /* pending tasks that need FD */
+  atomic_int refs;              /* references to this structure */
+  struct walk_dir *fd_prev, *fd_next;   /* list of directories with FD */
+};
+
+/* A task: read the directory DIR->ents[LO], or search the files among
+   DIR->ents[LO..HI-1].  */
+struct walk_task
+{
+  struct walk_dir *dir;
+  size_t lo, hi;
+  bool read;
+};
+
+/* A binary heap of tasks, earliest in fts order first.  */
+struct walk_heap
+{
+  struct walk_task **v;
+  idx_t n, alloc;
+};
+
+static struct
+{
+  pthread_mutex_t mu;           /* protects the members up to INSIDE */
+  pthread_cond_t cv;            /* tasks became available, or done */
+  pthread_cond_t left_cv;       /* INSIDE dropped to zero */
+  struct walk_heap reads, files;
+  int idle;                     /* threads waiting on CV */
+  int running;                  /* threads running a task or committing */
+  int inside;                   /* threads in walk_participate */
+  unsigned int gen;             /* number of the current traversal */
+  bool done;                    /* the traversal is fully committed */
+
+  bool logical;                 /* -R: use full names */
+  int fd_cap;                   /* soft limit on open directories */
+
+  pthread_mutex_t fd_mu;        /* protects the members below */
+  atomic_int open_fds;          /* directories with open descriptors */
+  struct walk_dir *fd_list;     /* those directories */
+
+  pthread_mutex_t commit_mu;    /* held by the committer */
+  atomic_ulong commit_req;      /* commit attempts so far */
+  struct walk_dir *cur;         /* directory of the commit cursor */
+} walk =
+  {
+    .mu = PTHREAD_MUTEX_INITIALIZER,
+    .cv = PTHREAD_COND_INITIALIZER,
+    .left_cv = PTHREAD_COND_INITIALIZER,
+    .fd_mu = PTHREAD_MUTEX_INITIALIZER,
+    .commit_mu = PTHREAD_MUTEX_INITIALIZER,
+  };
+
+/* Per-thread buffers for names and directory entries.  */
+static _Thread_local char *walk_pbuf;
+static _Thread_local idx_t walk_pbufsize;
+static _Thread_local char *walk_dbuf;
+enum { WALK_DBUF_SIZE = 64 * 1024 };
+
+static void
+walk_free_thread_buffers (void)
+{
+  free (walk_pbuf);
+  walk_pbuf = nullptr;
+  walk_pbufsize = 0;
+  free (walk_dbuf);
+  walk_dbuf = nullptr;
+}
+
+/* Flags with which fts opens directories, except O_NOFOLLOW.  */
+enum { WALK_DIR_FLAGS = (O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOCTTY
+                         | O_NONBLOCK) };
+
+/* Return FD, or a duplicate of it that is not a standard descriptor.  */
+static int
+walk_fd_safer (int fd)
+{
+  if (0 <= fd && fd <= STDERR_FILENO)
     {
-      fts_set (fts, ent, FTS_SKIP);
-      return;
+      int nfd = fcntl (fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+      int err = errno;
+      close (fd);
+      errno = err;
+      fd = nfd;
     }
+  return fd;
+}
 
-  char const *fname = ent->fts_path;
-  if (omit_dot_slash && fname[1])
-    fname += 2;
-  follow = (fts->fts_options & FTS_LOGICAL
-            || (fts->fts_options & FTS_COMFOLLOW && command_line));
-
-  switch (ent->fts_info)
+/* Store into WALK_PBUF the fts_path of entry NAME of directory D, and
+   return it.  */
+static char *
+walk_path (struct walk_dir const *d, char const *name)
+{
+  size_t dlen = d->pathlen;
+  if (dlen && d->path[dlen - 1] == '/')
+    dlen--;
+  size_t nlen = strlen (name);
+  idx_t need = dlen + 1 + nlen + 1;
+  if (walk_pbufsize < need)
     {
-    case FTS_D:
-      if (directories == RECURSE_DIRECTORIES)
-        return;
-      fts_set (fts, ent, FTS_SKIP);
-      return;
-
-    case FTS_DC:
-      if (!suppress_errors)
-        producer_enqueue_msg (0, _("%s: warning: recursive directory loop"), fname);
-      return;
-
-    case FTS_DNR:
-    case FTS_ERR:
-    case FTS_NS:
-      if (!suppress_errors)
-        producer_enqueue_error (ent->fts_errno, fname);
-      else
-        producer_enqueue_errseen ();
-      return;
-
-    case FTS_DEFAULT:
-    case FTS_NSOK:
-      if (skip_devices (command_line))
-        {
-          struct stat *st = ent->fts_statp;
-          struct stat st1;
-          if (! st->st_mode)
-            {
-              int flag = follow ? 0 : AT_SYMLINK_NOFOLLOW;
-              if (fstatat (fts->fts_cwd_fd, ent->fts_accpath, &st1, flag) != 0)
-                {
-                  if (!suppress_errors)
-                    producer_enqueue_error (errno, fname);
-                  else
-                    producer_enqueue_errseen ();
-                  return;
-                }
-              st = &st1;
-            }
-          if (is_device_mode (st->st_mode))
-            return;
-        }
-      break;
-
-    case FTS_F:
-    case FTS_SLNONE:
-      if (S_ISREG (ent->fts_statp->st_mode)
-          && ent->fts_statp->st_size >= 2 * 1024 * 1024 && pool_nthreads > 1
-          && (!out_invert || (out_before <= 0 && out_after <= 0))
-          && ! (exact_stdout && SAME_INODE (*ent->fts_statp, out_stat)))
-        {
-          producer_flush_batch ();
-          chunked_grep_file (fname, ent->fts_statp);
-          return;
-        }
-      break;
-
-    case FTS_SL:
-    case FTS_W:
-      return;
-
-    default:
-      abort ();
+      free (walk_pbuf);
+      walk_pbufsize = need;
+      walk_pbuf = xpalloc (nullptr, &walk_pbufsize, need, -1, 1);
     }
+  char *p = mempcpy (walk_pbuf, d->path, dlen);
+  *p++ = '/';
+  memcpy (p, name, nlen + 1);
+  return walk_pbuf;
+}
 
-  producer_enqueue_file (fname, follow, command_line);
+/* Return how grep names file name PATH in diagnostics and output.  */
+static char const *
+walk_shown_name (char const *path)
+{
+  return omit_dot_slash && path[1] ? path + 2 : path;
+}
+
+/* Return the fts_path of entry E of D, in WALK_PBUF unless E is the
+   root.  */
+static char *
+walk_ent_path (struct walk_dir const *d, struct walk_ent const *e)
+{
+  return d->parent ? walk_path (d, e->name) : (char *) e->name;
+}
+
+/* Return a new output record holding diagnostic error (0, ERRNUM, FMT,
+   NAME) would output, or null if diagnostics are suppressed.  */
+static struct walk_out *
+walk_diagnostic (int errnum, char const *fmt, char const *name)
+{
+  if (suppress_errors)
+    return nullptr;
+  char buf[1024];
+  char *msg = format_message_l (buf, sizeof buf, fmt, name);
+  size_t len;
+  char *text = diagnostic_text (errnum, msg, &len);
+  if (msg != buf)
+    free (msg);
+  struct walk_out *o = ximalloc (sizeof *o + sizeof (struct errrec) + len);
+  o->outlen = o->nbig = 0;
+  o->errlen = sizeof (struct errrec) + len;
+  struct errrec h = { .outpos = 0, .len = len, .after_sep = false };
+  char *p = (char *) o->big;
+  memcpy (p, &h, sizeof h);
+  memcpy (p + sizeof h, text, len);
+  free (text);
+  return o;
+}
+
+/* Record that entry E of directory D got error ERRNUM, as
+   suppressible_error would report it.  */
+static void
+walk_ent_error (struct walk_dir const *d, struct walk_ent *e, int errnum)
+{
+  e->out = walk_diagnostic (errnum, "%s", walk_shown_name (walk_ent_path (d, e)));
+  e->errseen = true;
+}
+
+/* Record that the status of entry E of D could not be determined, which
+   fts reports as FTS_NS; grep then treats the entry as a file.  */
+static void
+walk_ent_stat_error (struct walk_dir const *d, struct walk_ent *e,
+                     int errnum)
+{
+  if (!skipped_file (e->name, false, false))
+    walk_ent_error (d, e, errnum);
+}
+
+/* Record that the directory entry E of D is a loop (FTS_DC).  */
+static void
+walk_ent_loop (struct walk_dir const *d, struct walk_ent *e)
+{
+  e->out = walk_diagnostic (0, _("%s: warning: recursive directory loop"),
+                            walk_shown_name (walk_ent_path (d, e)));
+}
+
+/* Return true if a directory with device DEV and inode INO is D or one
+   of its ancestors, i.e., entering it would loop.  */
+static bool _GL_ATTRIBUTE_PURE
+walk_is_loop (struct walk_dir const *d, dev_t dev, ino_t ino)
+{
+  for (; d->parent; d = d->parent)
+    if (d->ino == ino && d->dev == dev)
+      return true;
+  return false;
+}
+
+/* Return true if position I of directory A comes before position J of
+   directory B in fts order.  A directory entry comes before the entries
+   of the directory.  */
+static bool _GL_ATTRIBUTE_PURE
+walk_before (struct walk_dir const *a, size_t i,
+             struct walk_dir const *b, size_t j)
+{
+  bool a_up = false, b_up = false;
+  while (b->depth < a->depth)
+    {
+      i = a->pindex;
+      a = a->parent;
+      a_up = true;
+    }
+  while (a->depth < b->depth)
+    {
+      j = b->pindex;
+      b = b->parent;
+      b_up = true;
+    }
+  while (a != b)
+    {
+      i = a->pindex;
+      a = a->parent;
+      j = b->pindex;
+      b = b->parent;
+      a_up = b_up = true;
+    }
+  return i != j ? i < j : !a_up && b_up;
+}
+
+static bool _GL_ATTRIBUTE_PURE
+walk_task_before (struct walk_task const *a, struct walk_task const *b)
+{
+  return walk_before (a->dir, a->lo, b->dir, b->lo);
 }
 
 static void
-producer_recurse_dir (char const *dir, bool command_line)
+walk_heap_push (struct walk_heap *h, struct walk_task *t)
 {
-  FTS *fts;
-  FTSENT *ent;
-  int opts = fts_options & ~(command_line ? 0 : FTS_COMFOLLOW);
-  char *fts_arg[2];
-
-  fts_arg[0] = (char *) dir;
-  fts_arg[1] = nullptr;
-  fts = fts_open (fts_arg, opts, nullptr);
-  if (!fts)
-    xalloc_die ();
-
-  while ((ent = fts_read (fts)))
+  if (h->n == h->alloc)
+    h->v = xpalloc (h->v, &h->alloc, 1, -1, sizeof *h->v);
+  idx_t k = h->n++;
+  while (0 < k)
     {
-      producer_grepdirent (fts, ent, command_line);
+      idx_t p = (k - 1) / 2;
+      if (!walk_task_before (t, h->v[p]))
+        break;
+      h->v[k] = h->v[p];
+      k = p;
     }
+  h->v[k] = t;
+}
+
+static struct walk_task *
+walk_heap_pop (struct walk_heap *h)
+{
+  struct walk_task *top = h->v[0];
+  struct walk_task *last = h->v[--h->n];
+  idx_t k = 0;
+  for (;;)
+    {
+      idx_t c = 2 * k + 1;
+      if (h->n <= c)
+        break;
+      if (c + 1 < h->n && walk_task_before (h->v[c + 1], h->v[c]))
+        c++;
+      if (!walk_task_before (h->v[c], last))
+        break;
+      h->v[k] = h->v[c];
+      k = c;
+    }
+  if (0 < h->n)
+    h->v[k] = last;
+  return top;
+}
+
+static void
+walk_free_out (struct walk_out *o)
+{
+  free (o);
+}
+
+static void
+walk_unref (struct walk_dir *d)
+{
+  if (atomic_fetch_sub (&d->refs, 1) == 1)
+    {
+      for (size_t i = 0; i < d->nents; i++)
+        walk_free_out (d->ents[i].out);
+      walk_free_out (d->post);
+      free (d->ents);
+      free (d->names);
+      free (d->path);
+      free (d);
+    }
+}
+
+/* Make FD the open descriptor of D.  WALK.fd_mu must be held.  */
+static void
+walk_set_fd_locked (struct walk_dir *d, int fd)
+{
+  atomic_store_explicit (&d->fd, fd, memory_order_relaxed);
+  atomic_fetch_add (&walk.open_fds, 1);
+  d->fd_prev = nullptr;
+  d->fd_next = walk.fd_list;
+  if (walk.fd_list)
+    walk.fd_list->fd_prev = d;
+  walk.fd_list = d;
+}
+
+/* Close the descriptor of D.  WALK.fd_mu must be held.  */
+static void
+walk_close_fd_locked (struct walk_dir *d)
+{
+  int fd = atomic_load_explicit (&d->fd, memory_order_relaxed);
+  if (fd < 0)
+    return;
+  close (fd);
+  atomic_store_explicit (&d->fd, -1, memory_order_relaxed);
+  atomic_fetch_sub (&walk.open_fds, 1);
+  if (d->fd_prev)
+    d->fd_prev->fd_next = d->fd_next;
+  else
+    walk.fd_list = d->fd_next;
+  if (d->fd_next)
+    d->fd_next->fd_prev = d->fd_prev;
+}
+
+/* A task that needed the descriptor of D is done with it.  */
+static void
+walk_fd_release (struct walk_dir *d)
+{
+  if (!walk.logical && atomic_fetch_sub (&d->fd_users, 1) == 1)
+    {
+      pthread_mutex_lock (&walk.fd_mu);
+      walk_close_fd_locked (d);
+      pthread_mutex_unlock (&walk.fd_mu);
+    }
+}
+
+/* Open D again after its descriptor was closed to save descriptors,
+   checking that it is still the same directory.  Open the directories
+   between D and its nearest open ancestor only temporarily.
+   WALK.fd_mu must be held.  Return the descriptor, or -1 (setting
+   errno) on failure.  */
+static int
+walk_reopen_locked (struct walk_dir *d)
+{
+  int fd = atomic_load_explicit (&d->fd, memory_order_relaxed);
+  if (0 <= fd)
+    return fd;
+
+  /* CHAIN[0] is D, and CHAIN[N - 1] the topmost directory to open,
+     either the root or a child of the open directory BASE.  */
+  struct walk_dir **chain = nullptr;
+  idx_t n = 0, alloc = 0;
+  int base = -1;
+  for (struct walk_dir *a = d; ; a = a->parent)
+    {
+      if (n == alloc)
+        chain = xpalloc (chain, &alloc, 1, -1, sizeof *chain);
+      chain[n++] = a;
+      if (!a->parent->parent)
+        break;
+      base = atomic_load_explicit (&a->parent->fd, memory_order_relaxed);
+      if (0 <= base)
+        break;
+    }
+
+  int cur = base;
+  for (idx_t k = n; 0 < k--; )
+    {
+      struct walk_dir *x = chain[k];
+      int nfd = (x->parent->parent
+                 ? openat (cur, x->parent->ents[x->pindex].name,
+                           WALK_DIR_FLAGS | O_NOFOLLOW)
+                 : open (x->path, WALK_DIR_FLAGS));
+      int err = errno;
+      if (cur != base)
+        close (cur);
+      nfd = walk_fd_safer (nfd);
+      struct stat st;
+      if (nfd < 0 || fstat (nfd, &st) != 0
+          || st.st_dev != x->dev || st.st_ino != x->ino)
+        {
+          if (0 <= nfd)
+            {
+              close (nfd);
+              err = ENOENT;
+            }
+          free (chain);
+          errno = err;
+          return -1;
+        }
+      cur = nfd;
+    }
+  free (chain);
+  walk_set_fd_locked (d, cur);
+  return cur;
+}
+
+/* Return a descriptor open on D, or -1 (setting errno) on failure.  */
+static int
+walk_dir_fd (struct walk_dir *d)
+{
+  int fd = atomic_load_explicit (&d->fd, memory_order_relaxed);
+  if (0 <= fd)
+    return fd;
+  pthread_mutex_lock (&walk.fd_mu);
+  fd = walk_reopen_locked (d);
+  pthread_mutex_unlock (&walk.fd_mu);
+  return fd;
+}
+
+/* Too many directories are open and no task is running.  Close the
+   descriptors of all directories other than KEEP; they are needed only
+   by pending tasks, which open them again on demand.  WALK.mu must be
+   held.  */
+static void
+walk_relieve_fd_pressure (struct walk_dir *keep)
+{
+  pthread_mutex_lock (&walk.fd_mu);
+  for (struct walk_dir *d = walk.fd_list, *next; d; d = next)
+    {
+      next = d->fd_next;
+      if (d != keep)
+        walk_close_fd_locked (d);
+    }
+  pthread_mutex_unlock (&walk.fd_mu);
+}
+
+/* Create a directory node for entry PINDEX of PARENT, whose fts_path is
+   PATH with length PATHLEN.  */
+static struct walk_dir *
+walk_dir_new (struct walk_dir *parent, size_t pindex, char const *path,
+              size_t pathlen)
+{
+  struct walk_dir *d = xzalloc (sizeof *d);
+  d->parent = parent;
+  d->pindex = pindex;
+  d->depth = parent ? parent->depth + 1 : 0;
+  d->path = ximemdup0 (path, pathlen);
+  d->pathlen = pathlen;
+  atomic_init (&d->fd, -1);
+  atomic_init (&d->fd_users, 0);
+  atomic_init (&d->refs, 1);
+  return d;
+}
+
+/* Append entry NAME with type TYPE and inode INO to the arrays being
+   built for D.  Names are stored at offsets until the arrays are final.  */
+static void
+walk_add_ent (struct walk_dir *d, idx_t *nalloc, idx_t *namesalloc,
+              idx_t *namesused, char const *name, unsigned char type,
+              ino_t ino)
+{
+  idx_t len = strlen (name) + 1;
+  if (*namesalloc - *namesused < len)
+    d->names = xpalloc (d->names, namesalloc, len - (*namesalloc - *namesused),
+                        -1, 1);
+  memcpy (d->names + *namesused, name, len);
+  if (d->nents == *nalloc)
+    d->ents = xpalloc (d->ents, nalloc, 1, -1, sizeof *d->ents);
+  struct walk_ent *e = &d->ents[d->nents++];
+  memset (e, 0, sizeof *e);
+  e->name = (char const *) *namesused;
+  e->ino = ino;
+  e->type = type;
+  e->status = true;
+  *namesused += len;
+}
+
+/* Read the entries of the directory open on FD into D.  Return 0 on
+   success, or an errno value; then the entries read so far are kept.  */
+static int
+walk_read_entries (int fd, struct walk_dir *d)
+{
+  idx_t nalloc = 0, namesalloc = 0, namesused = 0;
+  int err = 0;
+#if (defined __linux__ && defined __GLIBC__ \
+     && 2 < __GLIBC__ + (30 <= __GLIBC_MINOR__))
+  if (!walk_dbuf)
+    walk_dbuf = ximalloc (WALK_DBUF_SIZE);
+  for (;;)
+    {
+      ssize_t n = getdents64 (fd, walk_dbuf, WALK_DBUF_SIZE);
+      if (n <= 0)
+        {
+          if (n < 0)
+            err = errno;
+          break;
+        }
+      for (char *p = walk_dbuf; p < walk_dbuf + n; )
+        {
+          struct dirent64 *de = CAST_ALIGNED (struct dirent64 *, p);
+          p += de->d_reclen;
+          char const *nm = de->d_name;
+          if (nm[0] == '.' && (!nm[1] || (nm[1] == '.' && !nm[2])))
+            continue;
+          walk_add_ent (d, &nalloc, &namesalloc, &namesused, nm, de->d_type,
+                        de->d_ino);
+        }
+    }
+#else
+  int dfd = fcntl (fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+  DIR *dirp = dfd < 0 ? nullptr : fdopendir (dfd);
+  if (!dirp)
+    {
+      err = errno;
+      if (0 <= dfd)
+        close (dfd);
+    }
+  else
+    {
+      for (;;)
+        {
+          errno = 0;
+          struct dirent *de = readdir (dirp);
+          if (!de)
+            {
+              err = errno;
+              break;
+            }
+          char const *nm = de->d_name;
+          if (nm[0] == '.' && (!nm[1] || (nm[1] == '.' && !nm[2])))
+            continue;
+          walk_add_ent (d, &nalloc, &namesalloc, &namesused, nm,
+# ifdef _DIRENT_HAVE_D_TYPE
+                        de->d_type,
+# else
+                        DT_UNKNOWN,
+# endif
+                        de->d_ino);
+        }
+      closedir (dirp);
+    }
+#endif
+  for (size_t i = 0; i < d->nents; i++)
+    d->ents[i].name = d->names + (intptr_t) d->ents[i].name;
+  return err;
+}
+
+/* Return true if fts would sort large batches of entries of the
+   directory open on FD by inode number.  */
+static bool
+walk_inode_sort_useful (int fd)
+{
+  if (walk.logical)
+    return true;
+#if defined __linux__ && HAVE_SYS_VFS_H && HAVE_FSTATFS
+  struct statfs fs;
+  if (fstatfs (fd, &fs) == 0)
+    switch (fs.f_type)
+      {
+      case 0x0BD00BD0:          /* Lustre */
+      case 0xFF534D42:          /* CIFS */
+      case 0x6969:              /* NFS */
+      case 0x01021994:          /* tmpfs */
+        return false;
+      }
+#endif
+  return true;
+}
+
+static int
+walk_ino_cmp (void const *a, void const *b)
+{
+  struct walk_ent const *const *pa = a;
+  struct walk_ent const *const *pb = b;
+  return _GL_CMP ((*pa)->ino, (*pb)->ino);
+}
+
+/* Sort the entries of D, open on FD, as fts would.  */
+static void
+walk_sort (struct walk_dir *d, int fd)
+{
+  if (d->nents <= WALK_INODE_SORT_MIN || !walk_inode_sort_useful (fd))
+    return;
+  struct walk_ent *sorted = xnmalloc (d->nents, sizeof *sorted);
+  struct walk_ent **ptrs = xnmalloc (MIN (d->nents, WALK_READDIR_BATCH),
+                                     sizeof *ptrs);
+  for (size_t b = 0; b < d->nents; b += WALK_READDIR_BATCH)
+    {
+      size_t n = MIN (d->nents - b, WALK_READDIR_BATCH);
+      for (size_t i = 0; i < n; i++)
+        ptrs[i] = &d->ents[b + i];
+      if (WALK_INODE_SORT_MIN < n)
+        qsort (ptrs, n, sizeof *ptrs, walk_ino_cmp);
+      for (size_t i = 0; i < n; i++)
+        sorted[b + i] = *ptrs[i];
+    }
+  free (ptrs);
+  free (d->ents);
+  d->ents = sorted;
+}
+
+/* Classify entry E of D as grepdirent would, given the status ST of the
+   file it names, as fts_stat would have obtained it.  */
+static void
+walk_classify_stat (struct walk_dir *d, struct walk_ent *e,
+                    struct stat const *st)
+{
+  if (S_ISDIR (st->st_mode))
+    e->kind = WALK_DIR;
+  else if (skipped_file (e->name, false, false) || S_ISLNK (st->st_mode)
+           || (!S_ISREG (st->st_mode) && skip_devices (false)
+               && is_device_mode (st->st_mode)))
+    e->kind = WALK_SKIP;
+  else
+    e->kind = WALK_FILE;
+  (void) d;
+}
+
+/* Classify the entries of D, open on FD, as grepdirent would.  Entries
+   that need no further work are marked done.  */
+static void
+walk_classify (struct walk_dir *d, int fd)
+{
+  for (size_t i = 0; i < d->nents; i++)
+    {
+      struct walk_ent *e = &d->ents[i];
+      unsigned char t = e->type;
+      if (t == DT_DIR)
+        e->kind = WALK_DIR;
+      else if (t == DT_REG || (t != DT_LNK && t != DT_UNKNOWN))
+        {
+          /* fts does not stat these; grepdirent checks the type.  */
+          mode_t m = DTTOIF (t);
+          e->kind = (skipped_file (e->name, false, false)
+                     || (t != DT_REG && skip_devices (false)
+                         && is_device_mode (m))
+                     ? WALK_SKIP : WALK_FILE);
+        }
+      else if (!walk.logical && t == DT_LNK)
+        {
+          /* Opening it with O_NOFOLLOW would fail, silently.  */
+          e->kind = WALK_SKIP;
+        }
+      else
+        {
+          /* fts_stat.  */
+          struct stat st;
+          bool ok;
+          if (walk.logical)
+            {
+              char *path = walk_path (d, e->name);
+              ok = stat (path, &st) == 0;
+              if (!ok && errno == ENOENT && lstat (path, &st) == 0)
+                {
+                  /* FTS_SLNONE: grep tries to open it.  */
+                  e->kind = (skipped_file (e->name, false, false)
+                             ? WALK_SKIP : WALK_FILE);
+                  goto classified;
+                }
+            }
+          else
+            ok = fstatat (fd, e->name, &st, AT_SYMLINK_NOFOLLOW) == 0;
+          if (ok)
+            walk_classify_stat (d, e, &st);
+          else
+            {
+              e->kind = WALK_SKIP;
+              walk_ent_stat_error (d, e, errno);
+            }
+        }
+    classified:
+      if (e->kind == WALK_SKIP)
+        atomic_init (&e->done, true);
+    }
+}
+
+/* Search entry E of D, whose directory is open on DFD (unless -R), into
+   the buffers of the current thread, and record the results in E.  If
+   MAY_DEFER, leave the output file to the committer.  */
+static void
+walk_search (struct walk_dir *d, int dfd, struct walk_ent *e, bool may_defer)
+{
+  char *path = walk_path (d, e->name);
+  task_reset ();
+  filename = walk_shown_name (path);
+  tls_may_defer = may_defer && exact_stdout;
+  e->status = grepfile (dfd, walk.logical ? path : e->name, walk.logical,
+                        false);
+  tls_may_defer = false;
+  e->errseen = tls_errseen;
+  e->used = task_had_prtext;
+  e->sep = task_sep;
+  if (tls_deferred)
+    {
+      e->defer = true;
+      return;
+    }
+  if (tls_out.len | tls_err.len)
+    {
+      struct walk_out *o = ximalloc (sizeof *o + tls_big.len + tls_out.len
+                                     + tls_err.len);
+      o->outlen = tls_out.len;
+      o->errlen = tls_err.len;
+      o->nbig = tls_big.len / (2 * sizeof (size_t));
+      char *p = mempcpy (o->big, tls_big.data, tls_big.len);
+      p = mempcpy (p, tls_out.data, tls_out.len);
+      memcpy (p, tls_err.data, tls_err.len);
+      e->out = o;
+    }
+}
+
+static void walk_push_dir (struct walk_dir *d);
+
+/* Read the directory named by entry PINDEX of P, as fts would when it
+   reaches that entry, and record what to commit for it.  */
+static void
+walk_read_dir (struct walk_dir *p, size_t pindex)
+{
+  struct walk_ent *e = &p->ents[pindex];
+  bool root = !p->parent;
+  char *path = walk_ent_path (p, e);
+  struct stat st;
+  int fd;
+
+  if (walk.logical)
+    {
+      if (!root)
+        {
+          if (stat (path, &st) != 0)
+            {
+              int err = errno;
+              if (err == ENOENT && lstat (path, &st) == 0)
+                goto search_as_file;
+              walk_ent_stat_error (p, e, err);
+              return;
+            }
+          if (!S_ISDIR (st.st_mode))
+            goto search_as_file;
+          if (skipped_file (e->name, false, true))
+            return;
+          if (walk_is_loop (p, st.st_dev, st.st_ino))
+            {
+              walk_ent_loop (p, e);
+              return;
+            }
+        }
+      fd = walk_fd_safer (open (path, WALK_DIR_FLAGS));
+      if (fd < 0)
+        {
+          walk_ent_error (p, e, errno);
+          return;
+        }
+    }
+  else if (root)
+    {
+      fd = walk_fd_safer (open (path, WALK_DIR_FLAGS));
+      if (fd < 0)
+        {
+          walk_ent_error (p, e, errno);
+          return;
+        }
+    }
+  else
+    {
+      int pfd = walk_dir_fd (p);
+      if (pfd < 0)
+        {
+          walk_ent_error (p, e, errno);
+          return;
+        }
+      if (skipped_file (e->name, false, true))
+        {
+          /* fts would stat it first, and grep would treat it as a file
+             if that failed.  */
+          if (fstatat (pfd, e->name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+            walk_ent_stat_error (p, e, errno);
+          return;
+        }
+      fd = walk_fd_safer (openat (pfd, e->name, WALK_DIR_FLAGS | O_NOFOLLOW));
+      if (fd < 0)
+        {
+          int err = errno;
+          if (fstatat (pfd, e->name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+            walk_ent_stat_error (p, e, errno);
+          else if (!S_ISDIR (st.st_mode))
+            goto search_as_file;
+          else if (walk_is_loop (p, st.st_dev, st.st_ino))
+            walk_ent_loop (p, e);
+          else
+            walk_ent_error (p, e, err);
+          return;
+        }
+    }
+
+  if (fstat (fd, &st) != 0)
+    {
+      int err = errno;
+      close (fd);
+      walk_ent_error (p, e, err);
+      return;
+    }
+  if (!root && !walk.logical && walk_is_loop (p, st.st_dev, st.st_ino))
+    {
+      close (fd);
+      walk_ent_loop (p, e);
+      return;
+    }
+
+  struct walk_dir *d = walk_dir_new (p, pindex, path, strlen (path));
+  d->dev = st.st_dev;
+  d->ino = st.st_ino;
+  int err = walk_read_entries (fd, d);
+  if (err && !d->nents)
+    {
+      /* FTS_DNR.  */
+      close (fd);
+      walk_unref (d);
+      walk_ent_error (p, e, err);
+      return;
+    }
+  if (err)
+    {
+      /* FTS_ERR, reported after the entries.  */
+      d->post = walk_diagnostic (err, "%s", walk_shown_name (d->path));
+      e->errseen = true;
+    }
+  walk_sort (d, fd);
+  walk_classify (d, fd);
+  if (walk.logical)
+    close (fd);
+  else
+    {
+      pthread_mutex_lock (&walk.fd_mu);
+      walk_set_fd_locked (d, fd);
+      pthread_mutex_unlock (&walk.fd_mu);
+    }
+  e->sub = d;
+  walk_push_dir (d);
+  return;
+
+ search_as_file:
+  /* The entry is no longer a directory.  Search it as grepdirent would
+     search a file of that type.  */
+  if (!skipped_file (e->name, false, false)
+      && !S_ISLNK (st.st_mode)
+      && ! (skip_devices (false) && is_device_mode (st.st_mode)))
+    {
+      e->kind = WALK_FILE;
+      walk_search (p, walk.logical ? AT_FDCWD : walk_dir_fd (p), e, false);
+    }
+}
+
+/* Queue the tasks for the entries of the directory D, which has just
+   been read.  */
+static void
+walk_push_dir (struct walk_dir *d)
+{
+  /* Build the tasks before taking the lock.  */
+  struct walk_task *stackv[64];
+  struct walk_task **v = stackv;
+  idx_t nv = 0, valloc = sizeof stackv / sizeof *stackv;
+  size_t batch_lo = 0, batch_files = 0;
+  for (size_t i = 0; i <= d->nents; i++)
+    {
+      struct walk_ent *e = i < d->nents ? &d->ents[i] : nullptr;
+      bool flush = batch_files && (!e || batch_files == WALK_BATCH);
+      for (int pass = 0; pass < 2; pass++)
+        {
+          struct walk_task *t = nullptr;
+          if (pass == 0 && flush)
+            {
+              t = xmalloc (sizeof *t);
+              *t = (struct walk_task) { .dir = d, .lo = batch_lo, .hi = i,
+                                        .read = false };
+              batch_files = 0;
+            }
+          else if (pass == 1 && e && e->kind == WALK_DIR)
+            {
+              t = xmalloc (sizeof *t);
+              *t = (struct walk_task) { .dir = d, .lo = i, .hi = i + 1,
+                                        .read = true };
+            }
+          if (t)
+            {
+              if (nv == valloc)
+                {
+                  if (v == stackv)
+                    {
+                      v = xnmalloc (valloc * 2, sizeof *v);
+                      memcpy (v, stackv, sizeof stackv);
+                      valloc *= 2;
+                    }
+                  else
+                    v = xpalloc (v, &valloc, 1, -1, sizeof *v);
+                }
+              v[nv++] = t;
+            }
+        }
+      if (e && e->kind == WALK_FILE)
+        {
+          if (!batch_files)
+            batch_lo = i;
+          batch_files++;
+        }
+    }
+
+  atomic_fetch_add (&d->refs, nv);
+  if (!walk.logical)
+    {
+      if (nv)
+        atomic_fetch_add (&d->fd_users, nv);
+      else
+        {
+          pthread_mutex_lock (&walk.fd_mu);
+          walk_close_fd_locked (d);
+          pthread_mutex_unlock (&walk.fd_mu);
+        }
+    }
+
+  if (nv)
+    {
+      pthread_mutex_lock (&walk.mu);
+      for (idx_t k = 0; k < nv; k++)
+        walk_heap_push (v[k]->read ? &walk.reads : &walk.files, v[k]);
+      if (nv < walk.idle)
+        for (idx_t k = 0; k < nv; k++)
+          pthread_cond_signal (&walk.cv);
+      else if (walk.idle)
+        pthread_cond_broadcast (&walk.cv);
+      pthread_mutex_unlock (&walk.mu);
+    }
+  if (v != stackv)
+    free (v);
+}
+
+/* Search the files of task T.  */
+static void
+walk_search_files (struct walk_task *t)
+{
+  struct walk_dir *d = t->dir;
+  int dfd = walk.logical ? AT_FDCWD : walk_dir_fd (d);
+  int fderr = errno;
+  for (size_t i = t->lo; i < t->hi; i++)
+    {
+      struct walk_ent *e = &d->ents[i];
+      if (e->kind != WALK_FILE)
+        continue;
+      if (dfd < 0 && !walk.logical)
+        walk_ent_error (d, e, fderr);
+      else
+        {
+          walk_search (d, dfd, e, true);
+          if (e->defer)
+            {
+              /* The committer will need the directory.  */
+              atomic_fetch_add (&d->refs, 1);
+              atomic_fetch_add (&d->fd_users, 1);
+            }
+        }
+      atomic_store_explicit (&e->done, true, memory_order_release);
+    }
+}
+
+/* Run task T.  */
+static void
+walk_run_task (struct walk_task *t)
+{
+  struct walk_dir *d = t->dir;
+  if (t->read)
+    {
+      walk_read_dir (d, t->lo);
+      atomic_store_explicit (&d->ents[t->lo].done, true,
+                             memory_order_release);
+    }
+  else
+    walk_search_files (t);
+  walk_fd_release (d);
+  walk_unref (d);
+  free (t);
+}
+
+/* Search the output file, entry E of D, now that everything before it
+   has been committed.  */
+static void
+walk_search_deferred (struct walk_dir *d, struct walk_ent *e)
+{
+  bool saved_buffering = buffering_enabled;
+  buffering_enabled = true;
+  e->defer = false;
+  walk_search (d, walk.logical ? AT_FDCWD : walk_dir_fd (d), e, false);
+  buffering_enabled = saved_buffering;
+  walk_fd_release (d);
+  walk_unref (d);
+}
+
+/* Commit the results of entry E.  */
+static void
+walk_commit_ent (struct walk_ent *e)
+{
+  bool sep = need_group_separator (e->used, e->sep);
+  if (e->used)
+    global_used = true;
+  struct walk_out *o = e->out;
+  if (o)
+    {
+      char const *out = (char const *) (o->big + 2 * o->nbig);
+      commit_output (out, o->outlen, out + o->outlen, o->errlen, o->big,
+                     o->nbig, sep);
+      walk_free_out (o);
+      e->out = nullptr;
+      if (line_buffered)
+        fflush_errno ();
+    }
+  else if (sep)
+    print_group_separator ();
+  if (stdout_errno)
+    die (EXIT_TROUBLE, stdout_errno, _("write error"));
+  overall_status &= e->status;
+  if (e->errseen)
+    errseen = true;
+  if (exit_on_match && !e->status)
+    {
+      stdout_errno = -1;
+      exit (EXIT_SUCCESS);
+    }
+}
+
+/* Commit as much as possible.  WALK.commit_mu must be held.  Return true
+   if the traversal is now fully committed.  */
+static bool
+walk_commit_locked (void)
+{
+  bool saved_buffering = buffering_enabled;
+  buffering_enabled = false;
+  struct walk_dir *d = walk.cur;
+  while (d)
+    {
+      if (d->cpos == d->nents)
+        {
+          if (d->post)
+            {
+              struct walk_out *o = d->post;
+              commit_output (nullptr, 0, (char const *) o->big, o->errlen,
+                             nullptr, 0, false);
+            }
+          struct walk_dir *p = d->parent;
+          if (p)
+            p->cpos++;
+          walk.cur = p;
+          walk_unref (d);
+          d = p;
+          continue;
+        }
+      struct walk_ent *e = &d->ents[d->cpos];
+      if (!atomic_load_explicit (&e->done, memory_order_acquire))
+        break;
+      if (e->defer)
+        walk_search_deferred (d, e);
+      walk_commit_ent (e);
+      if (e->sub)
+        {
+          d = walk.cur = e->sub;
+          e->sub = nullptr;
+          continue;
+        }
+      d->cpos++;
+    }
+  buffering_enabled = saved_buffering;
+  return !d;
+}
+
+/* Commit whatever can be committed, unless another thread is doing it;
+   that thread then commits on behalf of this one too.  */
+static void
+walk_commit (void)
+{
+  atomic_fetch_add (&walk.commit_req, 1);
+  while (pthread_mutex_trylock (&walk.commit_mu) == 0)
+    {
+      unsigned long req = atomic_load (&walk.commit_req);
+      bool finished = walk_commit_locked ();
+      pthread_mutex_unlock (&walk.commit_mu);
+      if (finished)
+        {
+          pthread_mutex_lock (&walk.mu);
+          walk.done = true;
+          pthread_cond_broadcast (&walk.cv);
+          pthread_mutex_unlock (&walk.mu);
+          return;
+        }
+      if (atomic_load (&walk.commit_req) == req)
+        return;
+    }
+}
+
+/* Return the next task to run, or null if the traversal is over.
+   WALK.mu must be held.  */
+static struct walk_task *
+walk_pick (void)
+{
+  struct walk_task *r = walk.reads.n ? walk.reads.v[0] : nullptr;
+  struct walk_task *f = walk.files.n ? walk.files.v[0] : nullptr;
+  if (r && (!f || walk_task_before (r, f))
+      && (walk.logical || atomic_load (&walk.open_fds) < walk.fd_cap))
+    return walk_heap_pop (&walk.reads);
+  if (f)
+    return walk_heap_pop (&walk.files);
+  if (r && walk.running == 0)
+    {
+      walk_relieve_fd_pressure (r->dir);
+      return walk_heap_pop (&walk.reads);
+    }
+  return nullptr;
+}
+
+/* Take part in traversal number GEN until it is over.  */
+static void
+walk_participate (unsigned int gen)
+{
+  pthread_mutex_lock (&walk.mu);
+  if (walk.gen != gen || walk.done)
+    {
+      pthread_mutex_unlock (&walk.mu);
+      return;
+    }
+  walk.inside++;
+  for (;;)
+    {
+      struct walk_task *t = walk_pick ();
+      if (!t)
+        {
+          if (walk.done)
+            break;
+          walk.idle++;
+          pthread_cond_wait (&walk.cv, &walk.mu);
+          walk.idle--;
+          continue;
+        }
+      walk.running++;
+      pthread_mutex_unlock (&walk.mu);
+      walk_run_task (t);
+      walk_commit ();
+      pthread_mutex_lock (&walk.mu);
+      walk.running--;
+    }
+  if (--walk.inside == 0)
+    pthread_cond_broadcast (&walk.left_cv);
+  pthread_mutex_unlock (&walk.mu);
+}
+
+/* Return the number of directories that a traversal may keep open.  */
+static int
+walk_fd_cap (void)
+{
+  struct rlimit rl;
+  long lim = 1024;
+  if (getrlimit (RLIMIT_NOFILE, &rl) == 0)
+    lim = rl.rlim_cur == RLIM_INFINITY ? LONG_MAX : rl.rlim_cur;
+  /* Leave room for the standard streams, a file per thread and more.  */
+  long cap = lim - (pool_nthreads + 1) - 16;
+#ifdef WALK_FD_CAP_MAX
+  /* For testing the handling of descriptor shortages.  */
+  cap = MIN (cap, WALK_FD_CAP_MAX);
+#endif
+  return MAX (2, MIN (cap, 4096));
+}
+
+/* Search directory DIR, a command-line operand, recursively.  */
+static void
+walk_run (char const *dir)
+{
+  /* Commit all output that precedes the traversal.  */
   producer_flush_batch ();
-  if (errno)
+  pthread_mutex_lock (&pool_mutex);
+  while (commit_seq < next_seq)
     {
-      if (!suppress_errors)
-        producer_enqueue_error (errno, dir);
-      else
-        producer_enqueue_errseen ();
+      rob_try_commit_locked ();
+      if (commit_seq >= next_seq)
+        break;
+      rob_done_waiters++;
+      pthread_cond_wait (&rob_done_cv, &pool_mutex);
+      rob_done_waiters--;
     }
-  if (fts_close (fts) != 0)
+  pthread_mutex_unlock (&pool_mutex);
+
+  /* Like fts_open, trim all but one trailing slash.  */
+  size_t len = strlen (dir);
+  if (2 < len && dir[len - 1] == '/')
+    while (1 < len && dir[len - 2] == '/')
+      --len;
+
+  struct walk_dir *holder = walk_dir_new (nullptr, 0, "", 0);
+  holder->names = ximemdup0 (dir, len);
+  holder->ents = xzalloc (sizeof *holder->ents);
+  holder->nents = 1;
+  holder->ents[0].name = holder->names;
+  holder->ents[0].kind = WALK_DIR;
+  holder->ents[0].status = true;
+  atomic_init (&holder->refs, 2);
+  atomic_init (&holder->fd_users, 1);
+  struct walk_task *t = xmalloc (sizeof *t);
+  *t = (struct walk_task) { .dir = holder, .lo = 0, .hi = 1, .read = true };
+
+  pthread_mutex_lock (&walk.mu);
+  walk.logical = (fts_options & FTS_LOGICAL) != 0;
+  walk.fd_cap = walk_fd_cap ();
+  walk.cur = holder;
+  walk.done = false;
+  unsigned int gen = ++walk.gen;
+  walk_heap_push (&walk.reads, t);
+  pthread_mutex_unlock (&walk.mu);
+
+  /* Let the worker threads join.  */
+  pthread_mutex_lock (&pool_mutex);
+  for (int i = 0; i < pool_nthreads; i++)
     {
-      if (!suppress_errors)
-        producer_enqueue_error (errno, dir);
-      else
-        producer_enqueue_errseen ();
+      while (q_count >= WORK_QUEUE_CAP)
+        pthread_cond_wait (&q_not_full_cv, &pool_mutex);
+      work_queue[q_tail] = (struct work_task) { .type = TASK_TYPE_WALK,
+                                                .seq = gen };
+      q_tail = (q_tail + 1) % WORK_QUEUE_CAP;
+      q_count++;
     }
+  pthread_cond_broadcast (&q_not_empty_cv);
+  pthread_mutex_unlock (&pool_mutex);
+
+  bool saved_buffering = buffering_enabled;
+  buffering_enabled = true;
+  walk_participate (gen);
+  buffering_enabled = saved_buffering;
+
+  pthread_mutex_lock (&walk.mu);
+  while (walk.inside)
+    pthread_cond_wait (&walk.left_cv, &walk.mu);
+  pthread_mutex_unlock (&walk.mu);
 }
 
 static void
@@ -5266,7 +6462,7 @@ producer_run (char *const *files)
                 continue;
 
               if (S_ISDIR (st.st_mode) && directories == RECURSE_DIRECTORIES)
-                producer_recurse_dir (*f, true);
+                walk_run (*f);
               else if (S_ISREG (st.st_mode) && st.st_size >= 2 * 1024 * 1024 && pool_nthreads > 1
                        && (!out_invert || (out_before <= 0 && out_after <= 0)))
                 chunked_grep_file (*f, &st);
@@ -5933,9 +7129,17 @@ main (int argc, char **argv)
   initial_done_on_match = done_on_match;
 
   int nthreads = get_num_threads ();
+
+  /* Each thread may hold a file open, so stay well within the limit on
+     open files.  */
+  struct rlimit nofile;
+  if (getrlimit (RLIMIT_NOFILE, &nofile) == 0
+      && nofile.rlim_cur != RLIM_INFINITY)
+    nthreads = MIN (nthreads, MAX (1, ((long) nofile.rlim_cur - 16) / 2));
+
   struct stat tmp_st;
-  bool is_single_stdin = (num_operands == 0
-                          || (num_operands == 1 && STREQ (*files, "-")));
+  bool single_operand = files[0] && !files[1];
+  bool is_single_stdin = single_operand && STREQ (*files, "-");
   struct stat in_st;
   bool stdin_is_reg = (is_single_stdin && fstat (STDIN_FILENO, &in_st) == 0 && S_ISREG (in_st.st_mode));
   bool stdin_is_large_reg = (stdin_is_reg
@@ -5949,13 +7153,13 @@ main (int argc, char **argv)
                           && max_count == INTMAX_MAX);
   bool can_parallelize_stdin = (!isatty (STDIN_FILENO)
                                 && (stdin_is_large_reg || can_slice_stdin));
-  bool is_single_large_file = (num_operands == 1
+  bool is_single_large_file = (single_operand
                                && !STREQ (*files, "-")
                                && stat (*files, &tmp_st) == 0
                                && S_ISREG (tmp_st.st_mode)
                                && tmp_st.st_size >= 2 * 1024 * 1024
                                && (!out_invert || (out_before <= 0 && out_after <= 0)));
-  bool is_dir_recurse = (num_operands == 1
+  bool is_dir_recurse = (single_operand
                          && !STREQ (*files, "-")
                          && directories == RECURSE_DIRECTORIES
                          && stat (*files, &tmp_st) == 0
@@ -5973,11 +7177,14 @@ main (int argc, char **argv)
           output_is_operand = true;
       }
 
+  /* A maximum count applies to each file separately, so a directory
+     traversal can search files in parallel even then; the other
+     parallel paths do not support it.  */
   if (nthreads <= 1
       || output_is_operand
-      || max_count < INTMAX_MAX
+      || (max_count < INTMAX_MAX && !is_dir_recurse)
       || (is_single_stdin && !can_parallelize_stdin)
-      || (num_operands == 1 && !is_single_stdin && !is_single_large_file && !is_dir_recurse))
+      || (single_operand && !is_single_stdin && !is_single_large_file && !is_dir_recurse))
     {
       init_worker_buffer ();
       bool status = true;

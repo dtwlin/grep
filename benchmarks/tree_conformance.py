@@ -23,8 +23,10 @@ Regression entries in the adversarial tree:
   out*/       hold the output file in the output-file-in-tree runs
 A separate tree holds names longer than PATH_MAX, which fts-based grep
 handles with -r but not with -R; its comparisons are labeled
-"deep_path_max".  Comparisons whose label starts with a --known-fail
-prefix are reported as expected failures instead of failures.
+"deep_path_max".  Another one is deep and has a leaf directory at every
+level; it is searched with low limits on open files.  Comparisons whose
+label starts with a --known-fail prefix are reported as expected
+failures instead of failures.
 
 Example:
   python3 benchmarks/tree_conformance.py \\
@@ -35,6 +37,7 @@ Example:
 import argparse
 import hashlib
 import os
+import resource
 import shutil
 import subprocess
 import sys
@@ -214,6 +217,30 @@ def build_pathmax_tree(root):
                b"needle beyond PATH_MAX\n")
 
 
+def build_comb_tree(root, depth=120):
+    """A deep tree whose every level also has a leaf directory, so that a
+    depth-first traversal keeps many directories pending at once."""
+    fd = os.open(os.path.dirname(root), os.O_RDONLY | os.O_DIRECTORY)
+    name = os.path.basename(root)
+    try:
+        for i in range(depth + 1):
+            os.mkdir(name, dir_fd=fd)
+            nfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+            os.mkdir("leaf", dir_fd=fd)
+            lf = os.open("leaf/f.txt", os.O_WRONLY | os.O_CREAT, 0o644,
+                         dir_fd=fd)
+            os.write(lf, f"needle in leaf {i}\n".encode())
+            os.close(lf)
+            lf = os.open("g.txt", os.O_WRONLY | os.O_CREAT, 0o644, dir_fd=fd)
+            os.write(lf, f"needle at level {i}\n".encode())
+            os.close(lf)
+            name = "next"
+    finally:
+        os.close(fd)
+
+
 def build_fifo_tree(root):
     os.makedirs(os.path.join(root, "d"))
     write_file(os.path.join(root, "a.txt"), "needle a\n")
@@ -269,7 +296,7 @@ class Runner:
 
     def run(self, binary, opts, roots, threads=None, cwd=None,
             stdout_path=None, timeout=300, argv0=ARGV0, combined=False,
-            pattern=None):
+            pattern=None, nofile=None):
         env = dict(self.env)
         if threads is not None:
             env["GREP_THREADS"] = str(threads)
@@ -278,7 +305,12 @@ class Runner:
         cmd = [argv0] + opts + ["-e", pattern or self.pattern] + roots
         out_f = open(stdout_path, "wb") if stdout_path else subprocess.PIPE
         try:
+            limit = None
+            if nofile:
+                limit = lambda: resource.setrlimit(resource.RLIMIT_NOFILE,
+                                                   (nofile, nofile))
             p = subprocess.run(cmd, executable=binary, stdout=out_f,
+                               preexec_fn=limit,
                                stderr=(subprocess.STDOUT if combined
                                        else subprocess.PIPE),
                                stdin=subprocess.DEVNULL, env=env, cwd=cwd,
@@ -295,7 +327,8 @@ class Runner:
         return out, err, p.returncode
 
     def compare(self, label, opts, roots, cwd=None, stdout_path=None,
-                fifo=None, argv0=ARGV0, combined=False, pattern=None):
+                fifo=None, argv0=ARGV0, combined=False, pattern=None,
+                nofile=None):
         if self.args.only and not any(o in label for o in self.args.only):
             return True
         def go(binary, threads):
@@ -305,7 +338,8 @@ class Runner:
             if fifo:
                 fifo.arm()
             r = self.run(binary, opts, roots, threads, cwd, stdout_path,
-                         argv0=argv0, combined=combined, pattern=pattern)
+                         argv0=argv0, combined=combined, pattern=pattern,
+                         nofile=nofile)
             if fifo:
                 fifo.disarm()
             return r
@@ -418,7 +452,7 @@ def main():
     ap.add_argument("--stop-on-fail", action="store_true")
     ap.add_argument("--known-fail", action="append", default=None,
                     help="label prefix of comparisons that are expected to "
-                    "fail (repeatable; default: deep_path_max)")
+                    "fail (repeatable)")
     ap.add_argument("--only", action="append", default=[],
                     help="only run comparisons whose label contains this "
                     "string (repeatable)")
@@ -426,7 +460,7 @@ def main():
     args = ap.parse_args()
     args.threads = [int(x) for x in args.threads.split(",") if x]
     if args.known_fail is None:
-        args.known_fail = ["deep_path_max"]
+        args.known_fail = []
 
     r = Runner(args)
     if os.geteuid() == 0:
@@ -447,6 +481,11 @@ def main():
             remove_tree(pathmax)
         if not os.path.exists(pathmax):
             build_pathmax_tree(pathmax)
+        comb = os.path.join(wd, "comb")
+        if args.rebuild:
+            remove_tree(comb)
+        if not os.path.exists(comb):
+            build_comb_tree(comb)
         fifo_root = os.path.join(wd, "fifo")
         if args.rebuild:
             remove_tree(fifo_root)
@@ -467,6 +506,12 @@ def main():
             # Several operands, files and directories mixed.
             r.compare(f"adv-multi{mode}", [mode, "-n"],
                       ["adv/sub1", "adv/a.txt", "adv/inc", "adv/sub2/k.c"],
+                      cwd=wd)
+            # Operands that are unreadable, missing, symbolic links, or
+            # given with trailing slashes.
+            r.compare(f"adv-operands{mode}", [mode, "-c"],
+                      ["adv/noperm_dir", "adv/does_not_exist", "adv/dirlink",
+                       "adv/filelink", "adv/sub2//", "adv/empty_dir/"],
                       cwd=wd)
             # Diagnostics must start with argv[0] verbatim.
             r.compare(f"adv-argv0{mode}", [mode, "-c"], ["adv"], cwd=wd,
@@ -499,6 +544,13 @@ def main():
                           cwd=wd)
             r.compare(f"deep_path_max-dot{mode}", [mode, "-c"], [],
                       cwd=os.path.join(wd, "pathmax"))
+
+        log(f"[{wd}] deep tree with a low limit on open files")
+        for mode in ("-r", "-R"):
+            for nofile in (40, 64, 1024):
+                for opts in ([], ["-c"], ["-l", "-n"]):
+                    r.compare(f"comb{mode}-nofile{nofile}", [mode] + opts,
+                              ["comb"], cwd=wd, nofile=nofile)
 
         log(f"[{wd}] FIFO tree")
         fifo = FifoWriter(os.path.join(fifo_root, "d", "pipe"))
