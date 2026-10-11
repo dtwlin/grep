@@ -626,26 +626,69 @@ fflush_errno (void)
     stdout_errno = errno;
 }
 
+/* Return the result of formatting FMT and AP as a string.  If it fits
+   in BUF of size BUFSIZE, store it there; otherwise allocate it.  */
+static char * _GL_ATTRIBUTE_FORMAT_PRINTF_STANDARD (3, 0)
+format_message (char *buf, size_t bufsize, char const *fmt, va_list ap)
+{
+  va_list ap2;
+  va_copy (ap2, ap);
+  int n = vsnprintf (buf, bufsize, fmt, ap);
+  if (n < 0)
+    {
+      buf[0] = '\0';
+      n = 0;
+    }
+  else if (bufsize <= (size_t) n)
+    {
+      buf = ximalloc ((idx_t) n + 1);
+      vsnprintf (buf, (size_t) n + 1, fmt, ap2);
+    }
+  va_end (ap2);
+  return buf;
+}
+
+/* Return a newly allocated copy of the diagnostic that
+   error (0, ERRNUM, "%s", MSG) would output, and store its length into
+   *LENP.  */
+static char *
+diagnostic_text (int errnum, char const *msg, size_t *lenp)
+{
+  char const *prog = getprogname ();
+  char const *err = errnum ? strerror (errnum) : nullptr;
+  size_t proglen = strlen (prog), msglen = strlen (msg);
+  size_t errlen = err ? strlen (err) : 0;
+  size_t len = proglen + 2 + msglen + (err ? 2 + errlen : 0) + 1;
+  char *text = ximalloc (len + 1);
+  char *p = mempcpy (text, prog, proglen);
+  p = mempcpy (p, ": ", 2);
+  p = mempcpy (p, msg, msglen);
+  if (err)
+    {
+      p = mempcpy (p, ": ", 2);
+      p = mempcpy (p, err, errlen);
+    }
+  *p++ = '\n';
+  *p = '\0';
+  *lenp = len;
+  return text;
+}
+
 static void _GL_ATTRIBUTE_FORMAT_PRINTF_STANDARD (2, 3)
 task_error_buffered (int errnum, char const *fmt, ...)
 {
-  char msg[1024];
+  char buf[1024];
   va_list ap;
   va_start (ap, fmt);
-  vsnprintf (msg, sizeof msg, fmt, ap);
+  char *msg = format_message (buf, sizeof buf, fmt, ap);
   va_end (ap);
 
-  char errbuf[2048];
-  int len;
-  if (errnum)
-    len = snprintf (errbuf, sizeof errbuf, "%s: %s: %s\n",
-                    getprogname (), msg, strerror (errnum));
-  else
-    len = snprintf (errbuf, sizeof errbuf, "%s: %s\n",
-                    getprogname (), msg);
-
-  if (len > 0)
-    membuf_append (&tls_err, errbuf, len);
+  size_t len;
+  char *text = diagnostic_text (errnum, msg, &len);
+  membuf_append (&tls_err, text, len);
+  free (text);
+  if (msg != buf)
+    free (msg);
 }
 
 #define task_error(errnum, ...) \
@@ -3856,6 +3899,18 @@ producer_enqueue_stdin (void)
   pthread_mutex_unlock (&pool_mutex);
 }
 
+/* Store into SLOT the diagnostic error (0, ERRNUM, "%s", MSG) would
+   output.  */
+static void
+slot_set_diagnostic (struct rob_slot *slot, int errnum, char const *msg)
+{
+  size_t len;
+  slot->stderr_buf = diagnostic_text (errnum, msg, &len);
+  slot->stderr_len = len;
+  slot->stderr_cap = len + 1;
+  slot->stderr_is_mmap = false;
+}
+
 static void
 producer_enqueue_error (int errnum, char const *fname)
 {
@@ -3869,27 +3924,22 @@ producer_enqueue_error (int errnum, char const *fname)
   slot->had_prtext = false;
 
   if (!suppress_errors)
-    {
-      char errbuf[2048];
-      int len;
-      if (errnum)
-        len = snprintf (errbuf, sizeof errbuf, "%s: %s: %s\n",
-                        getprogname (), fname, strerror (errnum));
-      else
-        len = snprintf (errbuf, sizeof errbuf, "%s: %s\n",
-                        getprogname (), fname);
-      if (len > 0)
-        {
-          slot->stderr_buf = ximemdup0 (errbuf, len);
-          slot->stderr_len = len;
-          slot->stderr_cap = len + 1;
-          slot->stderr_is_mmap = false;
-        }
-    }
+    slot_set_diagnostic (slot, errnum, fname);
 
   slot->state = ROB_SLOT_DONE;
   rob_try_commit_locked ();
   pthread_mutex_unlock (&pool_mutex);
+}
+
+/* Like format_message, but with a variable argument list.  */
+static char * _GL_ATTRIBUTE_FORMAT_PRINTF_STANDARD (3, 4)
+format_message_l (char *buf, size_t bufsize, char const *fmt, ...)
+{
+  va_list ap;
+  va_start (ap, fmt);
+  char *msg = format_message (buf, bufsize, fmt, ap);
+  va_end (ap);
+  return msg;
 }
 
 static void
@@ -3906,23 +3956,11 @@ producer_enqueue_msg (int errnum, char const *fmt, char const *fname)
 
   if (!suppress_errors)
     {
-      char msg[1024];
-      snprintf (msg, sizeof msg, fmt, fname);
-      char errbuf[2048];
-      int len;
-      if (errnum)
-        len = snprintf (errbuf, sizeof errbuf, "%s: %s: %s\n",
-                        getprogname (), msg, strerror (errnum));
-      else
-        len = snprintf (errbuf, sizeof errbuf, "%s: %s\n",
-                        getprogname (), msg);
-      if (len > 0)
-        {
-          slot->stderr_buf = ximemdup0 (errbuf, len);
-          slot->stderr_len = len;
-          slot->stderr_cap = len + 1;
-          slot->stderr_is_mmap = false;
-        }
+      char buf[1024];
+      char *msg = format_message_l (buf, sizeof buf, fmt, fname);
+      slot_set_diagnostic (slot, errnum, msg);
+      if (msg != buf)
+        free (msg);
     }
 
   slot->state = ROB_SLOT_DONE;
