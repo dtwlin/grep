@@ -19,12 +19,42 @@
 #include <config.h>
 #include <search.h>
 
+#include <stdatomic.h>
+
+/* A kwset compiled from a pattern list.  All compilations of the same
+   pattern list with the same options share it, as it is read-only
+   after kwsprep; this saves each worker thread from building its own
+   copy, which can be costly for large pattern lists.  */
+
+struct shared_kwset
+{
+  kwset_t kwset;
+
+  /* The number of words in KWSET.  */
+  idx_t words;
+
+  /* The number of compiled patterns that use KWSET, plus one if
+     KWSET is in the cache.  */
+  atomic_ptrdiff_t refs;
+
+  /* The pattern list and options KWSET was compiled from.  */
+  char *pattern;
+  idx_t size;
+  bool match_icase, match_words, match_lines, exact;
+  char eolbyte;
+};
+
+/* The first shared kwset, kept for the life of the process.  It is set
+   before any worker thread starts, and the worker threads only read it.  */
+static struct shared_kwset *kwset_cache;
+
 /* A compiled -F pattern list.  */
 
 struct kwsearch
 {
-  /* The kwset for this pattern list.  */
+  /* The kwset for this pattern list, and its shared owner.  */
   kwset_t kwset;
+  struct shared_kwset *shared;
 
   /* The number of user-specified patterns.  This is less than
      'kwswords (kwset)' when some extra one-character words have been
@@ -41,12 +71,23 @@ struct kwsearch
   void *re;
 };
 
-/* Compile the -F style PATTERN, containing SIZE bytes that are
-   followed by '\n'.  Return a description of the compiled pattern.  */
+/* Return a shared kwset for the -F style PATTERN, containing SIZE bytes
+   that are followed by '\n', compiled with the current options and
+   EXACT.  The caller owns one reference to it.  */
 
-void *
-Fcompile (char *pattern, idx_t size, reg_syntax_t ignored, bool exact)
+static struct shared_kwset *
+shared_kwset_get (char const *pattern, idx_t size, bool exact)
 {
+  struct shared_kwset *sk = kwset_cache;
+  if (sk && sk->size == size && memcmp (sk->pattern, pattern, size) == 0
+      && sk->match_icase == match_icase && sk->match_words == match_words
+      && sk->match_lines == match_lines && sk->exact == exact
+      && sk->eolbyte == eolbyte)
+    {
+      atomic_fetch_add (&sk->refs, 1);
+      return sk;
+    }
+
   kwset_t kwset;
   char *buf = nullptr;
   idx_t bufalloc = 0;
@@ -86,12 +127,36 @@ Fcompile (char *pattern, idx_t size, reg_syntax_t ignored, bool exact)
 
   free (buf);
 
-  idx_t words = kwswords (kwset);
+  sk = xmalloc (sizeof *sk);
+  sk->words = kwswords (kwset);
   kwsprep (kwset);
+  sk->kwset = kwset;
+  sk->pattern = ximemdup (pattern, size);
+  sk->size = size;
+  sk->match_icase = match_icase;
+  sk->match_words = match_words;
+  sk->match_lines = match_lines;
+  sk->exact = exact;
+  sk->eolbyte = eolbyte;
+  bool cache = !kwset_cache;
+  atomic_init (&sk->refs, 1 + cache);
+  if (cache)
+    kwset_cache = sk;
+  return sk;
+}
+
+/* Compile the -F style PATTERN, containing SIZE bytes that are
+   followed by '\n'.  Return a description of the compiled pattern.  */
+
+void *
+Fcompile (char *pattern, idx_t size, reg_syntax_t ignored, bool exact)
+{
+  struct shared_kwset *sk = shared_kwset_get (pattern, size, exact);
 
   struct kwsearch *kwsearch = xmalloc (sizeof *kwsearch);
-  kwsearch->kwset = kwset;
-  kwsearch->words = words;
+  kwsearch->kwset = sk->kwset;
+  kwsearch->shared = sk;
+  kwsearch->words = sk->words;
   kwsearch->pattern = ximemdup0 (pattern, size);
   kwsearch->size = size;
   kwsearch->re = nullptr;
@@ -252,8 +317,13 @@ Ffree (void *vcp)
   if (!vcp)
     return;
   struct kwsearch *kwsearch = vcp;
-  if (kwsearch->kwset)
-    kwsfree (kwsearch->kwset);
+  struct shared_kwset *sk = kwsearch->shared;
+  if (atomic_fetch_sub (&sk->refs, 1) == 1)
+    {
+      kwsfree (sk->kwset);
+      free (sk->pattern);
+      free (sk);
+    }
   free (kwsearch->pattern);
   if (kwsearch->re)
     EGfree (kwsearch->re);
