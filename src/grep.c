@@ -4029,6 +4029,7 @@ worker_thread_func (void *arg)
 
   membuf_free (&tls_out);
   membuf_free (&tls_err);
+  membuf_free (&tls_big);
   free_worker_buffer ();
   if (compiled_pattern)
     {
