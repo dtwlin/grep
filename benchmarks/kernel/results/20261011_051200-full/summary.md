@@ -29,7 +29,7 @@
 | `B-07` | literal-free regex ($BIG) | 700.2 ms | 59.2 ms | 1.65 s | 688.6 ms | 17.07 s | **11.83×** | 0.42× | **27.96×** | 0.68 | 1.65 | 0.69 | 18.71 | 1380M | 1391M | 37M | 1391M | **PASS** | PASS |
 | `B-08` | PCRE2 lookaround ($BIG) | 21.40 s | 1.57 s | 21.75 s | 21.60 s | 25.11 s | **13.64×** | 0.98× | **13.86×** | 21.68 | 21.73 | 21.56 | 25.13 | 1406M | 1393M | 37M | 1400M | **PASS** | PASS |
 | `B-09` | context ($BIG) | 950.1 ms | 44.1 ms | 327.3 ms | 947.5 ms | 1.46 s | **21.55×** | 2.90× | **7.42×** | 0.54 | 0.33 | 0.95 | 1.47 | 1380M | 1391M | 37M | 1392M | **PASS** | PASS |
-| `B-10` | only-matching ($BIG) | 803.4 ms | 8.5 ms | 252.9 ms | 848.0 ms | 10.09 s | **94.18×** | 3.18× | **29.64×** | 0.06 | 0.26 | 0.85 | 10.19 | 137M | 1391M | 37M | 1393M | ❌ FAIL | PASS |
+| `B-10` | only-matching ($BIG) | 803.4 ms | invalid (exit 2) | 252.9 ms | 848.0 ms | 10.09 s | **—** | 3.18× | **—** | 0.06 | 0.26 | 0.85 | 10.19 | 137M | 1391M | 37M | 1393M | ❌ FAIL | PASS |
 | `B-11` | inverted count ($BIG) | 1.01 s | 92.8 ms | 1.52 s | 998.2 ms | 3.50 s | **10.86×** | 0.66× | **16.42×** | 1.05 | 1.52 | 1.00 | 3.49 | 1381M | 1391M | 37M | 1392M | **PASS** | PASS |
 | `B-12` | stdin redirect (< $BIG) | 564.9 ms | 27.3 ms | 290.6 ms | 565.2 ms | — | **20.69×** | 1.94× | **10.65×** | 0.30 | 0.29 | 0.56 | — | 1381M | 37M | 37M | — | **PASS** | PASS |
 | `B-13` | FIFO pipe (cat $BIG |) | 1.16 s | 732.0 ms | 1.04 s | 1.17 s | — | **1.59×** | 1.11× | **1.43×** | 0.96 | 0.71 | 1.14 | — | 37M | 37M | 37M | — | **PASS** | PASS |
@@ -57,11 +57,11 @@
 | `T-11` | DFA regex with must-literal | 3.82 s | 486.5 ms | 348.6 ms | 3.81 s | 8.97 s | **7.85×** | 10.95× | **0.72×** | 5.01 | 4.08 | 3.82 | 154.83 | 176M | 37M | 37M | 333M | **PASS** | PASS |
 | `T-12` | anchored dense regex | 4.72 s | 543.8 ms | 591.3 ms | 4.78 s | 4.40 s | **8.68×** | 7.98× | **1.09×** | 5.53 | 6.52 | 4.78 | 69.34 | 179M | 37M | 37M | 332M | **PASS** | PASS |
 | `T-13` | literal alternation + word boundary | 3.98 s | 481.9 ms | 366.9 ms | 3.98 s | 1.82 s | **8.25×** | 10.84× | **0.76×** | 5.15 | 4.31 | 3.98 | 24.85 | 178M | 37M | 37M | 273M | **PASS** | PASS |
-| `T-14` | optional group + alternation | 3.89 s | 46.5 ms | 346.3 ms | 3.90 s | 2.22 s | **83.62×** | 11.23× | **7.44×** | 0.47 | 4.07 | 3.89 | 26.51 | 37M | 37M | 37M | 336M | ❌ FAIL | PASS |
+| `T-14` | optional group + alternation | 3.89 s | invalid (exit 2) | 346.3 ms | 3.90 s | 2.22 s | **—** | 11.23× | **—** | 0.47 | 4.07 | 3.89 | 26.51 | 37M | 37M | 37M | 336M | ❌ FAIL | PASS |
 | `T-15` | literal-free regex | 4.19 s | 490.2 ms | 376.2 ms | 4.19 s | 3.08 s | **8.54×** | 11.13× | **0.77×** | 5.56 | 4.41 | 4.18 | 37.37 | 175M | 37M | 37M | 328M | **PASS** | PASS |
 | `T-16` | PCRE2 lookaround, dense | 27.67 s | 1.92 s | 2.50 s | 27.72 s | 3.24 s | **14.40×** | 11.05× | **1.30×** | 28.98 | 29.60 | 27.75 | 45.64 | 215M | 37M | 37M | 326M | **PASS** | PASS |
 | `T-17` | PCRE2 rare with literal | 5.41 s | 518.4 ms | 522.0 ms | 5.37 s | 1.40 s | **10.44×** | 10.37× | **1.01×** | 6.35 | 6.16 | 5.38 | 10.40 | 196M | 37M | 37M | 232M | **PASS** | PASS |
-| `T-18` | only-matching | 4.21 s | 50.3 ms | 375.0 ms | 4.26 s | 2.20 s | **83.60×** | 11.22× | **7.45×** | 0.50 | 4.38 | 4.25 | 24.31 | 39M | 37M | 37M | 334M | ❌ FAIL | PASS |
+| `T-18` | only-matching | 4.21 s | invalid (exit 2) | 375.0 ms | 4.26 s | 2.20 s | **—** | 11.22× | **—** | 0.50 | 4.38 | 4.25 | 24.31 | 39M | 37M | 37M | 334M | ❌ FAIL | PASS |
 | `T-19` | context, rare | 4.40 s | 491.6 ms | 365.8 ms | 4.40 s | 1.42 s | **8.95×** | 12.03× | **0.74×** | 5.09 | 4.29 | 4.40 | 10.40 | 185M | 37M | 37M | 235M | **PASS** | PASS |
 | `T-20` | context, moderate | 4.44 s | 507.6 ms | 385.4 ms | 4.47 s | 1.54 s | **8.75×** | 11.53× | **0.76×** | 5.24 | 4.51 | 4.46 | 10.68 | 175M | 37M | 37M | 243M | **PASS** | PASS |
 | `T-21` | inverted count | 4.52 s | 502.8 ms | 1.10 s | 4.52 s | 2.91 s | **8.99×** | 4.12× | **2.18×** | 5.97 | 11.63 | 4.52 | 15.33 | 187M | 38M | 38M | 286M | **PASS** | SOFT_DIFF |
@@ -79,6 +79,8 @@
 | `P-01` | backreference (\b([a-z]{4,})_\1\b) | 41.42 s | 2.93 s | 834.7 ms | 53.61 s | 1.62 s | **14.16×** | 49.63× | **0.29×** | 45.74 | 9.91 | 53.79 | 19.95 | 172M | 38M | 38M | 282M | **PASS** | PASS |
 | `P-02` | 1,000-way regex alternation | 15.01 s | 1.41 s | 1.18 s | 14.42 s | 227.72 s | **10.62×** | 12.71× | **0.84×** | 20.76 | 13.69 | 14.41 | 2788.12 | 309M | 134M | 38M | 2795M | **PASS** | PASS |
 | `P-03` | dot-star heavy (.*_lock.*_unlock) | 3.81 s | 476.8 ms | 348.1 ms | 3.80 s | 9.56 s | **8.00×** | 10.96× | **0.73×** | 4.97 | 4.05 | 3.80 | 122.18 | 192M | 38M | 38M | 338M | **PASS** | PASS |
+
+> \* **Footnote on Gate A Failures**: Scenarios `B-10`, `T-14`, `T-18` failed Gate A conformance against G0 and are marked as invalid. They are excluded from speedup ratios and scorecard comparisons. (Root cause in `safe_dfaexec` trailing-sentinel line calculation fixed in commit `aa02aff`).
 
 ## 3. Correctness & Equivalence Gates
 
@@ -108,11 +110,11 @@ Detailed equivalence records are available in [equivalence.md](./equivalence.md)
 | `T-11` | DFA regex with must-literal | 3.82 s | 486.5 ms | 348.6 ms | 3.81 s | 8.97 s | **7.85×** | **0.72×** | 5.01 | 4.08 | 3.82 | 154.83 | 176M | 37M | 37M | 333M | **PASS** |
 | `T-12` | anchored dense regex | 4.72 s | 543.8 ms | 591.3 ms | 4.78 s | 4.40 s | **8.68×** | **1.09×** | 5.53 | 6.52 | 4.78 | 69.34 | 179M | 37M | 37M | 332M | **PASS** |
 | `T-13` | literal alternation + word boundary | 3.98 s | 481.9 ms | 366.9 ms | 3.98 s | 1.82 s | **8.25×** | **0.76×** | 5.15 | 4.31 | 3.98 | 24.85 | 178M | 37M | 37M | 273M | **PASS** |
-| `T-14` | optional group + alternation | 3.89 s | 46.5 ms | 346.3 ms | 3.90 s | 2.22 s | **83.62×** | **7.44×** | 0.47 | 4.07 | 3.89 | 26.51 | 37M | 37M | 37M | 336M | ❌ FAIL |
+| `T-14` | optional group + alternation | 3.89 s | invalid (exit 2) | 346.3 ms | 3.90 s | 2.22 s | **—** | **—** | 0.47 | 4.07 | 3.89 | 26.51 | 37M | 37M | 37M | 336M | ❌ FAIL |
 | `T-15` | literal-free regex | 4.19 s | 490.2 ms | 376.2 ms | 4.19 s | 3.08 s | **8.54×** | **0.77×** | 5.56 | 4.41 | 4.18 | 37.37 | 175M | 37M | 37M | 328M | **PASS** |
 | `T-16` | PCRE2 lookaround, dense | 27.67 s | 1.92 s | 2.50 s | 27.72 s | 3.24 s | **14.40×** | **1.30×** | 28.98 | 29.60 | 27.75 | 45.64 | 215M | 37M | 37M | 326M | **PASS** |
 | `T-17` | PCRE2 rare with literal | 5.41 s | 518.4 ms | 522.0 ms | 5.37 s | 1.40 s | **10.44×** | **1.01×** | 6.35 | 6.16 | 5.38 | 10.40 | 196M | 37M | 37M | 232M | **PASS** |
-| `T-18` | only-matching | 4.21 s | 50.3 ms | 375.0 ms | 4.26 s | 2.20 s | **83.60×** | **7.45×** | 0.50 | 4.38 | 4.25 | 24.31 | 39M | 37M | 37M | 334M | ❌ FAIL |
+| `T-18` | only-matching | 4.21 s | invalid (exit 2) | 375.0 ms | 4.26 s | 2.20 s | **—** | **—** | 0.50 | 4.38 | 4.25 | 24.31 | 39M | 37M | 37M | 334M | ❌ FAIL |
 | `T-19` | context, rare | 4.40 s | 491.6 ms | 365.8 ms | 4.40 s | 1.42 s | **8.95×** | **0.74×** | 5.09 | 4.29 | 4.40 | 10.40 | 185M | 37M | 37M | 235M | **PASS** |
 | `T-20` | context, moderate | 4.44 s | 507.6 ms | 385.4 ms | 4.47 s | 1.54 s | **8.75×** | **0.76×** | 5.24 | 4.51 | 4.46 | 10.68 | 175M | 37M | 37M | 243M | **PASS** |
 | `T-21` | inverted count | 4.52 s | 502.8 ms | 1.10 s | 4.52 s | 2.91 s | **8.99×** | **2.18×** | 5.97 | 11.63 | 4.52 | 15.33 | 187M | 38M | 38M | 286M | **PASS** |
@@ -124,6 +126,8 @@ Detailed equivalence records are available in [equivalence.md](./equivalence.md)
 | `T-26` | byte offsets | 4.45 s | 491.0 ms | 363.5 ms | 4.45 s | — | **9.07×** | **0.74×** | 5.14 | 4.28 | 4.44 | — | 173M | 38M | 38M | — | **PASS** |
 | `T-27` | sub-scope drivers/ | 2.04 s | 224.1 ms | 165.7 ms | 2.04 s | 714.7 ms | **9.12×** | **0.74×** | 2.28 | 1.89 | 2.04 | 5.08 | 175M | 38M | 38M | 232M | **PASS** |
 | `T-28` | sub-scope kernel mm fs | 172.9 ms | 19.2 ms | 19.4 ms | 169.7 ms | 83.0 ms | **9.01×** | **1.01×** | 0.18 | 0.16 | 0.17 | 0.86 | 38M | 38M | 38M | 38M | **PASS** |
+
+> \* **Note on Gate A Failures**: Scenarios `T-14`, `T-18` failed Gate A conformance against G0 and are marked as invalid. (Fixed in commit `aa02aff`).
 
 ### Category B — Single Huge File ($BIG ≈ 1.39 GB)
 
@@ -138,11 +142,13 @@ Detailed equivalence records are available in [equivalence.md](./equivalence.md)
 | `B-07` | literal-free regex ($BIG) | 700.2 ms | 59.2 ms | 1.65 s | 688.6 ms | 17.07 s | **11.83×** | **27.96×** | 0.68 | 1.65 | 0.69 | 18.71 | 1380M | 1391M | 37M | 1391M | **PASS** |
 | `B-08` | PCRE2 lookaround ($BIG) | 21.40 s | 1.57 s | 21.75 s | 21.60 s | 25.11 s | **13.64×** | **13.86×** | 21.68 | 21.73 | 21.56 | 25.13 | 1406M | 1393M | 37M | 1400M | **PASS** |
 | `B-09` | context ($BIG) | 950.1 ms | 44.1 ms | 327.3 ms | 947.5 ms | 1.46 s | **21.55×** | **7.42×** | 0.54 | 0.33 | 0.95 | 1.47 | 1380M | 1391M | 37M | 1392M | **PASS** |
-| `B-10` | only-matching ($BIG) | 803.4 ms | 8.5 ms | 252.9 ms | 848.0 ms | 10.09 s | **94.18×** | **29.64×** | 0.06 | 0.26 | 0.85 | 10.19 | 137M | 1391M | 37M | 1393M | ❌ FAIL |
+| `B-10` | only-matching ($BIG) | 803.4 ms | invalid (exit 2) | 252.9 ms | 848.0 ms | 10.09 s | **—** | **—** | 0.06 | 0.26 | 0.85 | 10.19 | 137M | 1391M | 37M | 1393M | ❌ FAIL |
 | `B-11` | inverted count ($BIG) | 1.01 s | 92.8 ms | 1.52 s | 998.2 ms | 3.50 s | **10.86×** | **16.42×** | 1.05 | 1.52 | 1.00 | 3.49 | 1381M | 1391M | 37M | 1392M | **PASS** |
 | `B-12` | stdin redirect (< $BIG) | 564.9 ms | 27.3 ms | 290.6 ms | 565.2 ms | — | **20.69×** | **10.65×** | 0.30 | 0.29 | 0.56 | — | 1381M | 37M | 37M | — | **PASS** |
 | `B-13` | FIFO pipe (cat $BIG |) | 1.16 s | 732.0 ms | 1.04 s | 1.17 s | — | **1.59×** | **1.43×** | 0.96 | 0.71 | 1.14 | — | 37M | 37M | 37M | — | **PASS** |
 | `B-14` | real 24 MB header (big-24M.h) | 49.2 ms | 18.2 ms | 43.2 ms | 49.3 ms | 79.1 ms | **2.71×** | **2.37×** | 0.07 | 0.04 | 0.05 | 0.11 | 37M | 37M | 37M | 41M | **PASS** |
+
+> \* **Note on Gate A Failures**: Scenarios `B-10` failed Gate A conformance against G0 and are marked as invalid. (Fixed in commit `aa02aff`).
 
 ### Category M — Multi-Pattern Sets
 

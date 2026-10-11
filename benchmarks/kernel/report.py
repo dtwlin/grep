@@ -335,15 +335,32 @@ class ReportGenerator:
             gate_a_str = f"**{gate_a}**" if gate_a == "PASS" else f"❌ {gate_a}"
             gate_b_str = f"{gate_b}"
 
+            if gate_a != "PASS":
+                g1_exit = g1.get("exit_code", 0) if g1 else 0
+                g1_str = f"invalid (exit {g1_exit})" if g1_exit != 0 else "invalid (mismatch)"
+                g1_vs_g0 = None
+                g1_vs_r0 = None
+            else:
+                g1_str = format_ms(g1_ms)
+                g1_vs_g0 = (g0_ms / g1_ms) if (g0_ms and g1_ms and g1_ms > 0) else None
+                g1_vs_r0 = (r0_ms / g1_ms) if (r0_ms and g1_ms and g1_ms > 0) else None
+
             row = (
                 f"| `{sid}` | {desc} | "
-                f"{format_ms(g0_ms)} | {format_ms(g1_ms)} | {r0_str} | "
+                f"{format_ms(g0_ms)} | {g1_str} | {r0_str} | "
                 f"{format_ms(g2_ms)} | {x1_str} | "
                 f"**{format_ratio(g1_vs_g0)}** | {format_ratio(r0_vs_g0)} | "
                 f"**{format_ratio(g1_vs_r0)}** | {g1_cpu} | {r0_cpu} | {g2_cpu} | {x1_cpu} | "
                 f"{g1_rss} | {r0_rss} | {g2_rss} | {x1_rss} | {gate_a_str} | {gate_b_str} |"
             )
             lines.append(row)
+
+        failed_sids = [sid for sid in self.scenarios if self.get_stat(sid, "G1") and self.check_gate_a(sid)[0] != "PASS"]
+        if failed_sids:
+            lines.extend([
+                "",
+                f"> \\* **Footnote on Gate A Failures**: Scenarios {', '.join(f'`{s}`' for s in failed_sids)} failed Gate A conformance against G0 and are marked as invalid. They are excluded from speedup ratios and scorecard comparisons. (Root cause in `safe_dfaexec` trailing-sentinel line calculation fixed in commit `aa02aff`).",
+            ])
 
         return "\n".join(lines)
 
@@ -392,8 +409,18 @@ class ReportGenerator:
             if sid == "U-02" and r0_ms is not None:
                 r0_str = f"{format_ms(r0_ms)}*"
 
-            g1_vs_g0 = (g0_ms / g1_ms) if (g0_ms and g1_ms and g1_ms > 0) else None
-            g1_vs_r0 = (r0_ms / g1_ms) if (r0_ms and g1_ms and g1_ms > 0) else None
+            gate_a, _ = self.check_gate_a(sid)
+            gate_a_str = f"**{gate_a}**" if gate_a == "PASS" else f"❌ {gate_a}"
+
+            if gate_a != "PASS":
+                g1_exit = g1.get("exit_code", 0) if g1 else 0
+                g1_str = f"invalid (exit {g1_exit})" if g1_exit != 0 else "invalid (mismatch)"
+                g1_vs_g0 = None
+                g1_vs_r0 = None
+            else:
+                g1_str = format_ms(g1_ms)
+                g1_vs_g0 = (g0_ms / g1_ms) if (g0_ms and g1_ms and g1_ms > 0) else None
+                g1_vs_r0 = (r0_ms / g1_ms) if (r0_ms and g1_ms and g1_ms > 0) else None
 
             g1_cpu = format_cpu(g1["mean_cpu_s"] if g1 else None)
             r0_cpu = format_cpu(r0["mean_cpu_s"] if r0 else None)
@@ -405,14 +432,18 @@ class ReportGenerator:
             g2_rss = format_rss(g2["max_rss_mb"] if g2 else None)
             x1_rss = format_rss(x1["max_rss_mb"] if (x1 and not (sid == "M-02" and x1.get("timed_out"))) else None)
 
-            gate_a, _ = self.check_gate_a(sid)
-            gate_a_str = f"**{gate_a}**" if gate_a == "PASS" else f"❌ {gate_a}"
-
             lines.append(
-                f"| `{sid}` | {desc} | {format_ms(g0_ms)} | {format_ms(g1_ms)} | {r0_str} | "
+                f"| `{sid}` | {desc} | {format_ms(g0_ms)} | {g1_str} | {r0_str} | "
                 f"{format_ms(g2_ms)} | {x1_str} | **{format_ratio(g1_vs_g0)}** | **{format_ratio(g1_vs_r0)}** | "
                 f"{g1_cpu} | {r0_cpu} | {g2_cpu} | {x1_cpu} | {g1_rss} | {r0_rss} | {g2_rss} | {x1_rss} | {gate_a_str} |"
             )
+
+        cat_fails = [sid for sid in sids if self.get_stat(sid, "G1") and self.check_gate_a(sid)[0] != "PASS"]
+        if cat_fails:
+            lines.extend([
+                "",
+                f"> \\* **Note on Gate A Failures**: Scenarios {', '.join(f'`{s}`' for s in cat_fails)} failed Gate A conformance against G0 and are marked as invalid. (Fixed in commit `aa02aff`).",
+            ])
 
         if category == "U":
             lines.extend([
@@ -950,6 +981,13 @@ class ReportGenerator:
             verdict, _ = self.check_gate_a(sid)
             v_str = f"**{verdict}**" if verdict == "PASS" else f"❌ {verdict}"
             lines.append(f"| `{sid}` | {desc} | {g0_exit} | {g1_exit} | `{g0_sha}` | `{g1_sha}` | {v_str} |")
+
+        failed_gate_a = [sid for sid in self.scenarios if self.get_stat(sid, "G1") and self.check_gate_a(sid)[0] != "PASS"]
+        if failed_gate_a:
+            lines.extend([
+                "",
+                f"> **Note on Gate A Failures**: Scenarios {', '.join(f'`{s}`' for s in failed_gate_a)} failed Gate A conformance against G0 due to exit code 2 (`grep: memory exhausted`) from an underflow in `safe_dfaexec` trailing-sentinel line calculation in `src/dfasearch.c`. This was resolved in commit `aa02aff`.",
+            ])
 
         lines.extend([
             "",

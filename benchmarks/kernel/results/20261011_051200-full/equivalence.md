@@ -64,6 +64,8 @@
 | `P-02` | 1,000-way regex alternation | 0 | 0 | `236038c5dd5034ab...` | `236038c5dd5034ab...` | **PASS** |
 | `P-03` | dot-star heavy (.*_lock.*_unlock) | 0 | 0 | `0a219b2dfbf3747f...` | `0a219b2dfbf3747f...` | **PASS** |
 
+> **Note on Gate A Failures**: Scenarios `B-10`, `T-14`, `T-18` failed Gate A conformance against G0 due to exit code 2 (`grep: memory exhausted`) from an underflow in `safe_dfaexec` trailing-sentinel line calculation in `src/dfasearch.c`. This was resolved in commit `aa02aff`.
+
 ## 2. Gate B: Cross-Tool Normalized Match Set Equivalence
 
 | Scenario | Description | R0 Match vs G0 | G2 Match vs G0 | X1 Match vs G0 | Notes |
