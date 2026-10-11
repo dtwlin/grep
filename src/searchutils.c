@@ -43,16 +43,24 @@ wordinit (void)
 kwset_t
 kwsinit (bool mb_trans)
 {
+  /* The translation table depends only on the locale, so all keyword
+     sets share one, which lives as long as the process.  The first
+     call is made before any worker thread starts.  */
+  static char *trans_table;
   char *trans = nullptr;
 
   if (match_icase && (MB_CUR_MAX == 1 || mb_trans))
     {
-      trans = ximalloc (NCHAR);
-      /* If I is a single-byte character that becomes a different
-         single-byte character when uppercased, set trans[I]
-         to that character.  Otherwise, set trans[I] to I.  */
-      for (int i = 0; i < NCHAR; i++)
-        trans[i] = toupper (i);
+      if (!trans_table)
+        {
+          trans_table = ximalloc (NCHAR);
+          /* If I is a single-byte character that becomes a different
+             single-byte character when uppercased, set trans[I]
+             to that character.  Otherwise, set trans[I] to I.  */
+          for (int i = 0; i < NCHAR; i++)
+            trans_table[i] = toupper (i);
+        }
+      trans = trans_table;
     }
 
   return kwsalloc (trans);
