@@ -1,0 +1,54 @@
+{
+  "L-02": {
+    "X1": {
+      "classification": "SOFT_DIFF",
+      "diff_sample": "--- /dev/shm/kbench_out/ref_L-02_G0.sorted\t2026-10-11 05:41:28.807094119 +0000\n+++ /dev/shm/kbench_out/ref_L-02_X1.sorted\t2026-10-11 05:41:28.889900749 +0000\n@@ -1,355 +1,355 @@\n-$K/kernel/sched/core.c:10960:\t\t/* Remote access to mm::mm_cid::pcpu requires rq_lock */\n-$K/kernel/sched/core.c:10961:\t\tguard(rq_lock_irq)(rq);\n-$K/kernel/sched/core.c:11008:\t/* Remote access to mm::mm_cid::pcpu requires rq_lock */\n-$K/kernel/sched/core.c:11009:\tguard(task_rq_lock)(t);\n-$K/kernel/sched/core.c:1277:\traw_spin_rq_lock_irqsave(rq, flags);\n-$K/kernel/sched/core.c:1687:\tguard(task_rq_lock)(p);\n-$K/kernel/sched/core.c:1949:\trq = task_rq_lock(p, &rf);"
+    }
+  },
+  "M-06": {
+    "X1": {
+      "classification": "SOFT_DIFF",
+      "diff_sample": "--- /dev/shm/kbench_out/ref_M-06_G0.sorted\t2026-10-11 06:42:56.054865977 +0000\n+++ /dev/shm/kbench_out/ref_M-06_X1.sorted\t2026-10-11 06:53:09.543278793 +0000\n@@ -1,21405 +0,0 @@\n-\t\t\t\t\t\t    \"OLDI%u: syscon_regmap_lookup_by_phandle failed.\\n\",\n-\t\t\t\t\t\t    &clk_gate_ops, 0);\n-\t\t\t\t\t\t   &clk_gate_ops,\n-\t\t\t\t\t\t   crypto_req_done, &wait);\n-\t\t\t\t\t\t   snd_pcm_hw_param_value_max(slave_params, SNDRV_PCM_HW_PARAM_PERIOD_SIZE, NULL));\n-\t\t\t\t\t\t   snd_pcm_hw_param_value_min(slave_params, SNDRV_PCM_HW_PARAM_PERIOD_SIZE, NULL));\n-\t\t\t\t\t\t &clk_gate_ops, (_flags)),\\"
+    }
+  },
+  "T-07": {
+    "R0": {
+      "classification": "SOFT_DIFF",
+      "diff_sample": "--- /dev/shm/kbench_out/ref_T-07_G0.sorted\t2026-10-11 07:44:13.170288313 +0000\n+++ /dev/shm/kbench_out/ref_T-07_R0.sorted\t2026-10-11 07:44:14.164207193 +0000\n@@ -2450,7 +2450,6 @@\n $K/Documentation/iio/iio_configfs.rst\n $K/Documentation/iio/opt4060.rst\n $K/Documentation/images/COPYING-logo\n-$K/Documentation/images/logo.gif\n $K/Documentation/images/logo.svg\n $K/Documentation/infiniband/core_locking.rst\n $K/Documentation/infiniband/ipoib.rst"
+    }
+  },
+  "T-09": {
+    "R0": {
+      "classification": "KNOWN-SEMANTIC (BOM stripping)",
+      "diff_sample": "--- /dev/shm/kbench_out/ref_T-09_G0.sorted\t2026-10-11 07:47:03.239150565 +0000\n+++ /dev/shm/kbench_out/ref_T-09_R0.sorted\t2026-10-11 07:47:04.903148433 +0000\n@@ -780,9 +780,9 @@\n $K/Documentation/translations/sp_SP/process/kernel-enforcement-statement.rst:Aunque existe el derecho de hacer valer un copyright distinto en las\n $K/Documentation/translations/sp_SP/process/kernel-enforcement-statement.rst:nuestro y de cualquier sucesor de nuestros derechos de autor (copyright):\n $K/Documentation/translations/zh_CN/admin-guide/reporting-issues.rst:   way if you want to contribute changes to the text, but for copyright\n+$K/Documentation/translations/zh_CN/dev-tools/sparse.rst:Copyright 2004 Linus Torvalds\n $K/Documentation/translations/zh_CN/dev-tools/sparse.rst:Copyright 2004 Pavel Machek <pavel@ucw.cz>\n $K/Documentation/translations/zh_CN/dev-tools/sparse.rst:Copyright 2006 Bob Copeland <me@bobcopeland.com>\n-$K/Documentation/translations/zh_CN/dev-tools/sparse.rst:\ufeffCopyright 2004 Linus Torvalds"
+    }
+  },
+  "T-19": {
+    "X1": {
+      "classification": "SOFT_DIFF",
+      "diff_sample": "--- /dev/shm/kbench_out/ref_T-19_G0.sorted\t2026-10-11 08:08:25.690185179 +0000\n+++ /dev/shm/kbench_out/ref_T-19_X1.sorted\t2026-10-11 08:08:32.373434828 +0000\n@@ -1,19 +1,19 @@\n---\n---\n---\n---\n---\n---\n---"
+    }
+  },
+  "T-20": {
+    "X1": {
+      "classification": "SOFT_DIFF",
+      "diff_sample": "--- /dev/shm/kbench_out/ref_T-20_G0.sorted\t2026-10-11 08:09:45.935788989 +0000\n+++ /dev/shm/kbench_out/ref_T-20_X1.sorted\t2026-10-11 08:09:53.165342668 +0000\n@@ -1,15722 +1,15722 @@\n---\n---\n---\n---\n---\n---\n---"
+    }
+  },
+  "T-21": {
+    "R0": {
+      "classification": "SOFT_DIFF",
+      "diff_sample": "--- /dev/shm/kbench_out/ref_T-21_G0.sorted\t2026-10-11 08:11:15.726310355 +0000\n+++ /dev/shm/kbench_out/ref_T-21_R0.sorted\t2026-10-11 08:11:17.942497214 +0000\n@@ -1 +1 @@\n-SUM:32347857\n+SUM:32247077"
+    },
+    "X1": {
+      "classification": "SOFT_DIFF",
+      "diff_sample": "--- /dev/shm/kbench_out/ref_T-21_G0.sorted\t2026-10-11 08:11:15.726310355 +0000\n+++ /dev/shm/kbench_out/ref_T-21_X1.sorted\t2026-10-11 08:11:25.817958528 +0000\n@@ -1 +1 @@\n-SUM:32347857\n+SUM:32247374"
+    }
+  },
+  "X-01": {
+    "R0": {
+      "classification": "SOFT_DIFF",
+      "diff_sample": "--- /dev/shm/kbench_out/ref_X-01_G0.sorted\t2026-10-11 08:20:43.640484591 +0000\n+++ /dev/shm/kbench_out/ref_X-01_R0.sorted\t2026-10-11 08:20:43.714437999 +0000\n@@ -0,0 +1,433 @@\n+benchmarks/kernel/patterns/sym_10000.txt:466:_raw_spin_lock_irqsave_nested\n+benchmarks/kernel/results/20261011_021542-quick/raw.jsonl:100:{\"scenario\": \"B-13\", \"category\": \"B\", \"description\": \"FIFO pipe (cat $BIG |)\", \"tool\": \"G2\", \"threads\": null, \"locale\": \"en_US.UTF-8\", \"round\": -1, \"is_warmup\": true, \"wall_ns\": 1144452049, \"wall_ms\": 1144.452049, \"user_s\": 0.7904939999999999, \"sys_s\": 0.337647, \"cpu_util\": 0.9857477217903079, \"max_rss_kib\": 41104, \"minflt\": 195, \"majflt\": 0, \"nvcsw\": 510, \"nivcsw\": 9, \"inblock\": 0, \"exit_code\": 0, \"timed_out\": false, \"stdout_bytes\": 843162, \"stdout_sha256\": \"a4ee27abab3ee2db65c7d60f8df6e6808f04bd24338ef8d92ee4deb7ebb60269\", \"stdout_sorted_sha256\": \"3d2ce05be7baa0bf4699acce49696aafaf7afcf35356bf6e361f1075f2d6f5de\", \"stderr_sha256\": \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\", \"sum_count\": 0, \"equiv_mode\": \"sorted_lines\", \"cmd\": [\"/usr/bin/grep\", \"--color=never\", \"-n\", \"-F\", \"spin_lock_irqsave\"]}\n+benchmarks/kernel/results/20261011_021542-quick/raw.jsonl:101:{\"scenario\": \"B-13\", \"category\": \"B\", \"description\": \"FIFO pipe (cat $BIG |)\", \"tool\": \"G0\", \"threads\": null, \"locale\": \"en_US.UTF-8\", \"round\": 0, \"is_warmup\": false, \"wall_ns\": 1109343910, \"wall_ms\": 1109.34391, \"user_s\": 0.820514, \"sys_s\": 0.270819, \"cpu_util\": 0.9837643585207043, \"max_rss_kib\": 41104, \"minflt\": 189, \"majflt\": 0, \"nvcsw\": 586, \"nivcsw\": 9, \"inblock\": 0, \"exit_code\": 0, \"timed_out\": false, \"stdout_bytes\": 843162, \"stdout_sha256\": \"a4ee27abab3ee2db65c7d60f8df6e6808f04bd24338ef8d92ee4deb7ebb60269\", \"stdout_sorted_sha256\": \"3d2ce05be7baa0bf4699acce49696aafaf7afcf35356bf6e361f1075f2d6f5de\", \"stderr_sha256\": \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\", \"sum_count\": 0, \"equiv_mode\": \"sorted_lines\", \"cmd\": [\"$REPO/benchmarks/grep-baseline\", \"--color=never\", \"-n\", \"-F\", \"spin_lock_irqsave\"]}\n+benchmarks/kernel/results/20261011_021542-quick/raw.jsonl:102:{\"scenario\": \"B-13\", \"category\": \"B\", \"description\": \"FIFO pipe (cat $BIG |)\", \"tool\": \"G1\", \"threads\": null, \"locale\": \"en_US.UTF-8\", \"round\": 0, \"is_warmup\": false, \"wall_ns\": 741318064, \"wall_ms\": 741.318064, \"user_s\": 0.214446, \"sys_s\": 0.714422, \"cpu_util\": 1.2529952325564806, \"max_rss_kib\": 41104, \"minflt\": 1339, \"majflt\": 0, \"nvcsw\": 762, \"nivcsw\": 2, \"inblock\": 0, \"exit_code\": 0, \"timed_out\": false, \"stdout_bytes\": 843162, \"stdout_sha256\": \"a4ee27abab3ee2db65c7d60f8df6e6808f04bd24338ef8d92ee4deb7ebb60269\", \"stdout_sorted_sha256\": \"3d2ce05be7baa0bf4699acce49696aafaf7afcf35356bf6e361f1075f2d6f5de\", \"stderr_sha256\": \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\", \"sum_count\": 0, \"equiv_mode\": \"sorted_lines\", \"cmd\": [\"$REPO/src/grep\", \"--color=never\", \"-n\", \"-F\", \"spin_lock_irqsave\"]}\n+benchmarks/kernel/results/20261011_021542-quick/raw.jsonl:103:{\"scenario\": \"B-13\", \"category\": \"B\", \"description\": \"FIFO pipe (cat $BIG |)\", \"tool\": \"R0\", \"threads\": null, \"locale\": \"en_US.UTF-8\", \"round\": 0, \"is_warmup\": false, \"wall_ns\": 1094908627, \"wall_ms\": 1094.908627, \"user_s\": 0.139439, \"sys_s\": 0.627219, \"cpu_util\": 0.7002027211171111, \"max_rss_kib\": 41104, \"minflt\": 315, \"majflt\": 0, \"nvcsw\": 6330, \"nivcsw\": 2, \"inblock\": 0, \"exit_code\": 0, \"timed_out\": false, \"stdout_bytes\": 843162, \"stdout_sha256\": \"a4ee27abab3ee2db65c7d60f8df6e6808f04bd24338ef8d92ee4deb7ebb60269\", \"stdout_sorted_sha256\": \"3d2ce05be7baa0bf4699acce49696aafaf7afcf35356bf6e361f1075f2d6f5de\", \"stderr_sha256\": \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\", \"sum_count\": 0, \"equiv_mode\": \"sorted_lines\", \"cmd\": [\"/usr/bin/rg\", \"--color=never\", \"--no-heading\", \"-n\", \"-F\", \"spin_lock_irqsave\"]}\n+benchmarks/kernel/results/20261011_021542-quick/raw.jsonl:104:{\"scenario\": \"B-13\", \"category\": \"B\", \"description\": \"FIFO pipe (cat $BIG |)\", \"tool\": \"G2\", \"threads\": null, \"locale\": \"en_US.UTF-8\", \"round\": 0, \"is_warmup\": false, \"wall_ns\": 1108909121, \"wall_ms\": 1108.909121, \"user_s\": 0.7946749999999999, \"sys_s\": 0.295104, \"cpu_util\": 0.9827487026324133, \"max_rss_kib\": 41104, \"minflt\": 193, \"majflt\": 0, \"nvcsw\": 621, \"nivcsw\": 10, \"inblock\": 0, \"exit_code\": 0, \"timed_out\": false, \"stdout_bytes\": 843162, \"stdout_sha256\": \"a4ee27abab3ee2db65c7d60f8df6e6808f04bd24338ef8d92ee4deb7ebb60269\", \"stdout_sorted_sha256\": \"3d2ce05be7baa0bf4699acce49696aafaf7afcf35356bf6e361f1075f2d6f5de\", \"stderr_sha256\": \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\", \"sum_count\": 0, \"equiv_mode\": \"sorted_lines\", \"cmd\": [\"/usr/bin/grep\", \"--color=never\", \"-n\", \"-F\", \"spin_lock_irqsave\"]}\n+benchmarks/kernel/results/20261011_021542-quick/raw.jsonl:105:{\"scenario\": \"B-13\", \"category\": \"B\", \"description\": \"FIFO pipe (cat $BIG |)\", \"tool\": \"G1\", \"threads\": null, \"locale\": \"en_US.UTF-8\", \"round\": 1, \"is_warmup\": false, \"wall_ns\": 609114039, \"wall_ms\": 609.114039, \"user_s\": 0.209082, \"sys_s\": 0.563174, \"cpu_util\": 1.2678348397088905, \"max_rss_kib\": 41104, \"minflt\": 1341, \"majflt\": 0, \"nvcsw\": 1265, \"nivcsw\": 4, \"inblock\": 0, \"exit_code\": 0, \"timed_out\": false, \"stdout_bytes\": 843162, \"stdout_sha256\": \"a4ee27abab3ee2db65c7d60f8df6e6808f04bd24338ef8d92ee4deb7ebb60269\", \"stdout_sorted_sha256\": \"3d2ce05be7baa0bf4699acce49696aafaf7afcf35356bf6e361f1075f2d6f5de\", \"stderr_sha256\": \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\", \"sum_count\": 0, \"equiv_mode\": \"sorted_lines\", \"cmd\": [\"$REPO/src/grep\", \"--color=never\", \"-n\", \"-F\", \"spin_lock_irqsave\"]}"
+    }
+  }
+}
