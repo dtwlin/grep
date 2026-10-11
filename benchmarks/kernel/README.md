@@ -106,6 +106,18 @@ python3 benchmarks/kernel/kernel_bench.py \
 - **Gate C**: Exit code consistency (0 = match, 1 = no match, 2 = syntax/error).
 - **Gate D**: G1 deterministic thread invariance across thread counts `{1, 4, 16, 32, 64, 128}`.
 
+Input read from a pipe is a known exception to byte-exact comparison.
+GNU grep checks each read buffer for null bytes and switches to binary
+mode from the buffer that holds the first one, and after omitting a
+line with an encoding error it prints context that depends on where its
+buffers end.  With a pipe, how much each read returns depends on the
+pipe capacity and on how fast the writer is, so in these two cases the
+output of stock grep itself varies.  The parallel grep assumes a writer
+that keeps the pipe full (reads of 96 KiB or the pipe capacity,
+whichever is smaller), which is what stock grep sees with a fast
+writer.  Counts and file names (`-c`, `-l`, `-L`, `-q`) do not depend on
+the buffers and must match in every case.
+
 ## 7. Reports and Artifacts
 
 Every benchmark run writes:

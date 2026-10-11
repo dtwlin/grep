@@ -1305,10 +1305,6 @@ reset (int fd, struct stat const *st)
   bufbeg[-1] = eolbyte;
   bufdesc = fd;
   eof_known = false;
-#ifdef F_SETPIPE_SZ
-  if (fd == STDIN_FILENO)
-    fcntl (STDIN_FILENO, F_SETPIPE_SZ, 1024 * 1024);
-#endif
   bufoffset = fd == STDIN_FILENO ? lseek (fd, 0, SEEK_CUR) : 0;
   seek_failed = bufoffset < 0;
 
@@ -3255,6 +3251,11 @@ static intmax_t stream_commit_totalnl = 0;
 static bool stream_binary;
 static bool stream_binary_match;
 
+/* How much a read of single-threaded grep would return from standard
+   input, if the writer keeps the pipe full: its read size, or less if
+   the pipe holds less.  */
+static idx_t stream_readsize;
+
 /* Output the group separator, as prtext does.  */
 static void
 print_group_separator (void)
@@ -3415,8 +3416,11 @@ rob_search_deferred (struct rob_slot *slot)
    bytes.  From the start of the read buffer that holds the first null
    byte of the input, single-threaded grep outputs nothing more, stops
    at the next match (which it reports at the end), and turns null bytes
-   into line ends.  How much a read from a pipe returns varies; suppose
-   that each read filled the buffer, as with a regular file.  */
+   into line ends.  How much a read from a pipe returns varies with the
+   writer; suppose a writer that keeps the pipe full, so that each read
+   returns STREAM_READSIZE bytes.  Single-threaded grep then switches at
+   the same point, and its results do not depend on the writer anyway
+   with -c, -l, -L and -q.  */
 static void
 stream_commit_binary (struct rob_slot *slot)
 {
@@ -3444,9 +3448,8 @@ stream_commit_binary (struct rob_slot *slot)
   if (!stream_binary)
     {
       char *z = memchr (beg, '\0', lim - beg);
-      idx_t readsize = ALIGN_TO (GOOD_READSIZE_MIN, pagesize);
       intmax_t boundary = ((slot->stream_totalcc + (z - beg))
-                           / readsize * readsize);
+                           / stream_readsize * stream_readsize);
       if (slot->stream_totalcc < boundary)
         {
           char *eol = memrchr (beg, eolbyte, boundary - slot->stream_totalcc);
@@ -5329,7 +5332,16 @@ chunked_grep_file (char const *fname, struct stat const *st_in)
 static void
 stream_slicer_stdin (void)
 {
+  stream_readsize = ALIGN_TO (GOOD_READSIZE_MIN, pagesize);
+#ifdef F_GETPIPE_SZ
+  int pipe_size = fcntl (STDIN_FILENO, F_GETPIPE_SZ);
+  if (0 < pipe_size)
+    stream_readsize = MIN (stream_readsize, pipe_size);
+#endif
 #ifdef F_SETPIPE_SZ
+  /* Fewer, larger reads keep the slices coming.  This changes how far
+     the writer can get ahead of grep, which matters little here, as
+     the slicer reads ahead anyway.  */
   fcntl (STDIN_FILENO, F_SETPIPE_SZ, 1024 * 1024);
 #endif
   stream_commit_totalnl = 0;
