@@ -686,6 +686,25 @@ diagnostic_text (int errnum, char const *msg, size_t *lenp)
   return text;
 }
 
+/* A diagnostic captured while buffering.  It is stored in a membuf as
+   this header followed by LEN bytes of text, and must be written to
+   stderr after OUTPOS bytes of the same task's buffered output.  */
+struct errrec
+{
+  size_t outpos;
+  size_t len;
+};
+
+/* Append to MB a record for diagnostic TEXT of length LEN issued after
+   OUTPOS bytes of output.  */
+static void
+errrec_add (struct membuf *mb, size_t outpos, char const *text, size_t len)
+{
+  struct errrec h = { .outpos = outpos, .len = len };
+  membuf_append (mb, &h, sizeof h);
+  membuf_append (mb, text, len);
+}
+
 static void _GL_ATTRIBUTE_FORMAT_PRINTF_STANDARD (2, 3)
 task_error_buffered (int errnum, char const *fmt, ...)
 {
@@ -697,7 +716,7 @@ task_error_buffered (int errnum, char const *fmt, ...)
 
   size_t len;
   char *text = diagnostic_text (errnum, msg, &len);
-  membuf_append (&tls_err, text, len);
+  errrec_add (&tls_err, tls_out.len, text, len);
   free (text);
   if (msg != buf)
     free (msg);
@@ -3138,6 +3157,33 @@ static intmax_t chunk_accumulated_count = 0;
 static bool chunk_has_any_match = false;
 static intmax_t stream_commit_totalnl = 0;
 
+/* Commit output captured by a worker: OUTLEN bytes of standard output
+   at OUT and the diagnostic records ERR..ERR+ERRLEN (see struct errrec).
+   Write each diagnostic after the output that preceded it, flushing
+   standard output first, as error () does.  Buffering must be
+   disabled.  */
+static void
+commit_output (char const *out, size_t outlen, char const *err,
+               size_t errlen)
+{
+  size_t pos = 0;
+  char const *lim = err + errlen;
+  for (char const *p = err; p < lim; )
+    {
+      struct errrec h;
+      memcpy (&h, p, sizeof h);
+      char const *text = p + sizeof h;
+      if (pos < h.outpos)
+        fwrite_errno (out + pos, 1, h.outpos - pos);
+      pos = h.outpos;
+      fflush (stdout);
+      fwrite (text, 1, h.len, stderr);
+      p = text + h.len;
+    }
+  if (pos < outlen)
+    fwrite_errno (out + pos, 1, outlen - pos);
+}
+
 static void
 rob_try_commit_locked (void)
 {
@@ -3272,11 +3318,8 @@ rob_try_commit_locked (void)
             }
         }
 
-      if (slot->stdout_len > 0)
-        fwrite_errno (slot->stdout_buf ? slot->stdout_buf : slot->inline_out, 1, slot->stdout_len);
-
-      if (slot->stderr_len > 0)
-        fwrite (slot->stderr_buf, 1, slot->stderr_len, stderr);
+      commit_output (slot->stdout_buf ? slot->stdout_buf : slot->inline_out,
+                     slot->stdout_len, slot->stderr_buf, slot->stderr_len);
 
       if (line_buffered)
         fflush_errno ();
@@ -3917,9 +3960,13 @@ static void
 slot_set_diagnostic (struct rob_slot *slot, int errnum, char const *msg)
 {
   size_t len;
-  slot->stderr_buf = diagnostic_text (errnum, msg, &len);
-  slot->stderr_len = len;
-  slot->stderr_cap = len + 1;
+  char *text = diagnostic_text (errnum, msg, &len);
+  struct membuf mb = { .data = nullptr };
+  errrec_add (&mb, 0, text, len);
+  free (text);
+  slot->stderr_buf = mb.data;
+  slot->stderr_len = mb.len;
+  slot->stderr_cap = mb.cap;
   slot->stderr_is_mmap = false;
 }
 
@@ -4095,8 +4142,10 @@ format_context_matches_to_rob (char const *fname, struct chunk_file_state *state
   membuf_init (&out, 64 * 1024);
 
   struct membuf saved_out = tls_out;
+  struct membuf saved_err = tls_err;
   bool saved_buffering = buffering_enabled;
   tls_out = out;
+  tls_err = (struct membuf) { .data = nullptr };
   buffering_enabled = true;
 
   char const *saved_filename = filename;
@@ -4164,6 +4213,8 @@ format_context_matches_to_rob (char const *fname, struct chunk_file_state *state
 
   out = tls_out;
   tls_out = saved_out;
+  struct membuf err = tls_err;
+  tls_err = saved_err;
   buffering_enabled = saved_buffering;
   filename = saved_filename;
   bufbeg = saved_bufbeg;
@@ -4193,6 +4244,10 @@ format_context_matches_to_rob (char const *fname, struct chunk_file_state *state
       slot->stdout_cap = out.cap;
       slot->stdout_is_mmap = out.is_mmap;
     }
+  slot->stderr_buf = err.data;
+  slot->stderr_len = err.len;
+  slot->stderr_cap = err.cap;
+  slot->stderr_is_mmap = err.is_mmap;
   slot->state = ROB_SLOT_DONE;
 
   rob_try_commit_locked ();
