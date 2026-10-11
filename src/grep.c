@@ -6886,7 +6886,8 @@ producer_run (char *const *files)
               && st.st_size >= 2 * 1024 * 1024
               && !SAME_INODE (st, out_stat)
               && lseek (STDIN_FILENO, 0, SEEK_CUR) == 0
-              && (!out_invert || (out_before <= 0 && out_after <= 0)))
+              && (!out_invert || (out_before <= 0 && out_after <= 0))
+              && max_count == INTMAX_MAX)
             {
               chunked_grep_fd (STDIN_FILENO, false, label ? label : _("(standard input)"), &st);
             }
@@ -6908,7 +6909,8 @@ producer_run (char *const *files)
               if (S_ISDIR (st.st_mode) && directories == RECURSE_DIRECTORIES)
                 walk_run (*f);
               else if (S_ISREG (st.st_mode) && st.st_size >= 2 * 1024 * 1024 && pool_target > 1
-                       && (!out_invert || (out_before <= 0 && out_after <= 0)))
+                       && (!out_invert || (out_before <= 0 && out_after <= 0))
+                       && max_count == INTMAX_MAX)
                 chunked_grep_file (*f, &st);
               else
                 producer_enqueue_file (*f, true, true);
@@ -7645,12 +7647,11 @@ main (int argc, char **argv)
           output_is_operand = true;
       }
 
-  /* A maximum count applies to each file separately, so a directory
-     traversal can search files in parallel even then; the other
-     parallel paths do not support it.  */
+  /* A maximum count applies to each file separately, so files can be
+     searched in parallel even then, but not in chunks.  */
   if (nthreads <= 1
       || output_is_operand
-      || (max_count < INTMAX_MAX && !is_dir_recurse)
+      || (max_count < INTMAX_MAX && single_operand && !is_dir_recurse)
       || (is_single_stdin && !can_parallelize_stdin)
       || (single_operand && !is_single_stdin && !is_single_large_file && !is_dir_recurse))
     {

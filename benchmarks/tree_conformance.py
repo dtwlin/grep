@@ -66,6 +66,8 @@ EXTRA_OPTION_SETS = [
     ["--exclude-dir=wide", "--exclude-dir=deep*", "-n"],
     ["-s", "-l"], ["-D", "skip"], ["-a", "-c"], ["-I", "-l"],
     ["--binary-files=without-match", "-n"], ["-z", "-l"],
+    ["-m0"], ["-m1", "-c"], ["-m1", "-l"], ["-m1", "-L"], ["-m1", "-v"],
+    ["-m2", "-C1"], ["-m1", "-o"], ["-m3", "-n", "-A1"], ["-m1", "-q"],
 ]
 
 # Option sets run with stdout and stderr sent to the same file.
@@ -77,7 +79,7 @@ LARGE_OPTION_SETS = [
     ["--color=always"], ["-w"], ["-l"], ["-L"], ["-q"], ["-A0"],
     ["--binary-files=without-match"], ["-a"], ["-o", "-b"],
     ["-A2"], ["-B1"], ["-C3", "-n"], ["-A1", "--group-separator=XX"],
-    ["-C1"], ["--binary-files=text"], ["-n", "-o"],
+    ["-C1"], ["--binary-files=text"], ["-n", "-o"], ["-m5", "-n"],
 ]
 
 PATTERN = "needle"
@@ -640,7 +642,7 @@ def main():
         log(f"[{wd}] large outputs")
         many_files = sorted(os.path.join("many", f) for f in os.listdir(many))
         for opts in ([], ["-o"], ["-n", "-o"], ["-b", "-o"], ["-c"],
-                     ["--color=always"]):
+                     ["--color=always"], ["-m2", "-n"], ["-m3", "-c", "-v"]):
             r.compare("many-operands", opts, many_files, cwd=wd)
         for opts in (["-o"], ["-n"]):
             r.compare("many-r", ["-r"] + opts, ["many"], cwd=wd)
@@ -671,9 +673,10 @@ def main():
                 r.compare(f"adv-dot{mode}", [mode] + opts, [],
                           cwd=os.path.join(wd, "adv", "sub1"))
             # Several operands, files and directories mixed.
-            r.compare(f"adv-multi{mode}", [mode, "-n"],
-                      ["adv/sub1", "adv/a.txt", "adv/inc", "adv/sub2/k.c"],
-                      cwd=wd)
+            for opts in (["-n"], ["-n", "-m1"], ["-c", "-m2"]):
+                r.compare(f"adv-multi{mode}", [mode] + opts,
+                          ["adv/sub1", "adv/a.txt", "adv/inc", "adv/sub2/k.c"],
+                          cwd=wd)
             # Operands that are unreadable, missing, symbolic links, or
             # given with trailing slashes.
             r.compare(f"adv-operands{mode}", [mode, "-c"],
