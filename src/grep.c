@@ -29,6 +29,9 @@
 #include <stdatomic.h>
 #include <sched.h>
 #include <sys/mman.h>
+#ifdef __GLIBC__
+# include <stdio_ext.h>
+#endif
 #if defined __AVX2__
 # include <immintrin.h>
 #endif
@@ -472,6 +475,29 @@ static _Thread_local bool tls_errseen;
    the committer knows.  */
 static _Thread_local bool task_sep;
 
+/* True if output committed from worker buffers must reach standard
+   output through the same sequence of stdio buffer states as in
+   single-threaded grep.  This matters when standard output is a
+   regular file that grep may read as input, which happens with -c,
+   -l, -L or -m1, and is cheap since output is small then.  */
+static bool exact_stdout;
+
+/* While buffering in exact mode, each write of at least BIG_WRITE_MIN
+   bytes is recorded in TLS_BIG as a pair of size_t values (offset in
+   TLS_OUT, length), so that it can be replayed as one write.  Smaller
+   writes never bypass a stdio buffer that is at least that large, so
+   they can be replayed in any pieces that are smaller too.  */
+enum { BIG_WRITE_MIN = 128 };
+static _Thread_local struct membuf tls_big;
+
+/* In exact mode, worker threads must not read the output file, since
+   what they would read depends on how much output has been committed.
+   If TLS_MAY_DEFER, grepdesc leaves such a file alone and sets
+   TLS_DEFERRED; the committer then searches the file itself, when all
+   the output that precedes it has been written.  */
+static _Thread_local bool tls_may_defer;
+static _Thread_local bool tls_deferred;
+
 static void
 membuf_init (struct membuf *mb, size_t initial_cap)
 {
@@ -565,12 +591,26 @@ putchar_errno (int c)
     stdout_errno = errno;
 }
 
+/* Record a buffered write of LEN bytes that is about to be appended to
+   TLS_OUT, if exact mode needs to know about it.  */
+static void
+note_big_write (size_t len)
+{
+  if (exact_stdout && BIG_WRITE_MIN <= len)
+    {
+      size_t rec[2] = { tls_out.len, len };
+      membuf_append (&tls_big, rec, sizeof rec);
+    }
+}
+
 static void
 fputs_errno (char const *s)
 {
   if (buffering_enabled)
     {
-      membuf_append (&tls_out, s, strlen (s));
+      size_t len = strlen (s);
+      note_big_write (len);
+      membuf_append (&tls_out, s, len);
       return;
     }
   if (fputs (s, stdout) < 0)
@@ -616,7 +656,10 @@ fwrite_errno (void const *ptr, idx_t size, idx_t nmemb)
     {
       size_t total;
       if (!ckd_mul (&total, size, nmemb) && total > 0)
-        membuf_append (&tls_out, ptr, total);
+        {
+          note_big_write (total);
+          membuf_append (&tls_out, ptr, total);
+        }
       return;
     }
   if (fwrite (ptr, size, nmemb, stdout) != nmemb)
@@ -2345,6 +2388,14 @@ grepdesc (int desc, bool command_line)
       goto closeout;
     }
 
+  /* In exact mode, let the committer read the output file; see
+     TLS_MAY_DEFER.  */
+  if (tls_may_defer && S_ISREG (st.st_mode) && SAME_INODE (st, out_stat))
+    {
+      tls_deferred = true;
+      goto closeout;
+    }
+
   count = grep (desc, &st, &ineof);
   if (count_matches)
     {
@@ -2994,6 +3045,14 @@ struct rob_slot
   size_t stderr_cap;
   bool stderr_is_mmap;
 
+  size_t *big;
+  size_t nbig;
+
+  /* A file left for the committer to search; see TLS_MAY_DEFER.  */
+  char *defer_name;
+  bool defer_follow;
+  bool defer_command_line;
+
   bool is_chunk;
   bool is_last_chunk;
   intmax_t chunk_count;
@@ -3194,16 +3253,60 @@ need_group_separator (bool had_prtext, bool sep)
           && global_used && group_separator);
 }
 
+/* The size of the pieces in which exact mode replays small writes; see
+   BIG_WRITE_MIN.  */
+static size_t
+exact_piece_size (void)
+{
+#ifdef __GLIBC__
+  size_t bufsize = __fbufsize (stdout);
+  if (BIG_WRITE_MIN <= bufsize)
+    return bufsize - 1;
+#endif
+  return BIG_WRITE_MIN - 1;
+}
+
+/* Write OUT[FROM..TO) to standard output.  BIG[0..2*NBIG) are the
+   large writes recorded while buffering, and *BIGI is the index of the
+   first one not yet replayed.  */
+static void
+commit_stdout (char const *out, size_t from, size_t to,
+               size_t const *big, size_t nbig, size_t *bigi)
+{
+  if (!exact_stdout)
+    {
+      if (from < to)
+        fwrite_errno (out + from, 1, to - from);
+      return;
+    }
+  while (from < to)
+    {
+      if (*bigi < nbig && big[2 * *bigi] == from)
+        {
+          size_t len = big[2 * *bigi + 1];
+          fwrite_errno (out + from, 1, len);
+          from += len;
+          ++*bigi;
+          continue;
+        }
+      size_t lim = *bigi < nbig ? MIN (to, big[2 * *bigi]) : to;
+      size_t n = MIN (lim - from, exact_piece_size ());
+      fwrite_errno (out + from, 1, n);
+      from += n;
+    }
+}
+
 /* Commit output captured by a worker: OUTLEN bytes of standard output
-   at OUT and the diagnostic records ERR..ERR+ERRLEN (see struct errrec).
-   Write each diagnostic after the output that preceded it, flushing
-   standard output first, as error () does.  If SEP, output a group
-   separator first.  Buffering must be disabled.  */
+   at OUT, the diagnostic records ERR..ERR+ERRLEN (see struct errrec),
+   and the large writes BIG[0..2*NBIG) recorded in exact mode.  Write
+   each diagnostic after the output that preceded it, flushing standard
+   output first, as error () does.  If SEP, output a group separator
+   first.  Buffering must be disabled.  */
 static void
 commit_output (char const *out, size_t outlen, char const *err,
-               size_t errlen, bool sep)
+               size_t errlen, size_t const *big, size_t nbig, bool sep)
 {
-  size_t pos = 0;
+  size_t pos = 0, bigi = 0;
   char const *lim = err + errlen;
   for (char const *p = err; p < lim; )
     {
@@ -3215,8 +3318,7 @@ commit_output (char const *out, size_t outlen, char const *err,
           print_group_separator ();
           sep = false;
         }
-      if (pos < h.outpos)
-        fwrite_errno (out + pos, 1, h.outpos - pos);
+      commit_stdout (out, pos, h.outpos, big, nbig, &bigi);
       pos = h.outpos;
       fflush (stdout);
       fwrite (text, 1, h.len, stderr);
@@ -3224,8 +3326,66 @@ commit_output (char const *out, size_t outlen, char const *err,
     }
   if (sep)
     print_group_separator ();
-  if (pos < outlen)
-    fwrite_errno (out + pos, 1, outlen - pos);
+  commit_stdout (out, pos, outlen, big, nbig, &bigi);
+}
+
+/* Reset the per-file state of the current thread before searching a
+   file into its buffers.  */
+static void
+task_reset (void)
+{
+  membuf_reset (&tls_out);
+  membuf_reset (&tls_err);
+  membuf_reset (&tls_big);
+  tls_errseen = false;
+  tls_deferred = false;
+  out_quiet = initial_out_quiet;
+  done_on_match = initial_done_on_match;
+  totalcc = 0;
+  lastnl = nullptr;
+  lastout = nullptr;
+  outleft = max_count;
+  pending = 0;
+  file_used = false;
+  task_had_prtext = false;
+  task_sep = false;
+}
+
+/* Search the file that a worker left for the committer, now that all
+   output before it has been committed, and put the results into SLOT.
+   See TLS_MAY_DEFER.  */
+static void
+rob_search_deferred (struct rob_slot *slot)
+{
+  bool saved_buffering = buffering_enabled;
+  char const *saved_filename = filename;
+  struct membuf saved_out = tls_out, saved_err = tls_err, saved_big = tls_big;
+  tls_out = tls_err = tls_big = (struct membuf) { .data = nullptr };
+  buffering_enabled = true;
+  task_reset ();
+  filename = slot->defer_name;
+  slot->status = grepfile (AT_FDCWD, slot->defer_name, slot->defer_follow,
+                           slot->defer_command_line);
+  slot->errseen = tls_errseen;
+  slot->had_prtext = task_had_prtext;
+  slot->sep = task_sep;
+  slot->stdout_buf = tls_out.data;
+  slot->stdout_len = tls_out.len;
+  slot->stdout_cap = tls_out.cap;
+  slot->stdout_is_mmap = tls_out.is_mmap;
+  slot->stderr_buf = tls_err.data;
+  slot->stderr_len = tls_err.len;
+  slot->stderr_cap = tls_err.cap;
+  slot->stderr_is_mmap = tls_err.is_mmap;
+  slot->big = CAST_ALIGNED (size_t *, tls_big.data);
+  slot->nbig = tls_big.len / (2 * sizeof (size_t));
+  free (slot->defer_name);
+  slot->defer_name = nullptr;
+  tls_out = saved_out;
+  tls_err = saved_err;
+  tls_big = saved_big;
+  filename = saved_filename;
+  buffering_enabled = saved_buffering;
 }
 
 static void
@@ -3240,6 +3400,9 @@ rob_try_commit_locked (void)
       struct rob_slot *slot = &rob[commit_seq % ROB_CAP];
       if (slot->state != ROB_SLOT_DONE)
         break;
+
+      if (slot->defer_name)
+        rob_search_deferred (slot);
 
       if (slot->filename)
         filename = slot->filename;
@@ -3356,7 +3519,7 @@ rob_try_commit_locked (void)
 
       commit_output (slot->stdout_buf ? slot->stdout_buf : slot->inline_out,
                      slot->stdout_len, slot->stderr_buf, slot->stderr_len,
-                     want_sep);
+                     slot->big, slot->nbig, want_sep);
 
       if (line_buffered)
         fflush_errno ();
@@ -3385,6 +3548,10 @@ rob_try_commit_locked (void)
             free (slot->stderr_buf);
           slot->stderr_buf = nullptr;
         }
+
+      free (slot->big);
+      slot->big = nullptr;
+      slot->nbig = 0;
 
       if (slot->cleanup_fn)
         {
@@ -3584,21 +3751,10 @@ worker_thread_func (void *arg)
           continue;
         }
 
-      membuf_reset (&tls_out);
-      membuf_reset (&tls_err);
-      tls_errseen = false;
-      out_quiet = initial_out_quiet;
-      done_on_match = initial_done_on_match;
-      totalcc = 0;
-      lastnl = nullptr;
-      lastout = nullptr;
-      outleft = max_count;
-      pending = 0;
-      file_used = false;
-      task_had_prtext = false;
-      task_sep = false;
+      task_reset ();
 
       bool status = true;
+      char *defer_name = nullptr;
       intmax_t chunk_matched_cnt = 0;
 
       if (task.type == TASK_TYPE_STDIN)
@@ -3611,8 +3767,13 @@ worker_thread_func (void *arg)
       else if (task.type == TASK_TYPE_FILE)
         {
           filename = task.filename;
+          tls_may_defer = exact_stdout;
           status = grepfile (AT_FDCWD, task.filename, task.follow, task.command_line);
-          free (task.filename);
+          tls_may_defer = false;
+          if (tls_deferred)
+            defer_name = task.filename;
+          else
+            free (task.filename);
         }
       else if (task.type == TASK_TYPE_STREAM_CHUNK)
         {
@@ -3799,6 +3960,17 @@ worker_thread_func (void *arg)
       slot->had_prtext = task_had_prtext;
       slot->sep = task_sep;
       slot->chunk_count = chunk_matched_cnt;
+      if (defer_name)
+        {
+          slot->defer_name = defer_name;
+          slot->defer_follow = task.follow;
+          slot->defer_command_line = task.command_line;
+        }
+      if (tls_big.len)
+        {
+          slot->big = ximemdup (tls_big.data, tls_big.len);
+          slot->nbig = tls_big.len / (2 * sizeof (size_t));
+        }
       if (task.type == TASK_TYPE_CHUNK || task.type == TASK_TYPE_STREAM_CHUNK)
         {
           slot->is_chunk = true;
@@ -4182,9 +4354,10 @@ format_context_matches_to_rob (char const *fname, struct chunk_file_state *state
 
   struct membuf saved_out = tls_out;
   struct membuf saved_err = tls_err;
+  struct membuf saved_big = tls_big;
   bool saved_buffering = buffering_enabled;
   tls_out = out;
-  tls_err = (struct membuf) { .data = nullptr };
+  tls_err = tls_big = (struct membuf) { .data = nullptr };
   buffering_enabled = true;
 
   char const *saved_filename = filename;
@@ -4258,6 +4431,8 @@ format_context_matches_to_rob (char const *fname, struct chunk_file_state *state
   tls_out = saved_out;
   struct membuf err = tls_err;
   tls_err = saved_err;
+  struct membuf big = tls_big;
+  tls_big = saved_big;
   buffering_enabled = saved_buffering;
   filename = saved_filename;
   bufbeg = saved_bufbeg;
@@ -4294,6 +4469,8 @@ format_context_matches_to_rob (char const *fname, struct chunk_file_state *state
   slot->stderr_len = err.len;
   slot->stderr_cap = err.cap;
   slot->stderr_is_mmap = err.is_mmap;
+  slot->big = CAST_ALIGNED (size_t *, big.data);
+  slot->nbig = big.len / (2 * sizeof (size_t));
   slot->state = ROB_SLOT_DONE;
 
   rob_try_commit_locked ();
@@ -4983,7 +5160,8 @@ producer_grepdirent (FTS *fts, FTSENT *ent, bool command_line)
     case FTS_SLNONE:
       if (S_ISREG (ent->fts_statp->st_mode)
           && ent->fts_statp->st_size >= 2 * 1024 * 1024 && pool_nthreads > 1
-          && (!out_invert || (out_before <= 0 && out_after <= 0)))
+          && (!out_invert || (out_before <= 0 && out_after <= 0))
+          && ! (exact_stdout && SAME_INODE (*ent->fts_statp, out_stat)))
         {
           producer_flush_batch ();
           chunked_grep_file (fname, ent->fts_statp);
@@ -5588,6 +5766,12 @@ main (int argc, char **argv)
     }
   out_quiet = count_matches | done_on_match | exit_on_match;
 
+  /* If grep might read its own output, commit output exactly; see
+     EXACT_STDOUT.  Otherwise grepdesc refuses to read the output.  */
+  exact_stdout = (S_ISREG (out_stat.st_mode)
+                  && (out_quiet || list_files != LISTFILES_NONE
+                      || max_count <= 1));
+
   if (out_after < 0)
     out_after = default_context;
   if (out_before < 0)
@@ -5759,7 +5943,20 @@ main (int argc, char **argv)
                          && stat (*files, &tmp_st) == 0
                          && S_ISDIR (tmp_st.st_mode));
 
+  /* Search single-threaded if an operand is the output file that grep
+     will read; directory traversals defer such a file instead.  */
+  bool output_is_operand = false;
+  if (exact_stdout)
+    for (char *const *f = files; *f; f++)
+      {
+        struct stat st;
+        if ((STREQ (*f, "-") ? fstat (STDIN_FILENO, &st) : stat (*f, &st)) == 0
+            && S_ISREG (st.st_mode) && SAME_INODE (st, out_stat))
+          output_is_operand = true;
+      }
+
   if (nthreads <= 1
+      || output_is_operand
       || max_count < INTMAX_MAX
       || (is_single_stdin && !can_parallelize_stdin)
       || (num_operands == 1 && !is_single_stdin && !is_single_large_file && !is_dir_recurse))
