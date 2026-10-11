@@ -77,6 +77,7 @@ LARGE_OPTION_SETS = [
     ["--color=always"], ["-w"], ["-l"], ["-L"], ["-q"], ["-A0"],
     ["--binary-files=without-match"], ["-a"], ["-o", "-b"],
     ["-A2"], ["-B1"], ["-C3", "-n"], ["-A1", "--group-separator=XX"],
+    ["-C1"], ["--binary-files=text"], ["-n", "-o"],
 ]
 
 PATTERN = "needle"
@@ -299,6 +300,18 @@ LARGE_FILES = {
     # An encoding error in a line of trailing context.
     "enc_ctx.txt": {997 * 30 + 1: b"context line with a bad \xff byte\n",
                     997 * 150: b"needle with a bad \xff byte\n"},
+    # Null bytes, which make single-threaded grep treat the rest of the
+    # file as binary from the start of the read buffer that holds the
+    # first one.  "@N" puts a null byte at byte offset N.
+    "nul32k.txt": {"@32778": None},
+    "nul64k.txt": {"@65546": None},
+    "nul_mid.txt": {"@5000000": None},
+    "nul_match.txt": {997 * 120: b"needle with a \0 byte\n"},
+    "nul_readbound.txt": {"@3932160": None, "@7864319": None},
+    "nul_chunkbound.txt": {"@4430000": None},
+    "nul_longline.txt": {100000: b"x" * 200000 + b"\0 needle " + b"y" * 200000
+                         + b"\n"},
+    "nul_tail.txt": {199999: b"needle at the end \0 and no newline"},
 }
 
 
@@ -306,7 +319,10 @@ def large_pipe_ok(name, opts):
     """Whether what single-threaded grep outputs for the large file NAME
     with OPTS does not depend on how much each read from a pipe returns.
     After omitting a line with an encoding error, the context it prints
-    depends on where its buffers end."""
+    depends on where its buffers end, and so does what it does after
+    reading a null byte."""
+    if name.startswith("nul"):
+        return False
     if name.startswith("enc"):
         return not any(o[:2] in ("-A", "-B", "-C") and o[2:] != "0"
                        for o in opts)
@@ -325,9 +341,14 @@ def build_large_files(root):
             base = large_base_lines()
         lines = list(base)
         for i, data in edits.items():
-            lines[i] = data
+            if not isinstance(i, str):
+                lines[i] = data
+        data = bytearray(b"".join(lines))
+        for i in edits:
+            if isinstance(i, str):
+                data[int(i[1:])] = 0
         with open(path + ".tmp", "wb") as f:
-            f.writelines(lines)
+            f.write(data)
         os.rename(path + ".tmp", path)
 
 

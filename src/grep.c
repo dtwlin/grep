@@ -3043,6 +3043,10 @@ struct rob_slot
      error, so that a "binary file matches" message must follow the
      output of the file's last chunk.  */
   bool enc_error;
+
+  /* If nonnull, the chunked file whose results this slot holds; the
+     slot must not be committed until GATE->decided.  */
+  struct chunk_file_state *gate;
   void (*cleanup_fn) (void *);
   void *cleanup_arg;
   char *filename;
@@ -3123,6 +3127,19 @@ struct chunk_file_state
   _Atomic intmax_t total_count;
   _Atomic bool has_match;
   _Atomic bool early_stop;
+
+  /* Whether some chunk contains a null byte.  Single-threaded grep
+     then treats the rest of the file as binary from a point that
+     depends on where its read buffers end, so the file is searched
+     sequentially instead.  In the modes that search each chunk in a
+     single pass, the chunks' slots must not be committed before that
+     is decided: CHUNKS_DONE counts the filled slots, which start at
+     FIRST_SEQ, and DECIDED tells whether they are final.  These three
+     are protected by pool_mutex.  */
+  _Atomic bool has_nul;
+  size_t chunks_done;
+  bool decided;
+  uint64_t first_seq;
 
   pthread_mutex_t done_mutex;
   pthread_cond_t done_cv;
@@ -3400,6 +3417,8 @@ rob_try_commit_locked (void)
       struct rob_slot *slot = &rob[commit_seq % ROB_CAP];
       if (slot->state != ROB_SLOT_DONE)
         break;
+      if (slot->gate && !slot->gate->decided)
+        break;
 
       if (slot->defer_name)
         rob_search_deferred (slot);
@@ -3635,6 +3654,123 @@ producer_alloc_slot_locked (void)
 static void walk_participate (unsigned int);
 static void walk_free_thread_buffers (void);
 
+/* Chunk tasks search in pieces of about this many bytes, so that the
+   check for null bytes reads each piece while the search has left it in
+   cache.  */
+enum { CHUNK_PIECE = 128 * 1024 };
+
+static void chunk_slot_done_locked (struct chunk_file_state *state);
+
+/* Return true if chunk tasks of the file of STATE should still check
+   for null bytes.  */
+static bool
+chunk_nul_check (struct chunk_file_state *state)
+{
+  return (eolbyte && binary_files != TEXT_BINARY_FILES
+          && !atomic_load_explicit (&state->has_nul, memory_order_relaxed));
+}
+
+/* Note that the file of STATE contains a null byte.  */
+static void
+chunk_note_nul (struct chunk_file_state *state)
+{
+  atomic_store_explicit (&state->has_nul, true, memory_order_relaxed);
+}
+
+/* Return the number of lines in the chunk [BEG, LIM) of the file of
+   STATE, and note whether the chunk contains a null byte.  */
+static idx_t
+chunk_count_newlines (char const *beg, char const *lim,
+                      struct chunk_file_state *state)
+{
+  if (!chunk_nul_check (state))
+    return count_newlines (beg, lim);
+
+  idx_t newlines = 0;
+  bool nul = false;
+#if defined __AVX2__
+  if (lim - beg >= 128)
+    {
+      /* Count line ends as count_newlines does, and track the least
+         byte seen, which is zero if there is a null byte.  */
+      __m256i match_eol = _mm256_set1_epi8 (eolbyte);
+      __m256i least = _mm256_set1_epi8 (-1);
+      while (lim - beg >= 128)
+        {
+          __m256i v0 = _mm256_loadu_si256 ((__m256i const *) (void const *) (beg + 0));
+          __m256i v1 = _mm256_loadu_si256 ((__m256i const *) (void const *) (beg + 32));
+          __m256i v2 = _mm256_loadu_si256 ((__m256i const *) (void const *) (beg + 64));
+          __m256i v3 = _mm256_loadu_si256 ((__m256i const *) (void const *) (beg + 96));
+          unsigned int m0 = _mm256_movemask_epi8 (_mm256_cmpeq_epi8 (v0, match_eol));
+          unsigned int m1 = _mm256_movemask_epi8 (_mm256_cmpeq_epi8 (v1, match_eol));
+          unsigned int m2 = _mm256_movemask_epi8 (_mm256_cmpeq_epi8 (v2, match_eol));
+          unsigned int m3 = _mm256_movemask_epi8 (_mm256_cmpeq_epi8 (v3, match_eol));
+          newlines += __builtin_popcount (m0) + __builtin_popcount (m1)
+                    + __builtin_popcount (m2) + __builtin_popcount (m3);
+          least = _mm256_min_epu8 (least,
+                                   _mm256_min_epu8 (_mm256_min_epu8 (v0, v1),
+                                                    _mm256_min_epu8 (v2, v3)));
+          beg += 128;
+        }
+      nul = (_mm256_movemask_epi8 (_mm256_cmpeq_epi8 (least,
+                                                      _mm256_setzero_si256 ()))
+             != 0);
+    }
+#endif
+  newlines += count_newlines (beg, lim);
+  if (nul || memchr (beg, '\0', lim - beg))
+    chunk_note_nul (state);
+  return newlines;
+}
+
+/* If SEARCH, search the chunk [BEG, LIM) of the file of STATE with
+   grepbuf, a line-aligned piece at a time, stopping at the first match
+   if DONE_ON_MATCH; and note whether the chunk contains a null byte.
+   Return what grepbuf returned in total.  */
+static intmax_t
+chunk_grepbuf (char *beg, char *lim, struct chunk_file_state *state,
+               bool search)
+{
+  bool check = chunk_nul_check (state);
+  intmax_t n = 0;
+  for (char *p = beg; p < lim && (search || check); )
+    {
+      char *q = lim;
+      if (CHUNK_PIECE < lim - p)
+        {
+          char *nl = memchr (p + CHUNK_PIECE, eolbyte,
+                             lim - (p + CHUNK_PIECE));
+          if (nl)
+            q = nl + 1;
+        }
+      bool stop = false;
+      if (search)
+        {
+          n += grepbuf (p, q);
+          stop = n && done_on_match;
+        }
+
+      /* Check the piece after searching it, while it is in cache.  */
+      if (check && memchr (p, '\0', q - p))
+        {
+          chunk_note_nul (state);
+          check = false;
+        }
+
+      if (stop)
+        {
+          /* Single-threaded grep stops reading here.  A null byte
+             further on matters only if it would make the file not
+             match.  */
+          search = false;
+          if (binary_files != WITHOUT_MATCH_BINARY_FILES)
+            check = false;
+        }
+      p = q;
+    }
+  return n;
+}
+
 static void *
 worker_thread_func (void *arg)
 {
@@ -3681,7 +3817,7 @@ worker_thread_func (void *arg)
           char const *cbeg = task.chunk_data;
           char const *clim = task.chunk_data + task.chunk_len;
 
-          state->chunk_nls[idx] = count_newlines (cbeg, clim);
+          state->chunk_nls[idx] = chunk_count_newlines (cbeg, clim, state);
 
           idx_t match_size;
           ptrdiff_t off = execute (compiled_pattern, cbeg, clim - cbeg, &match_size, nullptr);
@@ -3947,11 +4083,16 @@ worker_thread_func (void *arg)
               if (atomic_load (&state->early_stop))
                 {
                   status = true;
+
+                  /* With --binary-files=without-match, a null byte
+                     before the first match makes the file not match.  */
+                  if (binary_files == WITHOUT_MATCH_BINARY_FILES)
+                    chunk_grepbuf (bufbeg, buflim, state, false);
                 }
               else
                 {
                   out_quiet = true;
-                  intmax_t cnt = grepbuf (bufbeg, buflim);
+                  intmax_t cnt = chunk_grepbuf (bufbeg, buflim, state, true);
                   chunk_matched_cnt = cnt;
                   if (cnt > 0)
                     {
@@ -3964,7 +4105,10 @@ worker_thread_func (void *arg)
             }
           else
             {
-              intmax_t lines_matched = grepbuf (bufbeg, buflim);
+              intmax_t lines_matched
+                = (task.mode == CHUNK_MODE_STATELESS
+                   ? chunk_grepbuf (bufbeg, buflim, task.shared_state, true)
+                   : grepbuf (bufbeg, buflim));
               status = (lines_matched == 0);
               enc_error = (binary_files == BINARY_BINARY_FILES && !out_quiet
                            && encoding_error_output);
@@ -4048,6 +4192,8 @@ worker_thread_func (void *arg)
         }
 
       slot->state = ROB_SLOT_DONE;
+      if (task.type == TASK_TYPE_CHUNK && task.mode != CHUNK_MODE_LINE_NUMBER)
+        chunk_slot_done_locked (task.shared_state);
       rob_try_commit_locked ();
     }
 
@@ -4348,6 +4494,108 @@ chunk_search_sequentially (struct chunk_file_state *state, char const *fname)
   return status;
 }
 
+/* Search the file of STATE sequentially into SLOT, as for
+   rob_search_deferred.  */
+static void
+chunk_search_to_slot (struct chunk_file_state *state, struct rob_slot *slot)
+{
+  struct membuf saved_out = tls_out, saved_err = tls_err, saved_big = tls_big;
+  bool saved_buffering = buffering_enabled;
+  tls_out = tls_err = tls_big = (struct membuf) { .data = nullptr };
+  buffering_enabled = true;
+  task_reset ();
+  slot->status = chunk_search_sequentially (state, state->fname);
+  slot->errseen = tls_errseen;
+  slot->had_prtext = task_had_prtext;
+  slot->sep = task_sep;
+  slot->stdout_buf = tls_out.data;
+  slot->stdout_len = tls_out.len;
+  slot->stdout_cap = tls_out.cap;
+  slot->stderr_buf = tls_err.data;
+  slot->stderr_len = tls_err.len;
+  slot->stderr_cap = tls_err.cap;
+  slot->big = CAST_ALIGNED (size_t *, tls_big.data);
+  slot->nbig = tls_big.len / (2 * sizeof (size_t));
+  tls_out = saved_out;
+  tls_err = saved_err;
+  tls_big = saved_big;
+  buffering_enabled = saved_buffering;
+}
+
+/* Queue the results of a sequential search of the file of STATE, named
+   FNAME.  */
+static void
+chunk_sequential_to_rob (char const *fname, struct chunk_file_state *state)
+{
+  pthread_mutex_lock (&pool_mutex);
+  uint64_t seq = producer_alloc_slot_locked ();
+  struct rob_slot *slot = &rob[seq % ROB_CAP];
+  slot->cleanup_fn = cleanup_chunk_file_state;
+  slot->cleanup_arg = state;
+  slot->filename = xstrdup (fname);
+  pthread_mutex_unlock (&pool_mutex);
+
+  chunk_search_to_slot (state, slot);
+
+  pthread_mutex_lock (&pool_mutex);
+  slot->state = ROB_SLOT_DONE;
+  rob_try_commit_locked ();
+  pthread_mutex_unlock (&pool_mutex);
+}
+
+/* Note that the slot of one more chunk of the file of STATE is filled,
+   in a mode that searches each chunk in a single pass.  When all are,
+   decide whether the file must be searched sequentially; if so, do it
+   and let the last slot hold the results instead of the chunks'.
+   pool_mutex must be held; it is released while searching.  */
+static void
+chunk_slot_done_locked (struct chunk_file_state *state)
+{
+  if (++state->chunks_done < state->num_chunks)
+    return;
+
+  if (atomic_load_explicit (&state->has_nul, memory_order_relaxed))
+    {
+      struct rob_slot *result = xzalloc (sizeof *result);
+      pthread_mutex_unlock (&pool_mutex);
+      chunk_search_to_slot (state, result);
+      pthread_mutex_lock (&pool_mutex);
+
+      for (size_t k = 0; k < state->num_chunks; k++)
+        {
+          struct rob_slot *s = &rob[(state->first_seq + k) % ROB_CAP];
+          free (s->stdout_buf);
+          free (s->stderr_buf);
+          free (s->big);
+          s->stdout_buf = s->stderr_buf = nullptr;
+          s->stdout_len = s->stderr_len = 0;
+          s->big = nullptr;
+          s->nbig = 0;
+          s->status = true;
+          s->errseen = s->had_prtext = s->sep = s->enc_error = false;
+          s->chunk_count = 0;
+          s->is_chunk = s->is_last_chunk = false;
+        }
+      struct rob_slot *last
+        = &rob[(state->first_seq + state->num_chunks - 1) % ROB_CAP];
+      last->status = result->status;
+      last->errseen = result->errseen;
+      last->had_prtext = result->had_prtext;
+      last->sep = result->sep;
+      last->stdout_buf = result->stdout_buf;
+      last->stdout_len = result->stdout_len;
+      last->stdout_cap = result->stdout_cap;
+      last->stderr_buf = result->stderr_buf;
+      last->stderr_len = result->stderr_len;
+      last->stderr_cap = result->stderr_cap;
+      last->big = result->big;
+      last->nbig = result->nbig;
+      free (result);
+    }
+
+  state->decided = true;
+}
+
 static int
 cmp_matches (void const *a, void const *b)
 {
@@ -4634,7 +4882,7 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
           producer_enqueue_file (fname, true, true);
         }
       else
-        stream_slicer_stdin ();
+        producer_enqueue_stdin ();
       return;
     }
 
@@ -4704,6 +4952,9 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
           struct rob_slot *slot = &rob[seq % ROB_CAP];
           slot->is_chunk = true;
           slot->is_last_chunk = is_last;
+          slot->gate = state;
+          if (k == 0)
+            state->first_seq = seq;
           if (is_last)
             {
               slot->cleanup_fn = cleanup_chunk_file_state;
@@ -4761,6 +5012,9 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
           struct rob_slot *slot = &rob[seq % ROB_CAP];
           slot->is_chunk = true;
           slot->is_last_chunk = is_last;
+          slot->gate = state;
+          if (k == 0)
+            state->first_seq = seq;
           if (is_last)
             {
               slot->cleanup_fn = cleanup_chunk_file_state;
@@ -4848,6 +5102,12 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
   while (atomic_load (&state->chunks_completed) < num_chunks)
     pthread_cond_wait (&state->done_cv, &state->done_mutex);
   pthread_mutex_unlock (&state->done_mutex);
+
+  if (atomic_load (&state->has_nul))
+    {
+      chunk_sequential_to_rob (fname, state);
+      return;
+    }
 
   /* Prefix sum of newlines */
   state->prefix_nls[0] = 0;
