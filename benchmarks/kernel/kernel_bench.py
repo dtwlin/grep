@@ -729,6 +729,7 @@ def main():
     parser.add_argument("--sweep-rounds", type=int, default=5, help="Number of measured rounds per thread sweep point")
     parser.add_argument("--sweep-warmups", type=int, default=1, help="Number of warmup rounds per thread sweep point")
     parser.add_argument("--cold-rounds", type=int, default=3, help="Number of cold cache measured rounds")
+    parser.add_argument("--phase", choices=["all", "warm", "c", "cold", "sweep"], default="all", help="Which benchmark phase to run")
     parser.add_argument("--out", default=None, help="Output directory for results")
     parser.add_argument("--resume", default=None, help="Resume from an existing results directory")
     args = parser.parse_args()
@@ -855,6 +856,9 @@ def main():
     # =========================================================================
     # Phase 1: Warm Cache Matrix (Primary Locale, e.g. en_US.UTF-8)
     # =========================================================================
+    if args.phase not in ("all", "warm"):
+        selected_scenarios = []
+
     total_scenarios = len(selected_scenarios)
     for s_idx, scenario in enumerate(selected_scenarios, 1):
         print(f"\n[Phase 1 {s_idx}/{total_scenarios}] Scenario {scenario.sid}: {scenario.description} ({scenario.category})")
@@ -1017,7 +1021,7 @@ def main():
     # =========================================================================
     # Phase 2: LC_ALL=C Matrix (22 Scenarios: Core + T-12, T-16, B-05, M-04)
     # =========================================================================
-    run_c_matrix = ("C" in locales) and not args.quick and not args.dry_run and not args.scenarios
+    run_c_matrix = ("C" in locales) and not args.quick and not args.dry_run and not args.scenarios and (args.phase in ("all", "c"))
     if run_c_matrix:
         if args.c_scenarios:
             c_sids = [s.strip() for s in args.c_scenarios.split(",") if s.strip()]
@@ -1113,7 +1117,7 @@ def main():
     # =========================================================================
     # Phase 3: Cold Cache Matrix (T-01, T-03, T-06, B-01; fadvise eviction)
     # =========================================================================
-    run_cold_matrix = bool(args.cold_scenarios) and not args.quick and not args.dry_run and not args.scenarios
+    run_cold_matrix = bool(args.cold_scenarios) and not args.quick and not args.dry_run and not args.scenarios and (args.phase in ("all", "cold"))
     if run_cold_matrix:
         cold_sids = [s.strip() for s in args.cold_scenarios.split(",") if s.strip()]
         cold_scenarios = [all_scenarios[sid] for sid in cold_sids if sid in all_scenarios]
@@ -1167,7 +1171,7 @@ def main():
     # =========================================================================
     # Phase 4: Multi-Thread Scaling Sweeps (8 Scenarios, 1..64 Threads)
     # =========================================================================
-    run_sweep_matrix = bool(sweep_threads) and not args.quick and not args.dry_run and not args.scenarios
+    run_sweep_matrix = bool(sweep_threads) and not args.dry_run and (args.phase in ("all", "sweep")) and (not args.scenarios or args.phase == "sweep")
     if run_sweep_matrix:
         if args.sweep_scenarios:
             sw_sids = [s.strip() for s in args.sweep_scenarios.split(",") if s.strip()]
@@ -1184,6 +1188,7 @@ def main():
             print(f"\n[Phase 4 {s_idx}/{len(sw_scenarios)}] Thread Sweep Scenario {scenario.sid}: {scenario.description}")
             sweep_tools = [t for t in ("G1", "R0", "X1") if t in tools and t not in scenario.na_tools]
             timeout_for_scenario = scenario.timeout_sec or args.timeout
+            g1_shas = {}
 
             for th in sweep_threads:
                 for s_tool in sweep_tools:
@@ -1236,10 +1241,19 @@ def main():
                             jsonl_fp.write(json.dumps(rec) + "\n")
                             jsonl_fp.flush()
                             measured_ms.append(rec["wall_ms"])
+                            if s_tool == "G1":
+                                g1_shas.setdefault(th, []).append(rec["stdout_sha256"])
 
                     if measured_ms:
                         med = sorted(measured_ms)[len(measured_ms) // 2]
-                        print(f"    {s_tool:2s} (threads={th:2d}): median {med:7.1f} ms | min {min(measured_ms):7.1f} ms | max {max(measured_ms):7.1f} ms")
+                        print(f"    {s_tool:2s} (threads={th:3d}): median {med:7.1f} ms | min {min(measured_ms):7.1f} ms | max {max(measured_ms):7.1f} ms")
+
+            if "G1" in sweep_tools and g1_shas:
+                all_g1_shas = {sha for shas in g1_shas.values() for sha in shas}
+                if len(all_g1_shas) == 1:
+                    print(f"  --> [Gate D for {scenario.sid}: PASS - 100% deterministic stdout SHA-256 across all {len(g1_shas)} thread counts]")
+                else:
+                    print(f"  --> [Gate D for {scenario.sid}: FAIL - divergent stdout SHA-256 detected: {len(all_g1_shas)} distinct hashes]")
 
     jsonl_fp.close()
 
