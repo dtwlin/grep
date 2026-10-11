@@ -7083,6 +7083,14 @@ main (int argc, char **argv)
 
   init_localeinfo (&localeinfo);
 
+  /* The mbrlen and mbrtowc replacements may cache facts about the
+     locale when first called.  Call mbrlen now, so that worker threads
+     do not race to fill in the cache.  */
+  {
+    mbstate_t mbs; mbszero (&mbs);
+    mbrlen ("", 1, &mbs);
+  }
+
   atexit (clean_up_stdout);
   c_stack_action (nullptr);
 
