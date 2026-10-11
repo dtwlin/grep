@@ -363,6 +363,26 @@ safe_dfaexec (struct dfa *d, char const *begin, char *end,
 
   char stackbuf[4096];
 
+  if (len < 0)
+    {
+      /* When EGexecute prefers the DFA to the keyword matcher, END can
+         be a byte or two before BEGIN.  dfaexec then examines only the
+         line that starts at BEGIN.  Do the same on a private copy that
+         keeps END where it was relative to BEGIN, so that the sentinel
+         is not stored into a buffer that other threads may be reading.  */
+      char const *line_end = rawmemchr (begin, eolbyte);
+      idx_t pre = begin - end;
+      idx_t n = line_end + 1 - end;
+      char *copy = n < (idx_t) sizeof stackbuf ? stackbuf : xmalloc (n + 1);
+      memcpy (copy, end, n);
+      copy[n] = eolbyte;
+      char *res = dfaexec (d, copy + pre, copy, 0, count, backref);
+      char *ret = res ? (char *) begin + (res - (copy + pre)) : nullptr;
+      if (copy != stackbuf)
+        free (copy);
+      return ret;
+    }
+
   if (len >= sizeof stackbuf && end > begin + 1)
     {
       char *prev_nl = memrchr (begin, eolbyte, (end - 1) - begin);
