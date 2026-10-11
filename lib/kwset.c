@@ -171,6 +171,21 @@ struct kwset
   uint32_t dfa_accept;
   unsigned char dfa_class[NCHAR];
 
+  /* Sampling filter that runs ahead of the dense automaton, or null.
+     Every keyword is at least QF_LEAD + QF_Q bytes long, and QF_BITS
+     has the bit for the hash of every QF_Q-byte substring of the first
+     QF_LEAD + QF_Q bytes of every keyword.  So an occurrence that
+     starts in [P, P + QF_LEAD + 1) contains the QF_Q bytes at
+     P + QF_LEAD, and if their bit is clear, no occurrence starts there.
+     If QF_FOLD, bytes are folded by qf_fold_byte before hashing, so
+     that bytes that TRANS maps to the same byte hash alike.  */
+  uint64_t *qf_bits;
+  uint64_t qf_qmask;            /* Selects the first QF_Q bytes of a load.  */
+  idx_t qf_lead;
+  int qf_q;
+  int qf_shift;                 /* Hash shift: 64 - log2 (bits in QF_BITS).  */
+  bool qf_fold;
+
   /* kwsexec implementation.  */
   ptrdiff_t (*kwsexec) (kwset_t, char const *, idx_t, struct kwsmatch *, bool);
 };
@@ -217,6 +232,8 @@ kwsalloc (char const *trans)
 
   kwset->dfa_trans = nullptr;
   kwset->dfa_node = nullptr;
+  kwset->qf_bits = nullptr;
+  kwset->qf_fold = false;
 
   return kwset;
 }
@@ -551,6 +568,104 @@ compute_simd_byte_mask (char const *trans, uint8_t target_byte,
    many transitions.  */
 enum { DFA_MAX_ENTRIES = 1 << 27 };
 
+/* The sampling filter loads this many bytes at a time, so its q-grams
+   are at most this long.  */
+enum { QF_LOAD = 8 };
+
+/* The sampling filter is used only if every keyword is at least this
+   long.  Shorter q-grams are not selective enough to pay off.  */
+enum { QF_MIN_WINDOW = 4 };
+
+/* The filter looks at no more than this many leading bytes of each
+   keyword.  */
+enum { QF_MAX_WINDOW = 64 };
+
+/* Multiplier of the filter's hash function.  */
+#define QF_MULT UINT64_C (0x9E3779B97F4A7C15)
+
+/* Fold the byte B for the filter: drop bit 5 (0x20) of an ASCII byte,
+   which maps an ASCII letter to its upper case, and map every other
+   byte to 0x80.  */
+static unsigned char
+qf_fold_byte (unsigned char b)
+{
+  return b & 0x80 ? 0x80 : b & 0xDF;
+}
+
+/* Fold each of the bytes in X, as qf_fold_byte does.  */
+static inline uint64_t
+qf_fold (uint64_t x)
+{
+  uint64_t hi = x & UINT64_C (0x8080808080808080);
+  uint64_t himask = hi | (hi - (hi >> 7));
+  return (x & ~himask & UINT64_C (0xDFDFDFDFDFDFDFDF)) | hi;
+}
+
+/* Return the filter bit number for the QF_LOAD bytes in X, which have
+   already been folded if necessary.  */
+static inline uint64_t
+qf_hash (uint64_t x, uint64_t qmask, int shift)
+{
+  return ((x & qmask) * QF_MULT) >> shift;
+}
+
+/* Set up the sampling filter of KWSET, if it is likely to help, by
+   choosing its parameters and allocating its empty bitmap.  Return the
+   length of the leading part of each keyword that the filter covers,
+   or 0 if there is no filter.  */
+static idx_t
+qf_init (kwset_t kwset)
+{
+  char const *trans = kwset->trans;
+  idx_t window = MIN (kwset->mind, QF_MAX_WINDOW);
+  if (window < QF_MIN_WINDOW)
+    return 0;
+
+  /* With TRANS, fold bytes before hashing.  This works only if folding
+     maps every byte to the same byte that its translation maps to.  */
+  bool fold = !!trans;
+  if (fold)
+    for (int i = 0; i < NCHAR; i++)
+      if (qf_fold_byte (i) != qf_fold_byte (U(trans[i])))
+        return 0;
+
+  int q = MIN (window, QF_LOAD);
+  idx_t lead = window - q;
+
+  /* Size the bitmap for about one bit set in 256.  Each keyword has at
+     most LEAD + 1 q-grams in its window.  */
+  idx_t nqgrams = MIN (kwset->words, kwset->nodes) * (lead + 1);
+  int log2bits = 12;
+  while (log2bits < 28 && ((idx_t) 1 << log2bits) < nqgrams * 256)
+    log2bits++;
+
+  unsigned char qmask_bytes[QF_LOAD] = { 0 };
+  memset (qmask_bytes, 0xFF, q);
+  memcpy (&kwset->qf_qmask, qmask_bytes, sizeof kwset->qf_qmask);
+  kwset->qf_lead = lead;
+  kwset->qf_q = q;
+  kwset->qf_shift = 64 - log2bits;
+  kwset->qf_fold = fold;
+  kwset->qf_bits = xicalloc ((idx_t) 1 << (log2bits - 6),
+                             sizeof *kwset->qf_bits);
+  return window;
+}
+
+/* Set the filter bit of KWSET for the q-gram that ends at a trie node,
+   given TAIL, the last QF_LOAD labels of the path to that node, with
+   the last label in the most significant byte.  */
+static void
+qf_add (kwset_t kwset, uint64_t tail)
+{
+  unsigned char buf[QF_LOAD] = { 0 };
+  for (int i = 0; i < kwset->qf_q; i++)
+    buf[i] = tail >> (8 * (QF_LOAD - kwset->qf_q + i));
+  uint64_t x;
+  memcpy (&x, buf, sizeof x);
+  uint64_t h = qf_hash (x, kwset->qf_qmask, kwset->qf_shift);
+  kwset->qf_bits[h >> 6] |= (uint64_t) 1 << (h & 63);
+}
+
 /* Store into ROW the transitions along the edges in TREE, given the
    class of each label.  */
 static void
@@ -565,9 +680,10 @@ dfa_set_children (struct tree const *tree, uint32_t *row,
 }
 
 /* Build the dense automaton of KWSET, whose trie and failure function
-   have been computed for Aho-Corasick and whose root is not accepting.
-   Return true if successful, false if the automaton would be too large
-   or if it might not track the trie search exactly.  */
+   have been computed for Aho-Corasick and whose root is not accepting,
+   and set up the sampling filter if it is likely to help.  Return true
+   if successful, false if the automaton would be too large or if it
+   might not track the trie search exactly.  */
 static bool
 kwsprep_dfa (kwset_t kwset)
 {
@@ -583,9 +699,13 @@ kwsprep_dfa (kwset_t kwset)
   idx_t nstates = kwset->nodes;
   if (DFA_MAX_ENTRIES < nstates)
     return false;
+  idx_t window = qf_init (kwset);
+  uint64_t *tail = window ? xinmalloc (nstates, sizeof *tail) : nullptr;
 
-  /* Number the states in level order, accepting states last, and find
-     the labels in use.  */
+  /* Number the states in level order, accepting states last.  Along
+     the way, find the labels in use and set the filter bits of the
+     q-grams of the leading WINDOW bytes of the keywords: a q-gram ends
+     at each node at least QF_Q deep and at most WINDOW deep.  */
   struct trie const **node = xinmalloc (nstates, sizeof *node);
   bool used[NCHAR] = { false };
   idx_t nonaccepting = 0, accepting = nstates;
@@ -595,8 +715,23 @@ kwsprep_dfa (kwset_t kwset)
       t->dfa_state = n;
       node[n] = t;
       if (t->parent)
-        used[t->label] = true;
+        {
+          used[t->label] = true;
+          if (t->depth <= window)
+            {
+              unsigned char b = t->label;
+              if (kwset->qf_fold)
+                b = qf_fold_byte (b);
+              tail[n] = ((tail[t->parent->dfa_state] >> 8)
+                         | ((uint64_t) b << (8 * (QF_LOAD - 1))));
+              if (kwset->qf_q <= t->depth)
+                qf_add (kwset, tail[n]);
+            }
+        }
+      else if (tail)
+        tail[n] = 0;
     }
+  free (tail);
 
   /* Bytes that label no edge share one class, which leads back to the
      root from every state; each label has a class of its own.  */
@@ -610,6 +745,8 @@ kwsprep_dfa (kwset_t kwset)
   if (DFA_MAX_ENTRIES / nclasses < nstates)
     {
       free (node);
+      free (kwset->qf_bits);
+      kwset->qf_bits = nullptr;
       return false;
     }
 
@@ -866,7 +1003,8 @@ kwsprep (kwset_t kwset)
     }
 #endif
 
-  /* For two or more keywords, search with a dense automaton.  */
+  /* For two or more keywords, search with a dense automaton, behind a
+     sampling filter when the keywords are long enough.  */
   if (!reverse && 0 < kwset->mind
 #if defined __AVX2__
       && !kwset->teddy_active
@@ -1360,25 +1498,117 @@ acexec (kwset_t kwset, char const *text, idx_t size,
            : acexec_trans (kwset, text, size, kwsmatch, longest)));
 }
 
-/* Multiple string search with the dense automaton.  This finds the
-   same match as acexec, as the automaton is in the same state as the
-   Aho-Corasick search after every byte.  */
-static ptrdiff_t
-acexec_dfa (kwset_t kwset, char const *text, idx_t len,
-            struct kwsmatch *kwsmatch, bool longest)
+/* Return true if the filter bit of the QF_LOAD bytes at P is set.  */
+static inline bool
+qf_probe (char const *p, uint64_t const *bits, uint64_t qmask, int shift,
+          bool fold)
 {
-  assume (0 <= len);
+  uint64_t x;
+  memcpy (&x, p, sizeof x);
+  if (fold)
+    x = qf_fold (x);
+  uint64_t h = qf_hash (x, qmask, shift);
+  return (bits[h >> 6] >> (h & 63)) & 1;
+}
+
+/* Multiple string search with the dense automaton.  This finds the
+   same match as acexec: the automaton is in the same state as the
+   Aho-Corasick search after every byte, except that the sampling
+   filter lets it skip text where no keyword can start, and it may
+   restart at the root at a point P after which no keyword can start
+   before P; this cannot change the first accepting position, nor the
+   longest keyword ending there.  (inlinable version)  */
+static inline ptrdiff_t
+acexec_dfa_fold (kwset_t kwset, char const *text, idx_t len,
+                 struct kwsmatch *kwsmatch, bool longest, bool fold)
+{
   if (len < kwset->mind)
     return -1;
 
   uint32_t const *dtrans = kwset->dfa_trans;
   unsigned char const *dclass = kwset->dfa_class;
   uint32_t accept = kwset->dfa_accept;
+  char const *lim = text + len;
   idx_t i = 0;
   uint32_t s = 0;
 
-  /* As the trie search does, skip bytes that leave the automaton at
-     the root.  */
+  if (kwset->qf_bits)
+    {
+      uint64_t const *bits = kwset->qf_bits;
+      uint64_t qmask = kwset->qf_qmask;
+      int shift = kwset->qf_shift;
+      idx_t lead = kwset->qf_lead;
+      idx_t stride = lead + 1;
+
+      /* No keyword starts before TEXT + ANCHOR.  */
+      idx_t anchor = 0;
+
+      while (true)
+        {
+          /* The sample at J tells whether a keyword can start
+             in [J - LEAD, J - LEAD + STRIDE).  */
+          idx_t j = anchor + lead;
+          while (j + 3 * stride + QF_LOAD <= len)
+            {
+              bool h0 = qf_probe (text + j, bits, qmask, shift, fold);
+              bool h1 = qf_probe (text + j + stride, bits, qmask, shift, fold);
+              bool h2 = qf_probe (text + j + 2 * stride, bits, qmask, shift,
+                                  fold);
+              bool h3 = qf_probe (text + j + 3 * stride, bits, qmask, shift,
+                                  fold);
+              if (kws_unlikely (h0 | h1 | h2 | h3))
+                {
+                  j += (h0 ? 0 : h1 ? stride : h2 ? 2 * stride : 3 * stride);
+                  goto verify;
+                }
+              j += 4 * stride;
+            }
+          while (j + QF_LOAD <= len)
+            {
+              if (qf_probe (text + j, bits, qmask, shift, fold))
+                goto verify;
+              j += stride;
+            }
+
+          /* Too little text is left to sample; search the rest.  */
+          i = j - lead;
+          break;
+
+        verify:
+          /* Run the automaton from the root at the start of the block
+             until it finds a match, or shows that no keyword starts in
+             the block, i.e., until the bytes consumed since the block
+             start exceed the depth of the state by at least STRIDE.  */
+          {
+            idx_t goal = j - lead + stride;
+            idx_t stop = goal;
+            i = j - lead;
+            s = 0;
+            while (true)
+              {
+                idx_t e = MIN (stop, len);
+                while (i < e)
+                  {
+                    s = dtrans[s + dclass[U(text[i++])]];
+                    if (kws_unlikely (accept <= s))
+                      goto found;
+                  }
+                if (i == len)
+                  return -1;
+                idx_t depth = kwset->dfa_node[s / kwset->dfa_nclasses]->depth;
+                if (goal <= i - depth)
+                  {
+                    anchor = i - depth;
+                    break;
+                  }
+                stop = goal + depth;
+              }
+          }
+        }
+    }
+
+  /* Search the rest of the text from the root.  As the trie search
+     does, skip bytes that leave the automaton at the root.  */
   while (i < len)
     {
       if (kwset->gc1 < 0)
@@ -1407,9 +1637,22 @@ acexec_dfa (kwset_t kwset, char const *text, idx_t len,
   return -1;
 
  found:
-  return ac_match (kwset, kwset->trans, text, text + len, text + i,
+  return ac_match (kwset, kwset->trans, text, lim, text + i,
                    kwset->dfa_node[s / kwset->dfa_nclasses], longest,
                    kwsmatch);
+}
+
+/* Multiple string search with the dense automaton.  */
+static ptrdiff_t
+acexec_dfa (kwset_t kwset, char const *text, idx_t size,
+            struct kwsmatch *kwsmatch, bool longest)
+{
+  assume (0 <= size);
+  /* Help the compiler inline in two ways, depending on whether the
+     filter folds bytes.  */
+  return (kwset->qf_fold
+          ? acexec_dfa_fold (kwset, text, size, kwsmatch, longest, true)
+          : acexec_dfa_fold (kwset, text, size, kwsmatch, longest, false));
 }
 
 ptrdiff_t
@@ -1424,6 +1667,7 @@ kwsfree (kwset_t kwset)
 {
   free (kwset->dfa_trans);
   free (kwset->dfa_node);
+  free (kwset->qf_bits);
   obstack_free (&kwset->obstack, nullptr);
   free (kwset);
 }
