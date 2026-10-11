@@ -216,6 +216,23 @@ def run_edge_case_conformance():
     checks.append(("Dense context match -C 1 75k", ["-C", "1", "-m", "75000", "INFO", SINGLE_FILE], None, None))
     checks.append(("Dense context match -C 1 15k", ["-C", "1", "ERROR_[0-9]{4}_HANDLER", SINGLE_FILE], None, None))
 
+    # 13. Keyword hit on a line that starts just past EGexecute's DFA
+    #     lookahead window, so safe_dfaexec gets an END before BEGIN.
+    #     The large copy (> 2 MiB) exercises the chunked path.
+    dfa_end_text = (b"\nvoid msrs_free(struct msr __percpu *msrs)\n{\n\tfree_percpu(msrs);\n}\n"
+                    b"EXPORT_SYMBOL(msrs_free);\n")
+    dfa_end_small = os.path.join(BENCH_DIR, "regress_dfa_end.c")
+    dfa_end_large = os.path.join(BENCH_DIR, "regress_dfa_end_large.c")
+    with open(dfa_end_small, "wb") as f:
+        f.write(dfa_end_text)
+    with open(dfa_end_large, "wb") as f:
+        f.write(dfa_end_text * 50000)
+    dfa_end_pat = r"EXPORT_SYMBOL(_GPL)?\([a-z_0-9]+\)"
+    checks.append(("DFA end before line start", ["-E", dfa_end_pat, dfa_end_small], None, None))
+    checks.append(("DFA end before line start -o", ["-o", "-E", dfa_end_pat, dfa_end_small], {"GREP_THREADS": "1"}, None))
+    checks.append(("DFA end before line start large -c", ["-c", "-E", dfa_end_pat, dfa_end_large], None, None))
+    checks.append(("DFA end before line start large -n", ["-n", "-E", dfa_end_pat, dfa_end_large], {"GREP_THREADS": "16"}, None))
+
     passed = 0
     total = len(checks)
     for name, args, env_vars, preexec in checks:
