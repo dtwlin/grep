@@ -1998,6 +1998,8 @@ grepbuf (char *beg, char const *lim)
   return outleft0 - outleft;
 }
 
+static void walk_maybe_recruit (void);
+
 /* Search a given (non-directory) file.  Return a count of lines printed.
    Set *INEOF to true if end-of-file reached.  */
 static intmax_t
@@ -2128,6 +2130,10 @@ grep (int fd, struct stat const *st, bool *ineof)
           suppressible_error (errno);
           goto finish_grep;
         }
+
+      /* A traversal that has not recruited the worker threads yet should
+         not wait for the end of a long file to do so.  */
+      walk_maybe_recruit ();
     }
   if (residue)
     {
@@ -3247,6 +3253,19 @@ cleanup_slice_freelist (void)
 
 static int pool_nthreads;
 static pthread_t *pool_threads;
+
+/* The number of worker threads to use, and whether they have been
+   started.  Workers start only when there is work for them; a
+   directory traversal first runs on the main thread alone and recruits
+   them only if it lasts long enough, so that small trees and early exits
+   do not pay for starting and stopping threads.  */
+static int pool_target;
+static bool pool_started;
+
+/* The number of entries of POOL_THREADS that have been filled in, and
+   whether the thread that creates the workers should stop.  */
+static atomic_int pool_created;
+static atomic_bool pool_stop_spawning;
 static bool overall_status = true;
 
 static intmax_t chunk_accumulated_count = 0;
@@ -4085,11 +4104,14 @@ struct producer_batch_item
 static struct producer_batch_item producer_batch[PRODUCER_BATCH_SIZE];
 static size_t producer_batch_count = 0;
 
+static void ensure_pool (void);
+
 static void
 producer_flush_batch (void)
 {
   if (producer_batch_count == 0)
     return;
+  ensure_pool ();
 
   pthread_mutex_lock (&pool_mutex);
 
@@ -4163,6 +4185,7 @@ static void
 producer_enqueue_stdin (void)
 {
   producer_flush_batch ();
+  ensure_pool ();
   pthread_mutex_lock (&pool_mutex);
 
   uint64_t seq = producer_alloc_slot_locked ();
@@ -4517,6 +4540,7 @@ static void stream_slicer_stdin (void);
 static void
 chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st_in)
 {
+  ensure_pool ();
   struct stat st;
   if (st_in)
     st = *st_in;
@@ -4916,6 +4940,7 @@ stream_slicer_stdin (void)
   fcntl (STDIN_FILENO, F_SETPIPE_SZ, 1024 * 1024);
 #endif
   stream_commit_totalnl = 0;
+  ensure_pool ();
 
   struct stat st;
   if (fstat (STDIN_FILENO, &st) == 0)
@@ -5261,6 +5286,20 @@ static struct
     .fd_mu = PTHREAD_MUTEX_INITIALIZER,
     .commit_mu = PTHREAD_MUTEX_INITIALIZER,
   };
+
+/* Whether the worker threads were asked to join the current traversal,
+   when it started, and whether the current thread is the main thread,
+   which recruits them.  */
+static bool walk_recruited;
+static struct timespec walk_start;
+static _Thread_local bool walk_is_main;
+
+/* The main thread traverses alone for this many nanoseconds before it
+   recruits the worker threads.  Searches that end sooner, such as -q
+   with an early match, then never start them.  */
+#ifndef WALK_RECRUIT_NS
+# define WALK_RECRUIT_NS (1000 * 1000)
+#endif
 
 /* Per-thread buffers for names and directory entries.  */
 static _Thread_local char *walk_pbuf;
@@ -6127,6 +6166,43 @@ walk_push_dir (struct walk_dir *d)
     free (v);
 }
 
+/* Ask the worker threads to join traversal number GEN.  */
+static void
+walk_recruit (unsigned int gen)
+{
+  walk_recruited = true;
+  ensure_pool ();
+  pthread_mutex_lock (&pool_mutex);
+  for (int i = 0; i < pool_nthreads; i++)
+    {
+      while (q_count >= WORK_QUEUE_CAP)
+        pthread_cond_wait (&q_not_full_cv, &pool_mutex);
+      work_queue[q_tail] = (struct work_task) { .type = TASK_TYPE_WALK,
+                                                .seq = gen };
+      q_tail = (q_tail + 1) % WORK_QUEUE_CAP;
+      q_count++;
+    }
+  pthread_cond_broadcast (&q_not_empty_cv);
+  pthread_mutex_unlock (&pool_mutex);
+}
+
+/* If the current thread is the main thread and it has traversed alone
+   for long enough, recruit the worker threads.  */
+static void
+walk_maybe_recruit (void)
+{
+  if (walk_is_main && !walk_recruited)
+    {
+      struct timespec now;
+      clock_gettime (CLOCK_MONOTONIC, &now);
+      if (WALK_RECRUIT_NS <= ((now.tv_sec - walk_start.tv_sec) * 1000000000
+                              + now.tv_nsec - walk_start.tv_nsec))
+        walk_recruit (walk.gen);
+    }
+}
+
+static void walk_commit (void);
+
 /* Search the files of task T.  */
 static void
 walk_search_files (struct walk_task *t)
@@ -6152,6 +6228,12 @@ walk_search_files (struct walk_task *t)
             }
         }
       atomic_store_explicit (&e->done, true, memory_order_release);
+
+      /* With -q, a match may end the search; do not wait for the rest
+         of the batch before committing it.  */
+      if (exit_on_match && !e->status)
+        walk_commit ();
+      walk_maybe_recruit ();
     }
 }
 
@@ -6334,6 +6416,7 @@ walk_participate (unsigned int gen)
       pthread_mutex_unlock (&walk.mu);
       walk_run_task (t);
       walk_commit ();
+      walk_maybe_recruit ();
       pthread_mutex_lock (&walk.mu);
       walk.running--;
     }
@@ -6351,7 +6434,7 @@ walk_fd_cap (void)
   if (getrlimit (RLIMIT_NOFILE, &rl) == 0)
     lim = rl.rlim_cur == RLIM_INFINITY ? LONG_MAX : rl.rlim_cur;
   /* Leave room for the standard streams, a file per thread and more.  */
-  long cap = lim - (pool_nthreads + 1) - 16;
+  long cap = lim - (pool_target + 1) - 16;
 #ifdef WALK_FD_CAP_MAX
   /* For testing the handling of descriptor shortages.  */
   cap = MIN (cap, WALK_FD_CAP_MAX);
@@ -6404,23 +6487,19 @@ walk_run (char const *dir)
   walk_heap_push (&walk.reads, t);
   pthread_mutex_unlock (&walk.mu);
 
-  /* Let the worker threads join.  */
-  pthread_mutex_lock (&pool_mutex);
-  for (int i = 0; i < pool_nthreads; i++)
-    {
-      while (q_count >= WORK_QUEUE_CAP)
-        pthread_cond_wait (&q_not_full_cv, &pool_mutex);
-      work_queue[q_tail] = (struct work_task) { .type = TASK_TYPE_WALK,
-                                                .seq = gen };
-      q_tail = (q_tail + 1) % WORK_QUEUE_CAP;
-      q_count++;
-    }
-  pthread_cond_broadcast (&q_not_empty_cv);
-  pthread_mutex_unlock (&pool_mutex);
+  /* If the worker threads are running anyway, let them join now.
+     Otherwise start alone; see WALK_RECRUIT_NS.  */
+  walk_recruited = false;
+  if (pool_started || WALK_RECRUIT_NS <= 0)
+    walk_recruit (gen);
+  else
+    clock_gettime (CLOCK_MONOTONIC, &walk_start);
 
   bool saved_buffering = buffering_enabled;
   buffering_enabled = true;
+  walk_is_main = true;
   walk_participate (gen);
+  walk_is_main = false;
   buffering_enabled = saved_buffering;
 
   pthread_mutex_lock (&walk.mu);
@@ -6437,7 +6516,7 @@ producer_run (char *const *files)
       if (STREQ (*f, "-"))
         {
           struct stat st;
-          if (pool_nthreads > 1 && !isatty (STDIN_FILENO)
+          if (pool_target > 1 && !isatty (STDIN_FILENO)
               && fstat (STDIN_FILENO, &st) == 0
               && S_ISREG (st.st_mode)
               && st.st_size >= 2 * 1024 * 1024
@@ -6447,7 +6526,7 @@ producer_run (char *const *files)
             {
               chunked_grep_fd (STDIN_FILENO, false, label ? label : _("(standard input)"), &st);
             }
-          else if (pool_nthreads > 1 && !isatty (STDIN_FILENO)
+          else if (pool_target > 1 && !isatty (STDIN_FILENO)
                    && out_before <= 0 && out_after <= 0 && max_count == INTMAX_MAX)
             stream_slicer_stdin ();
           else
@@ -6463,7 +6542,7 @@ producer_run (char *const *files)
 
               if (S_ISDIR (st.st_mode) && directories == RECURSE_DIRECTORIES)
                 walk_run (*f);
-              else if (S_ISREG (st.st_mode) && st.st_size >= 2 * 1024 * 1024 && pool_nthreads > 1
+              else if (S_ISREG (st.st_mode) && st.st_size >= 2 * 1024 * 1024 && pool_target > 1
                        && (!out_invert || (out_before <= 0 && out_after <= 0)))
                 chunked_grep_file (*f, &st);
               else
@@ -6476,42 +6555,59 @@ producer_run (char *const *files)
   producer_flush_batch ();
 }
 
+/* Create the worker threads other than the first, then work like
+   them.  Creating threads takes a while, so the first worker does it
+   instead of the thread that needed the workers.  */
+static void *
+pool_spawner (void *arg)
+{
+  pthread_attr_t attr;
+  pthread_attr_init (&attr);
+  pthread_attr_setstacksize (&attr, 1024 * 1024);
+  for (int i = 1; i < pool_nthreads; i++)
+    {
+      if (atomic_load (&pool_stop_spawning)
+          || pthread_create (&pool_threads[i], &attr, worker_thread_func,
+                             nullptr) != 0)
+        break;
+      atomic_store (&pool_created, i + 1);
+    }
+  pthread_attr_destroy (&attr);
+  return worker_thread_func (arg);
+}
+
 static void
 start_worker_pool (int nthreads)
 {
+  pool_started = true;
   pool_nthreads = nthreads;
   pool_threads = xnmalloc (pool_nthreads, sizeof *pool_threads);
   pool_terminate = false;
-  next_seq = 0;
-  commit_seq = 0;
-  q_head = q_tail = q_count = 0;
-  overall_status = true;
-  stream_commit_totalnl = 0;
 
   pthread_attr_t attr;
   pthread_attr_init (&attr);
   pthread_attr_setstacksize (&attr, 1024 * 1024);
-
-  int created = 0;
-  for (int i = 0; i < pool_nthreads; ++i)
-    {
-      if (pthread_create (&pool_threads[i], &attr, worker_thread_func, NULL) == 0)
-        created++;
-      else
-        break;
-    }
-  pthread_attr_destroy (&attr);
-
-  if (created == 0 && pool_nthreads > 0)
-    pool_nthreads = 0;
+  if (pthread_create (&pool_threads[0], &attr, pool_spawner, nullptr) == 0)
+    atomic_store (&pool_created, 1);
   else
-    pool_nthreads = created;
+    pool_nthreads = 0;
+  pthread_attr_destroy (&attr);
+}
+
+/* Start the worker threads if they are not running yet.  */
+static void
+ensure_pool (void)
+{
+  if (!pool_started)
+    start_worker_pool (pool_target);
 }
 
 static void
 finish_worker_pool (void)
 {
   producer_flush_batch ();
+  if (!pool_started)
+    return;
   pthread_mutex_lock (&pool_mutex);
   while (commit_seq < next_seq)
     {
@@ -6530,13 +6626,19 @@ finish_worker_pool (void)
   pthread_cond_broadcast (&slice_avail_cv);
   pthread_mutex_unlock (&pool_mutex);
 
-  for (int i = 0; i < pool_nthreads; ++i)
-    pthread_join (pool_threads[i], NULL);
+  /* Join the first worker first: once it has exited, it has created
+     all the threads it will create.  */
+  atomic_store (&pool_stop_spawning, true);
+  if (0 < pool_nthreads)
+    pthread_join (pool_threads[0], nullptr);
+  int created = atomic_load (&pool_created);
+  for (int i = 1; i < created; ++i)
+    pthread_join (pool_threads[i], nullptr);
 
   cleanup_slice_freelist ();
 
   free (pool_threads);
-  pool_threads = NULL;
+  pool_threads = nullptr;
   pool_nthreads = 0;
 }
 
@@ -7195,7 +7297,7 @@ main (int argc, char **argv)
       return errseen ? EXIT_TROUBLE : status;
     }
 
-  start_worker_pool (nthreads);
+  pool_target = nthreads;
   producer_run (files);
   finish_worker_pool ();
 
