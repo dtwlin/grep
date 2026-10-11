@@ -4039,12 +4039,13 @@ worker_thread_func (void *arg)
                 }
             }
 
+          /* Count the chunk under DONE_MUTEX and do not touch STATE
+             afterwards: once the last chunk is counted, the producer
+             may go on to free STATE.  */
+          pthread_mutex_lock (&state->done_mutex);
           if (atomic_fetch_add (&state->chunks_completed, 1) == state->num_chunks - 1)
-            {
-              pthread_mutex_lock (&state->done_mutex);
-              pthread_cond_signal (&state->done_cv);
-              pthread_mutex_unlock (&state->done_mutex);
-            }
+            pthread_cond_signal (&state->done_cv);
+          pthread_mutex_unlock (&state->done_mutex);
 
           pthread_mutex_lock (&pool_mutex);
           continue;
