@@ -648,13 +648,25 @@ format_message (char *buf, size_t bufsize, char const *fmt, va_list ap)
   return buf;
 }
 
+/* The program name that error () outputs before each diagnostic.
+   glibc uses argv[0] as given; gnulib's replacement uses getprogname.  */
+static char const *
+diag_program_name (void)
+{
+#ifdef __GLIBC__
+  return program_invocation_name;
+#else
+  return getprogname ();
+#endif
+}
+
 /* Return a newly allocated copy of the diagnostic that
    error (0, ERRNUM, "%s", MSG) would output, and store its length into
    *LENP.  */
 static char *
 diagnostic_text (int errnum, char const *msg, size_t *lenp)
 {
-  char const *prog = getprogname ();
+  char const *prog = diag_program_name ();
   char const *err = errnum ? strerror (errnum) : nullptr;
   size_t proglen = strlen (prog), msglen = strlen (msg);
   size_t errlen = err ? strlen (err) : 0;
