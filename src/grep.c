@@ -6988,10 +6988,14 @@ start_worker_pool (int nthreads)
   pthread_attr_t attr;
   pthread_attr_init (&attr);
   pthread_attr_setstacksize (&attr, 1024 * 1024);
-  if (pthread_create (&pool_threads[0], &attr, pool_spawner, nullptr) == 0)
-    atomic_store (&pool_created, 1);
-  else
-    pool_nthreads = 0;
+  /* Count the first worker before it starts: it raises the count as it
+     creates the others, possibly before pthread_create returns here.  */
+  atomic_store (&pool_created, 1);
+  if (pthread_create (&pool_threads[0], &attr, pool_spawner, nullptr) != 0)
+    {
+      atomic_store (&pool_created, 0);
+      pool_nthreads = 0;
+    }
   pthread_attr_destroy (&attr);
 }
 
