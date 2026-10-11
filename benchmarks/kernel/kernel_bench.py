@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -358,6 +359,31 @@ def detect_numa_node(affinity_cpus: List[int]) -> str:
     return ",".join(nodes) if nodes else "unknown"
 
 
+def sample_peak_threads(argv: List[str], cwd: Optional[str], env: Dict[str, str],
+                        timeout: float = 120.0) -> int:
+    """Run ARGV and return the largest 'Threads:' value of its /proc status."""
+    peak = 0
+    with open(os.devnull, "rb") as stdin_fp, tempfile.TemporaryFile() as out_fp:
+        proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=stdin_fp,
+                                stdout=out_fp, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + timeout
+        status_path = f"/proc/{proc.pid}/status"
+        while proc.poll() is None and time.monotonic() < deadline:
+            try:
+                with open(status_path) as f:
+                    for line in f:
+                        if line.startswith("Threads:"):
+                            peak = max(peak, int(line.split()[1]))
+                            break
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.001)
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+    return peak
+
+
 def capture_env_metadata(
     ksrc: str,
     kbench_dir: str,
@@ -436,13 +462,33 @@ def capture_env_metadata(
     except Exception:
         meta["linux_version"] = "unknown"
 
-    empirical_threads = {
-        "G0": 1,
-        "G1": min(aff_count, 32) + 1 if "G1" in binaries else 33,
-        "R0": min(aff_count, 12) + 1 if "R0" in binaries else 13,
-        "G2": 1,
-        "X1": 129,
+    # Default thread counts, measured: each tool runs a zero-match tree
+    # scan while /proc/PID/status is sampled for its peak thread count
+    # (main thread included).  stdout goes to a temporary regular file,
+    # because GNU grep stops at the first match when it writes to /dev/null.
+    probe = "ZZ_NO_SUCH_SYMBOL_0xDEADBEEF"
+    probe_env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": os.environ.get("HOME", "/"),
+        "LC_ALL": "en_US.UTF-8",
+        "RIPGREP_CONFIG_PATH": "",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
     }
+    empirical_threads: Dict[str, Optional[int]] = {}
+    for tool_name, bin_path in binaries.items():
+        cwd = None
+        if tool_name == "R0":
+            argv = [bin_path, "-uu", "-g", "!.git", "-F", probe, ksrc]
+        elif tool_name == "X1":
+            argv = [bin_path, "grep", "-F", probe]
+            cwd = ksrc
+        else:
+            argv = [bin_path, "-r", "--exclude-dir=.git", "-F", probe, ksrc]
+        try:
+            empirical_threads[tool_name] = sample_peak_threads(argv, cwd, probe_env)
+        except OSError:
+            empirical_threads[tool_name] = None
     meta["empirical_default_threads"] = empirical_threads
 
     # Binary metadata
