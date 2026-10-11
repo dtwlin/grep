@@ -3060,6 +3060,9 @@ struct rob_slot
   intmax_t stream_first_rel_nl;
   off_t stream_totalcc;
 
+  /* True if the slice has a null byte; the committer then searches it.  */
+  bool stream_has_nul;
+
   char inline_out[1024];
 };
 
@@ -3096,7 +3099,6 @@ struct work_task
   intmax_t chunk_lineno_offset;
   bool chunk_free_data;
   bool is_last_chunk;
-  bool is_binary_stream;
   size_t chunk_idx;
   void *shared_state;
 };
@@ -3186,8 +3188,6 @@ static char *slice_freelist[SLICE_POOL_CAP];
 static int slice_freelist_cnt = 0;
 static pthread_cond_t slice_avail_cv = PTHREAD_COND_INITIALIZER;
 
-static _Atomic bool binary_stream_reported;
-
 static char *
 alloc_slice_buf_locked (void)
 {
@@ -3248,6 +3248,12 @@ static intmax_t chunk_accumulated_count = 0;
 static bool chunk_has_any_match = false;
 static bool chunk_enc_error = false;
 static intmax_t stream_commit_totalnl = 0;
+
+/* Whether the committed part of standard input read in slices contains
+   a null byte, and whether a line matched after the point where
+   single-threaded grep would have started treating it as binary.  */
+static bool stream_binary;
+static bool stream_binary_match;
 
 /* Output the group separator, as prtext does.  */
 static void
@@ -3405,6 +3411,114 @@ rob_search_deferred (struct rob_slot *slot)
   buffering_enabled = saved_buffering;
 }
 
+/* Commit the slice of standard input in SLOT in the light of null
+   bytes.  From the start of the read buffer that holds the first null
+   byte of the input, single-threaded grep outputs nothing more, stops
+   at the next match (which it reports at the end), and turns null bytes
+   into line ends.  How much a read from a pipe returns varies; suppose
+   that each read filled the buffer, as with a regular file.  */
+static void
+stream_commit_binary (struct rob_slot *slot)
+{
+  /* What a worker output from the slice does not count.  */
+  free (slot->stdout_buf);
+  slot->stdout_buf = nullptr;
+  slot->stdout_len = 0;
+  free (slot->big);
+  slot->big = nullptr;
+  slot->nbig = 0;
+  slot->enc_error = false;
+
+  if (!slot->stream_chunk_data)
+    {
+      /* A worker searched the slice, which has no null byte, and its
+         count and status hold.  */
+      if (!count_matches && !slot->status)
+        stream_binary_match = true;
+      return;
+    }
+
+  char *beg = slot->stream_chunk_data;
+  char *lim = beg + slot->stream_chunk_len;
+  char *from = beg;
+  if (!stream_binary)
+    {
+      char *z = memchr (beg, '\0', lim - beg);
+      idx_t readsize = ALIGN_TO (GOOD_READSIZE_MIN, pagesize);
+      intmax_t boundary = ((slot->stream_totalcc + (z - beg))
+                           / readsize * readsize);
+      if (slot->stream_totalcc < boundary)
+        {
+          char *eol = memrchr (beg, eolbyte, boundary - slot->stream_totalcc);
+          if (eol)
+            from = eol + 1;
+        }
+      stream_binary = true;
+    }
+  zap_nuls (from, lim, eolbyte);
+
+  char const *saved_filename = filename;
+  char *saved_bufbeg = bufbeg;
+  char *saved_buflim = buflim;
+  off_t saved_totalcc = totalcc;
+  intmax_t saved_totalnl = totalnl;
+  char const *saved_lastnl = lastnl;
+  char *saved_lastout = lastout;
+  intmax_t saved_outleft = outleft;
+  idx_t saved_pending = pending;
+  bool saved_buffering_enabled = buffering_enabled;
+  bool saved_out_quiet = out_quiet;
+  bool saved_done_on_match = done_on_match;
+  bool saved_encoding_error_output = encoding_error_output;
+
+  buffering_enabled = false;
+  filename = label;
+  bufbeg = beg;
+  buflim = lim;
+  totalcc = slot->stream_totalcc;
+  totalnl = stream_commit_totalnl;
+  lastnl = beg;
+  lastout = nullptr;
+  outleft = max_count;
+  pending = 0;
+  out_quiet = initial_out_quiet;
+  done_on_match = initial_done_on_match;
+  encoding_error_output = false;
+
+  intmax_t n = beg < from ? grepbuf (beg, from) : 0;
+  slot->enc_error = (binary_files == BINARY_BINARY_FILES && !out_quiet
+                     && encoding_error_output);
+  if (!count_matches)
+    {
+      out_quiet = true;
+      done_on_match = true;
+    }
+  intmax_t nb = grepbuf (from, lim);
+  if (!count_matches && 0 < nb)
+    stream_binary_match = true;
+  slot->chunk_count = count_matches ? n + nb : 0;
+  slot->status = n + nb == 0;
+  slot->chunk_nls = count_newlines (beg, lim);
+
+  filename = saved_filename;
+  bufbeg = saved_bufbeg;
+  buflim = saved_buflim;
+  totalcc = saved_totalcc;
+  totalnl = saved_totalnl;
+  lastnl = saved_lastnl;
+  lastout = saved_lastout;
+  outleft = saved_outleft;
+  pending = saved_pending;
+  buffering_enabled = saved_buffering_enabled;
+  out_quiet = saved_out_quiet;
+  done_on_match = saved_done_on_match;
+  encoding_error_output = saved_encoding_error_output;
+
+  free_slice_buf_locked (slot->stream_chunk_alloc);
+  slot->stream_chunk_alloc = nullptr;
+  slot->stream_chunk_data = nullptr;
+}
+
 static void
 rob_try_commit_locked (void)
 {
@@ -3433,7 +3547,9 @@ rob_try_commit_locked (void)
 
       if (slot->is_stream_chunk)
         {
-          if (slot->stream_chunk_data != nullptr)
+          if (slot->stream_has_nul || stream_binary)
+            stream_commit_binary (slot);
+          else if (slot->stream_chunk_data != nullptr)
             {
               char const *saved_filename = filename;
               char *saved_bufbeg = bufbeg;
@@ -3539,10 +3655,14 @@ rob_try_commit_locked (void)
                 }
 
               slot->status = !chunk_has_any_match;
-              binary_message = chunk_enc_error;
+              binary_message = (chunk_enc_error
+                                || (stream_binary_match
+                                    && binary_files == BINARY_BINARY_FILES
+                                    && !initial_out_quiet));
               chunk_accumulated_count = 0;
               chunk_has_any_match = false;
               chunk_enc_error = false;
+              stream_binary = stream_binary_match = false;
             }
           else
             {
@@ -3955,7 +4075,29 @@ worker_thread_func (void *arg)
               while ((num /= 10) != 0);
             }
 
-          if (out_line && !out_quiet && !task.is_binary_stream && !count_matches && list_files == LISTFILES_NONE)
+          /* Whether and how a slice with a null byte is output
+             depends on what precedes it, which only the committer
+             knows; leave such a slice to it.  */
+          if (eolbyte && binary_files != TEXT_BINARY_FILES
+              && memchr (bufbeg, '\0', buflim - bufbeg))
+            {
+              pthread_mutex_lock (&pool_mutex);
+              struct rob_slot *slot = &rob[task.seq % ROB_CAP];
+              slot->is_chunk = true;
+              slot->is_last_chunk = task.is_last_chunk;
+              slot->is_stream_chunk = true;
+              slot->stream_has_nul = true;
+              slot->stream_chunk_alloc = (char *) (task.chunk_data - 1);
+              slot->stream_chunk_data = bufbeg;
+              slot->stream_chunk_len = task.chunk_len;
+              slot->stream_totalcc = task.chunk_totalcc;
+              slot->status = true;
+              slot->state = ROB_SLOT_DONE;
+              rob_try_commit_locked ();
+              continue;
+            }
+
+          if (out_line && !out_quiet && !count_matches && list_files == LISTFILES_NONE)
             {
               intmax_t chunk_nls = count_newlines (bufbeg, buflim);
               if (!out_invert)
@@ -4030,21 +4172,6 @@ worker_thread_func (void *arg)
                   rob_try_commit_locked ();
                   continue;
                 }
-            }
-          else if (task.is_binary_stream)
-            {
-              out_quiet = true;
-              done_on_match = true;
-              intmax_t lines_matched = grepbuf (bufbeg, buflim);
-              if (lines_matched > 0)
-                {
-                  if (!atomic_exchange (&binary_stream_reported, true))
-                    task_error (0, _("%s: binary file matches"),
-                                label ? label : _("(standard input)"));
-                  status = false;
-                }
-              else
-                status = true;
             }
           else if (count_matches)
             {
@@ -4149,6 +4276,7 @@ worker_thread_func (void *arg)
         {
           slot->is_chunk = true;
           slot->is_last_chunk = task.is_last_chunk;
+          slot->is_stream_chunk = task.type == TASK_TYPE_STREAM_CHUNK;
         }
 
       if (tls_out.len > 0)
@@ -4849,7 +4977,7 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
           producer_enqueue_file (fname, true, true);
         }
       else
-        stream_slicer_stdin ();
+        producer_enqueue_stdin ();
       return;
     }
 
@@ -4864,7 +4992,7 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
           producer_enqueue_file (fname, true, true);
         }
       else
-        stream_slicer_stdin ();
+        producer_enqueue_stdin ();
       return;
     }
 
@@ -5205,6 +5333,7 @@ stream_slicer_stdin (void)
   fcntl (STDIN_FILENO, F_SETPIPE_SZ, 1024 * 1024);
 #endif
   stream_commit_totalnl = 0;
+  stream_binary = stream_binary_match = false;
   ensure_pool ();
 
   struct stat st;
@@ -5225,7 +5354,6 @@ stream_slicer_stdin (void)
   size_t residue_len = 0;
   intmax_t stream_totalcc = 0;
   bool is_first_chunk = true;
-  bool is_binary = false;
 
   while (true)
     {
@@ -5277,35 +5405,7 @@ stream_slicer_stdin (void)
           break;
         }
 
-      if (is_first_chunk)
-        {
-          is_first_chunk = false;
-          if (eolbyte && binary_files != TEXT_BINARY_FILES
-              && buf_has_nulls (chunk_data, total_in_buf))
-            {
-              if (binary_files == WITHOUT_MATCH_BINARY_FILES)
-                {
-                  pthread_mutex_lock (&pool_mutex);
-                  free_slice_buf_locked (chunk_alloc);
-                  uint64_t seq = producer_alloc_slot_locked ();
-                  struct rob_slot *slot = &rob[seq % ROB_CAP];
-                  slot->status = true;
-                  slot->errseen = false;
-                  slot->had_prtext = false;
-                  slot->is_chunk = true;
-                  slot->is_last_chunk = true;
-                  slot->filename = label ? xstrdup (label) : nullptr;
-                  slot->state = ROB_SLOT_DONE;
-                  rob_try_commit_locked ();
-                  pthread_mutex_unlock (&pool_mutex);
-                  break;
-                }
-              is_binary = true;
-            }
-        }
-
-      if (is_binary)
-        zap_nuls (chunk_data, chunk_data + total_in_buf, eolbyte);
+      is_first_chunk = false;
 
       size_t chunk_len = 0;
       size_t next_residue = 0;
@@ -5393,7 +5493,6 @@ stream_slicer_stdin (void)
       t->chunk_lineno_offset = 0;
       t->chunk_free_data = true;
       t->is_last_chunk = is_eof;
-      t->is_binary_stream = is_binary;
       t->shared_state = nullptr;
 
       q_tail = (q_tail + 1) % WORK_QUEUE_CAP;
@@ -6792,7 +6891,8 @@ producer_run (char *const *files)
               chunked_grep_fd (STDIN_FILENO, false, label ? label : _("(standard input)"), &st);
             }
           else if (pool_target > 1 && !isatty (STDIN_FILENO)
-                   && out_before <= 0 && out_after <= 0 && max_count == INTMAX_MAX)
+                   && out_before <= 0 && out_after <= 0 && max_count == INTMAX_MAX
+                   && binary_files != WITHOUT_MATCH_BINARY_FILES)
             stream_slicer_stdin ();
           else
             producer_enqueue_stdin ();
@@ -7517,7 +7617,8 @@ main (int argc, char **argv)
   bool can_slice_stdin = (!isatty (STDIN_FILENO)
                           && (!stdin_is_reg || (in_st.st_size >= 2 * 1024 * 1024 && !SAME_INODE (in_st, out_stat)))
                           && out_before <= 0 && out_after <= 0
-                          && max_count == INTMAX_MAX);
+                          && max_count == INTMAX_MAX
+                          && binary_files != WITHOUT_MATCH_BINARY_FILES);
   bool can_parallelize_stdin = (!isatty (STDIN_FILENO)
                                 && (stdin_is_large_reg || can_slice_stdin));
   bool is_single_large_file = (single_operand

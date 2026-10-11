@@ -314,15 +314,19 @@ LARGE_FILES = {
     "nul_tail.txt": {199999: b"needle at the end \0 and no newline"},
 }
 
+# Option sets whose results for files with null bytes do not depend on
+# how much each read from a pipe returns.
+LARGE_PIPE_SAFE_SETS = [["-c"], ["-c", "-v"], ["-l"], ["-L"], ["-q"], ["-a"]]
+
 
 def large_pipe_ok(name, opts):
     """Whether what single-threaded grep outputs for the large file NAME
     with OPTS does not depend on how much each read from a pipe returns.
     After omitting a line with an encoding error, the context it prints
     depends on where its buffers end, and so does what it does after
-    reading a null byte."""
+    reading a null byte, unless only counts or file names are output."""
     if name.startswith("nul"):
-        return False
+        return opts in LARGE_PIPE_SAFE_SETS
     if name.startswith("enc"):
         return not any(o[:2] in ("-A", "-B", "-C") and o[2:] != "0"
                        for o in opts)
