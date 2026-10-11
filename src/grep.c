@@ -1214,6 +1214,11 @@ static bool skip_empty_lines;	/* Skip empty lines in data.  */
 static _Thread_local intmax_t totalnl;	/* Total newline count before lastnl. */
 static _Thread_local bool buffer_is_mmap;
 
+/* True if the current input is known to be at end of file, because a
+   single read returned the whole of a nonempty regular file and left
+   room in the buffer.  The read that would return 0 is then skipped.  */
+static _Thread_local bool eof_known;
+
 /* Minimum value for good_readsize.
    If it's too small, there are more syscalls;
    if too large, it wastes memory and likely cache.
@@ -1338,6 +1343,7 @@ reset (int fd, struct stat const *st)
   bufbeg = buflim = ALIGN_TO (buffer + 1, pagesize);
   bufbeg[-1] = eolbyte;
   bufdesc = fd;
+  eof_known = false;
 #ifdef F_SETPIPE_SZ
   if (fd == STDIN_FILENO)
     fcntl (STDIN_FILENO, F_SETPIPE_SZ, 1024 * 1024);
@@ -1434,11 +1440,22 @@ fillbuf (idx_t save, struct stat const *st)
 
   while (true)
     {
-      fillsize = safe_read (bufdesc, readbuf, good_readsize);
-      if (fillsize < 0)
+      if (eof_known)
+        fillsize = 0;
+      else
         {
-          fillsize = 0;
-          cc = false;
+          fillsize = safe_read (bufdesc, readbuf, good_readsize);
+          if (fillsize < 0)
+            {
+              fillsize = 0;
+              cc = false;
+            }
+          /* Pseudo-files may report sizes of 0 or 4096, and files may
+             grow, so trust the size only if one read returned exactly
+             that many bytes and was not limited by the buffer.  */
+          else if (S_ISREG (st->st_mode) && 0 < st->st_size
+                   && fillsize == st->st_size && fillsize < good_readsize)
+            eof_known = true;
         }
       bufoffset += fillsize;
 
