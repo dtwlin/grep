@@ -438,7 +438,7 @@ def capture_env_metadata(
 
     empirical_threads = {
         "G0": 1,
-        "G1": min(aff_count, 16) + 1 if "G1" in binaries else 17,
+        "G1": min(aff_count, 32) + 1 if "G1" in binaries else 33,
         "R0": min(aff_count, 12) + 1 if "R0" in binaries else 13,
         "G2": 1,
         "X1": 129,
