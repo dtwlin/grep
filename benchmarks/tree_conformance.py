@@ -249,6 +249,19 @@ def build_fifo_tree(root):
     write_file(os.path.join(root, "z.txt"), "needle z\n")
 
 
+def build_many_tree(root, count=48):
+    """Files whose output with -o is larger than the initial output
+    buffer of a worker thread, so that buffers grow and change hands
+    while other threads do the same."""
+    os.makedirs(root)
+    for i in range(count):
+        lines = []
+        for k in range(1500 + 97 * i):
+            lines.append(f"{k} needle{'.' * (k % 7)} needle {i} needle\n"
+                         if k % 3 else f"{k} plain line {i}\n")
+        write_file(os.path.join(root, f"f{i:03d}.txt"), "".join(lines))
+
+
 def fix_perms_for_removal(root):
     for dirpath, dirnames, filenames in os.walk(root):
         for d in dirnames:
@@ -491,8 +504,24 @@ def main():
             remove_tree(fifo_root)
         if not os.path.exists(fifo_root):
             build_fifo_tree(fifo_root)
+        many = os.path.join(wd, "many")
+        if args.rebuild:
+            remove_tree(many)
+        if not os.path.exists(many):
+            build_many_tree(many)
 
         r.pattern = PATTERN
+
+        # Large outputs from many file operands and from a traversal;
+        # with a sanitizer build, this checks how threads hand over
+        # output buffers.
+        log(f"[{wd}] large outputs")
+        many_files = sorted(os.path.join("many", f) for f in os.listdir(many))
+        for opts in ([], ["-o"], ["-n", "-o"], ["-b", "-o"], ["-c"],
+                     ["--color=always"]):
+            r.compare("many-operands", opts, many_files, cwd=wd)
+        for opts in (["-o"], ["-n"]):
+            r.compare("many-r", ["-r"] + opts, ["many"], cwd=wd)
         sets = BASE_OPTION_SETS + ([] if args.quick else EXTRA_OPTION_SETS)
         for mode in ("-r", "-R"):
             log(f"[{wd}] adversarial tree, {mode}")

@@ -466,7 +466,6 @@ struct membuf
   char *data;
   size_t len;
   size_t cap;
-  bool is_mmap;
 };
 
 static _Thread_local bool buffering_enabled;
@@ -506,22 +505,9 @@ static _Thread_local bool tls_deferred;
 static void
 membuf_init (struct membuf *mb, size_t initial_cap)
 {
-  void *ptr = mmap (NULL, initial_cap, PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-  if (ptr != MAP_FAILED)
-    {
-      mb->data = ptr;
-      mb->len = 0;
-      mb->cap = initial_cap;
-      mb->is_mmap = true;
-    }
-  else
-    {
-      mb->data = xmalloc (initial_cap);
-      mb->len = 0;
-      mb->cap = initial_cap;
-      mb->is_mmap = false;
-    }
+  mb->data = xmalloc (initial_cap);
+  mb->len = 0;
+  mb->cap = initial_cap;
 }
 
 static void
@@ -538,30 +524,7 @@ membuf_append (struct membuf *mb, void const *src, size_t n)
   if (mb->len + n > mb->cap)
     {
       size_t new_cap = MAX (mb->cap * 2, mb->len + n + 65536);
-      char *new_data;
-      if (mb->is_mmap)
-        {
-#if defined MREMAP_MAYMOVE
-          new_data = mremap (mb->data, mb->cap, new_cap, MREMAP_MAYMOVE);
-          if (new_data == MAP_FAILED)
-            {
-              new_data = xmalloc (new_cap);
-              memcpy (new_data, mb->data, mb->len);
-              munmap (mb->data, mb->cap);
-              mb->is_mmap = false;
-            }
-#else
-          new_data = xmalloc (new_cap);
-          memcpy (new_data, mb->data, mb->len);
-          munmap (mb->data, mb->cap);
-          mb->is_mmap = false;
-#endif
-        }
-      else
-        {
-          new_data = xrealloc (mb->data, new_cap);
-        }
-      mb->data = new_data;
+      mb->data = xrealloc (mb->data, new_cap);
       mb->cap = new_cap;
     }
   memcpy (mb->data + mb->len, src, n);
@@ -571,16 +534,9 @@ membuf_append (struct membuf *mb, void const *src, size_t n)
 static void
 membuf_free (struct membuf *mb)
 {
-  if (mb->data)
-    {
-      if (mb->is_mmap)
-        munmap (mb->data, mb->cap);
-      else
-        free (mb->data);
-      mb->data = nullptr;
-      mb->len = mb->cap = 0;
-      mb->is_mmap = false;
-    }
+  free (mb->data);
+  mb->data = nullptr;
+  mb->len = mb->cap = 0;
 }
 
 static void
@@ -3066,12 +3022,10 @@ struct rob_slot
   char *stdout_buf;
   size_t stdout_len;
   size_t stdout_cap;
-  bool stdout_is_mmap;
 
   char *stderr_buf;
   size_t stderr_len;
   size_t stderr_cap;
-  bool stderr_is_mmap;
 
   size_t *big;
   size_t nbig;
@@ -3414,11 +3368,9 @@ rob_search_deferred (struct rob_slot *slot)
   slot->stdout_buf = tls_out.data;
   slot->stdout_len = tls_out.len;
   slot->stdout_cap = tls_out.cap;
-  slot->stdout_is_mmap = tls_out.is_mmap;
   slot->stderr_buf = tls_err.data;
   slot->stderr_len = tls_err.len;
   slot->stderr_cap = tls_err.cap;
-  slot->stderr_is_mmap = tls_err.is_mmap;
   slot->big = CAST_ALIGNED (size_t *, tls_big.data);
   slot->nbig = tls_big.len / (2 * sizeof (size_t));
   free (slot->defer_name);
@@ -3575,19 +3527,13 @@ rob_try_commit_locked (void)
 
       if (slot->stdout_buf)
         {
-          if (slot->stdout_is_mmap)
-            munmap (slot->stdout_buf, slot->stdout_cap);
-          else
-            free (slot->stdout_buf);
+          free (slot->stdout_buf);
           slot->stdout_buf = nullptr;
         }
 
       if (slot->stderr_buf)
         {
-          if (slot->stderr_is_mmap)
-            munmap (slot->stderr_buf, slot->stderr_cap);
-          else
-            free (slot->stderr_buf);
+          free (slot->stderr_buf);
           slot->stderr_buf = nullptr;
         }
 
@@ -4037,7 +3983,6 @@ worker_thread_func (void *arg)
               slot->stdout_buf = nullptr;
               slot->stdout_len = tls_out.len;
               slot->stdout_cap = sizeof slot->inline_out;
-              slot->stdout_is_mmap = false;
               tls_out.len = 0;
             }
           else if (copy_out)
@@ -4045,7 +3990,6 @@ worker_thread_func (void *arg)
               slot->stdout_buf = copy_out;
               slot->stdout_len = tls_out.len;
               slot->stdout_cap = tls_out.len;
-              slot->stdout_is_mmap = false;
               tls_out.len = 0;
             }
           else
@@ -4053,11 +3997,9 @@ worker_thread_func (void *arg)
               slot->stdout_buf = tls_out.data;
               slot->stdout_len = tls_out.len;
               slot->stdout_cap = tls_out.cap;
-              slot->stdout_is_mmap = tls_out.is_mmap;
               tls_out.data = nullptr;
               tls_out.len = 0;
               tls_out.cap = 0;
-              tls_out.is_mmap = false;
               membuf_init (&tls_out, 64 * 1024);
             }
         }
@@ -4067,11 +4009,9 @@ worker_thread_func (void *arg)
           slot->stderr_buf = tls_err.data;
           slot->stderr_len = tls_err.len;
           slot->stderr_cap = tls_err.cap;
-          slot->stderr_is_mmap = tls_err.is_mmap;
           tls_err.data = nullptr;
           tls_err.len = 0;
           tls_err.cap = 0;
-          tls_err.is_mmap = false;
           membuf_init (&tls_err, 4096);
         }
 
@@ -4236,7 +4176,6 @@ slot_set_diagnostic (struct rob_slot *slot, int errnum, char const *msg)
   slot->stderr_buf = mb.data;
   slot->stderr_len = mb.len;
   slot->stderr_cap = mb.cap;
-  slot->stderr_is_mmap = false;
 }
 
 static void
@@ -4513,7 +4452,6 @@ format_context_matches_to_rob (char const *fname, struct chunk_file_state *state
       slot->stdout_buf = nullptr;
       slot->stdout_len = out.len;
       slot->stdout_cap = sizeof slot->inline_out;
-      slot->stdout_is_mmap = false;
       membuf_free (&out);
     }
   else
@@ -4521,12 +4459,10 @@ format_context_matches_to_rob (char const *fname, struct chunk_file_state *state
       slot->stdout_buf = out.data;
       slot->stdout_len = out.len;
       slot->stdout_cap = out.cap;
-      slot->stdout_is_mmap = out.is_mmap;
     }
   slot->stderr_buf = err.data;
   slot->stderr_len = err.len;
   slot->stderr_cap = err.cap;
-  slot->stderr_is_mmap = err.is_mmap;
   slot->big = CAST_ALIGNED (size_t *, big.data);
   slot->nbig = big.len / (2 * sizeof (size_t));
   slot->state = ROB_SLOT_DONE;
