@@ -2974,13 +2974,13 @@ try_fgrep_pattern (int matcher, char *keys, idx_t *len_p)
 }
 
 /* Without GREP_THREADS, use as many threads as there are usable
-   processors, but at most this many.  On a machine with 32 cores and
-   64 hardware threads, traversals of a source tree ran fastest with 32
-   threads and searches of a 1.6 GB file with 24 to 48; 16 threads took
-   22-32% and 10-16% longer.  Threads beyond the number of cores did not
-   help traversals, and slowed them down when they outnumbered the
-   usable hardware threads.  */
-enum { DEFAULT_MAX_THREADS = 16 };
+   processors, but at most this many.  With 32 threads instead of 16,
+   traversals of a Linux source tree took 5-21% less time and searches
+   of a 1.4 GB file 14-19% less on a machine with 64 cores and 128
+   hardware threads; on 32 of those cores (64 hardware threads) the
+   savings were 18-24% and 9-14%.  More than 32 threads slowed
+   traversals down on both.  */
+enum { DEFAULT_MAX_THREADS = 32 };
 
 /* Number of threads to use.  */
 static int
