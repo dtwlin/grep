@@ -6326,9 +6326,15 @@ walk_search (struct walk_dir *d, int dfd, struct walk_ent *e, bool may_defer)
       o->outlen = tls_out.len;
       o->errlen = tls_err.len;
       o->nbig = tls_big.len / (2 * sizeof (size_t));
-      char *p = mempcpy (o->big, tls_big.data, tls_big.len);
-      p = mempcpy (p, tls_out.data, tls_out.len);
-      memcpy (p, tls_err.data, tls_err.len);
+      /* A buffer that has never been used may be null; do not pass it
+         to memcpy even with a zero length.  */
+      char *p = (char *) o->big;
+      if (tls_big.len)
+        p = mempcpy (p, tls_big.data, tls_big.len);
+      if (tls_out.len)
+        p = mempcpy (p, tls_out.data, tls_out.len);
+      if (tls_err.len)
+        memcpy (p, tls_err.data, tls_err.len);
       e->out = o;
     }
 }
