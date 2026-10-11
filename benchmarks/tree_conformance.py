@@ -76,6 +76,7 @@ LARGE_OPTION_SETS = [
     [], ["-n"], ["-o"], ["-b"], ["-c"], ["-v"], ["-v", "-n"], ["-c", "-v"],
     ["--color=always"], ["-w"], ["-l"], ["-L"], ["-q"], ["-A0"],
     ["--binary-files=without-match"], ["-a"], ["-o", "-b"],
+    ["-A2"], ["-B1"], ["-C3", "-n"], ["-A1", "--group-separator=XX"],
 ]
 
 PATTERN = "needle"
@@ -295,7 +296,21 @@ LARGE_FILES = {
                 60000: b"plain line with a bad byte \xfe here\n",
                 997 * 140: b"another needle \xc3( bad\n"},
     "enc_late_nomatch.txt": {120001: b"no match but bad \xff byte\n"},
+    # An encoding error in a line of trailing context.
+    "enc_ctx.txt": {997 * 30 + 1: b"context line with a bad \xff byte\n",
+                    997 * 150: b"needle with a bad \xff byte\n"},
 }
+
+
+def large_pipe_ok(name, opts):
+    """Whether what single-threaded grep outputs for the large file NAME
+    with OPTS does not depend on how much each read from a pipe returns.
+    After omitting a line with an encoding error, the context it prints
+    depends on where its buffers end."""
+    if name.startswith("enc"):
+        return not any(o[:2] in ("-A", "-B", "-C") and o[2:] != "0"
+                       for o in opts)
+    return True
 
 
 def build_large_files(root):
@@ -617,8 +632,9 @@ def main():
                 r.compare(f"large-{name}", opts, [rel], cwd=wd)
                 r.compare(f"large-{name}-stdin", opts, [], cwd=wd,
                           stdin_path=rel)
-                r.compare(f"large-{name}-pipe", opts, [], cwd=wd,
-                          pipe_path=rel)
+                if large_pipe_ok(name, opts):
+                    r.compare(f"large-{name}-pipe", opts, [], cwd=wd,
+                              pipe_path=rel)
         sets = BASE_OPTION_SETS + ([] if args.quick else EXTRA_OPTION_SETS)
         for mode in ("-r", "-R"):
             log(f"[{wd}] adversarial tree, {mode}")

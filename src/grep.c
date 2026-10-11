@@ -4332,6 +4332,22 @@ cleanup_chunk_file_state (void *arg)
   free (state);
 }
 
+/* Search the file of STATE, named FNAME, as single-threaded grep
+   would, into the buffers of the current thread, and return its
+   status.  This is for the rare files whose output depends on how
+   single-threaded grep happens to divide its input into buffers.  */
+static bool
+chunk_search_sequentially (struct chunk_file_state *state, char const *fname)
+{
+  char const *saved_filename = filename;
+  filename = fname;
+  bool status = grepdesc (state->file_desc, true);
+  if (state->close_fd)
+    state->file_desc = -1;  /* grepdesc closed it.  */
+  filename = saved_filename;
+  return status;
+}
+
 static int
 cmp_matches (void const *a, void const *b)
 {
@@ -4451,8 +4467,29 @@ format_context_matches_to_rob (char const *fname, struct chunk_file_state *state
   if (pending > 0)
     prpending (buflim);
 
-  if (binary_files == BINARY_BINARY_FILES && !out_quiet && encoding_error_output)
-    task_error (0, _("%s: binary file matches"), fname);
+  bool status = false;
+  if ((0 < out_before || 0 < out_after) && encoding_error_output)
+    {
+      /* After omitting a line with an encoding error, single-threaded
+         grep prints context lines that depend on where its read buffers
+         happen to end.  Search the file as it does.  */
+      membuf_reset (&tls_out);
+      membuf_reset (&tls_err);
+      membuf_reset (&tls_big);
+      task_had_prtext = false;
+      task_sep = false;
+      file_used = false;
+      pthread_mutex_unlock (&pool_mutex);
+      status = chunk_search_sequentially (state, fname);
+      pthread_mutex_lock (&pool_mutex);
+    }
+  else
+    {
+      task_had_prtext = true;
+      if (binary_files == BINARY_BINARY_FILES && !out_quiet
+          && encoding_error_output)
+        task_error (0, _("%s: binary file matches"), fname);
+    }
 
   offset_width = saved_offset_width;
 
@@ -4473,8 +4510,8 @@ format_context_matches_to_rob (char const *fname, struct chunk_file_state *state
   pending = saved_pending;
   outleft = saved_outleft;
 
-  slot->status = false;
-  slot->had_prtext = true;
+  slot->status = status;
+  slot->had_prtext = task_had_prtext;
   slot->sep = task_sep;
   task_had_prtext = saved_had_prtext;
   task_sep = saved_sep;
