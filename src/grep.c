@@ -466,6 +466,12 @@ static _Thread_local struct membuf tls_out;
 static _Thread_local struct membuf tls_err;
 static _Thread_local bool tls_errseen;
 
+/* True if the current buffered task called prtext without OUT_QUIET
+   before any other prtext call.  Whether a group separator precedes
+   that output depends on what was output before the task, which only
+   the committer knows.  */
+static _Thread_local bool task_sep;
+
 static void
 membuf_init (struct membuf *mb, size_t initial_cap)
 {
@@ -688,19 +694,24 @@ diagnostic_text (int errnum, char const *msg, size_t *lenp)
 
 /* A diagnostic captured while buffering.  It is stored in a membuf as
    this header followed by LEN bytes of text, and must be written to
-   stderr after OUTPOS bytes of the same task's buffered output.  */
+   stderr after OUTPOS bytes of the same task's buffered output.
+   AFTER_SEP tells whether it was issued after the point where a group
+   separator decided by the committer would be output (see TASK_SEP).  */
 struct errrec
 {
   size_t outpos;
   size_t len;
+  bool after_sep;
 };
 
 /* Append to MB a record for diagnostic TEXT of length LEN issued after
-   OUTPOS bytes of output.  */
+   OUTPOS bytes of output, and after the deferred group separator if
+   AFTER_SEP.  */
 static void
-errrec_add (struct membuf *mb, size_t outpos, char const *text, size_t len)
+errrec_add (struct membuf *mb, size_t outpos, bool after_sep,
+            char const *text, size_t len)
 {
-  struct errrec h = { .outpos = outpos, .len = len };
+  struct errrec h = { .outpos = outpos, .len = len, .after_sep = after_sep };
   membuf_append (mb, &h, sizeof h);
   membuf_append (mb, text, len);
 }
@@ -716,7 +727,7 @@ task_error_buffered (int errnum, char const *fmt, ...)
 
   size_t len;
   char *text = diagnostic_text (errnum, msg, &len);
-  errrec_add (&tls_err, tls_out.len, text, len);
+  errrec_add (&tls_err, tls_out.len, task_sep, text, len);
   free (text);
   if (msg != buf)
     free (msg);
@@ -1806,6 +1817,8 @@ prtext (char *beg, char *lim)
           pr_sgr_end_if (sep_color);
           putchar_errno ('\n');
         }
+      else if (buffering_enabled && !task_had_prtext)
+        task_sep = true;
 
       while (p < beg)
         {
@@ -2969,6 +2982,7 @@ struct rob_slot
   bool status;
   bool errseen;
   bool had_prtext;
+  bool sep;
 
   char *stdout_buf;
   size_t stdout_len;
@@ -3157,14 +3171,37 @@ static intmax_t chunk_accumulated_count = 0;
 static bool chunk_has_any_match = false;
 static intmax_t stream_commit_totalnl = 0;
 
+/* Output the group separator, as prtext does.  */
+static void
+print_group_separator (void)
+{
+  pr_sgr_start_if (sep_color);
+  fputs_errno (group_separator);
+  pr_sgr_end_if (sep_color);
+  putchar_errno ('\n');
+}
+
+/* Return true if a task's output needs a leading group separator,
+   given what has been output so far.  HAD_PRTEXT tells whether the task
+   called prtext at all, and SEP whether its first call left the
+   decision to the committer (see TASK_SEP).  Like the static variable
+   USED of single-threaded grep, GLOBAL_USED becomes true after any
+   prtext call, even one that output nothing.  */
+static bool
+need_group_separator (bool had_prtext, bool sep)
+{
+  return (had_prtext && sep && (0 <= out_before || 0 <= out_after)
+          && global_used && group_separator);
+}
+
 /* Commit output captured by a worker: OUTLEN bytes of standard output
    at OUT and the diagnostic records ERR..ERR+ERRLEN (see struct errrec).
    Write each diagnostic after the output that preceded it, flushing
-   standard output first, as error () does.  Buffering must be
-   disabled.  */
+   standard output first, as error () does.  If SEP, output a group
+   separator first.  Buffering must be disabled.  */
 static void
 commit_output (char const *out, size_t outlen, char const *err,
-               size_t errlen)
+               size_t errlen, bool sep)
 {
   size_t pos = 0;
   char const *lim = err + errlen;
@@ -3173,6 +3210,11 @@ commit_output (char const *out, size_t outlen, char const *err,
       struct errrec h;
       memcpy (&h, p, sizeof h);
       char const *text = p + sizeof h;
+      if (sep && h.after_sep)
+        {
+          print_group_separator ();
+          sep = false;
+        }
       if (pos < h.outpos)
         fwrite_errno (out + pos, 1, h.outpos - pos);
       pos = h.outpos;
@@ -3180,6 +3222,8 @@ commit_output (char const *out, size_t outlen, char const *err,
       fwrite (text, 1, h.len, stderr);
       p = text + h.len;
     }
+  if (sep)
+    print_group_separator ();
   if (pos < outlen)
     fwrite_errno (out + pos, 1, outlen - pos);
 }
@@ -3201,17 +3245,9 @@ rob_try_commit_locked (void)
         filename = slot->filename;
 
       /* Group separator logic across files */
+      bool want_sep = need_group_separator (slot->had_prtext, slot->sep);
       if (slot->had_prtext)
-        {
-          if ((0 <= out_before || 0 <= out_after) && global_used && group_separator)
-            {
-              pr_sgr_start_if (sep_color);
-              fputs_errno (group_separator);
-              pr_sgr_end_if (sep_color);
-              putchar_errno ('\n');
-            }
-          global_used = true;
-        }
+        global_used = true;
 
       if (slot->is_stream_chunk)
         {
@@ -3319,7 +3355,8 @@ rob_try_commit_locked (void)
         }
 
       commit_output (slot->stdout_buf ? slot->stdout_buf : slot->inline_out,
-                     slot->stdout_len, slot->stderr_buf, slot->stderr_len);
+                     slot->stdout_len, slot->stderr_buf, slot->stderr_len,
+                     want_sep);
 
       if (line_buffered)
         fflush_errno ();
@@ -3559,6 +3596,7 @@ worker_thread_func (void *arg)
       pending = 0;
       file_used = false;
       task_had_prtext = false;
+      task_sep = false;
 
       bool status = true;
       intmax_t chunk_matched_cnt = 0;
@@ -3759,6 +3797,7 @@ worker_thread_func (void *arg)
       slot->status = status;
       slot->errseen = tls_errseen;
       slot->had_prtext = task_had_prtext;
+      slot->sep = task_sep;
       slot->chunk_count = chunk_matched_cnt;
       if (task.type == TASK_TYPE_CHUNK || task.type == TASK_TYPE_STREAM_CHUNK)
         {
@@ -3962,7 +4001,7 @@ slot_set_diagnostic (struct rob_slot *slot, int errnum, char const *msg)
   size_t len;
   char *text = diagnostic_text (errnum, msg, &len);
   struct membuf mb = { .data = nullptr };
-  errrec_add (&mb, 0, text, len);
+  errrec_add (&mb, 0, false, text, len);
   free (text);
   slot->stderr_buf = mb.data;
   slot->stderr_len = mb.len;
@@ -4168,6 +4207,10 @@ format_context_matches_to_rob (char const *fname, struct chunk_file_state *state
   pending = 0;
   outleft = max_count;
   file_used = false;
+  bool saved_had_prtext = task_had_prtext;
+  bool saved_sep = task_sep;
+  task_had_prtext = false;
+  task_sep = false;
 
   int saved_offset_width = offset_width;
   offset_width = state->offset_width;
@@ -4228,6 +4271,9 @@ format_context_matches_to_rob (char const *fname, struct chunk_file_state *state
 
   slot->status = false;
   slot->had_prtext = true;
+  slot->sep = task_sep;
+  task_had_prtext = saved_had_prtext;
+  task_sep = saved_sep;
   if (out.len <= sizeof slot->inline_out)
     {
       memcpy (slot->inline_out, out.data, out.len);
