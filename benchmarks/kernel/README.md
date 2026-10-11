@@ -7,7 +7,7 @@ Reproducible, high-fidelity benchmark harness comparing multi-threaded GNU `grep
 | Contestant | Binary | Provenance | Parallelism | Notes |
 | :--- | :--- | :--- | :---: | :--- |
 | **G0** | `benchmarks/grep-baseline` | Upstream GNU grep `v3.12-41-ge187ca5` | 1 thread | Baseline reference built with identical flags (`-O3 -march=native`) |
-| **G1** | `src/grep` | Multi-threaded GNU grep fork (`master`) | Auto (16) | 128 MiB slab arena, lockless SIMD scanners, intra-file chunking, Sequence Reorder Buffer |
+| **G1** | `src/grep` | Multi-threaded GNU grep fork (`master`) | Auto (32) | 128 MiB slab arena, lockless SIMD scanners, intra-file chunking, Sequence Reorder Buffer |
 | **R0** | `/usr/bin/rg` | ripgrep 15.1.0 | Auto (12) | Stock Debian package (`+pcre2`, runtime AVX2) |
 | **G2** | `/usr/bin/grep` | Distro GNU grep 3.12 | 1 thread | System release binary (Debian generic build) |
 | **X1** | `/usr/bin/git` | Git grep (`git grep`) | Auto (128) | Searches tracked files in working tree |
