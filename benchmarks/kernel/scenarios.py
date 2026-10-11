@@ -168,6 +168,86 @@ class StandardScenario(Scenario):
         }
 
 
+class XargsScenario(Scenario):
+    """Scenario that feeds file paths via xargs -0 -a $KBENCH/files.z with cwd=$K."""
+
+    def __init__(
+        self,
+        sid: str,
+        category: str,
+        description: str,
+        is_core: bool = False,
+        is_sweep: bool = False,
+        equiv_mode: str = "sorted_lines",
+        expected_exit: int = 123,
+        timeout_sec: int = 600,
+        na_tools: Optional[List[str]] = None,
+        notes: str = "",
+        grep_args_fn=None,
+        rg_args_fn=None,
+    ):
+        super().__init__(
+            sid=sid,
+            category=category,
+            description=description,
+            is_core=is_core,
+            is_sweep=is_sweep,
+            equiv_mode=equiv_mode,
+            expected_exit=expected_exit,
+            timeout_sec=timeout_sec,
+            na_tools=na_tools,
+            notes=notes,
+        )
+        self.grep_args_fn = grep_args_fn
+        self.rg_args_fn = rg_args_fn
+
+    def build_cmd(
+        self,
+        tool: str,
+        bin_path: str,
+        ksrc: str,
+        kbench_dir: str,
+        patterns_dir: str,
+        threads: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if tool in self.na_tools:
+            return {"na": True}
+
+        ctx = {
+            "K": ksrc,
+            "KBENCH": kbench_dir,
+            "P": patterns_dir,
+        }
+        env = {}
+        files_z = os.path.join(kbench_dir, "files.z")
+
+        if tool in ("G0", "G1", "G2"):
+            if tool == "G1" and threads is not None:
+                env["GREP_THREADS"] = str(threads)
+            tool_args = self.grep_args_fn(ctx)
+        elif tool == "R0":
+            extra = []
+            if threads is not None:
+                extra = ["-j", str(threads)]
+            tool_args = extra + self.rg_args_fn(ctx)
+        elif tool == "X1":
+            extra = []
+            if threads is not None:
+                extra = ["--threads", str(threads)]
+            tool_args = ["grep"] + extra + self.grep_args_fn(ctx)
+        else:
+            raise ValueError(f"Unknown tool: {tool}")
+
+        argv = ["xargs", "-0", "-a", files_z, bin_path] + tool_args + ["--"]
+        return {
+            "argv": argv,
+            "cwd": ksrc,
+            "env": env,
+            "stdin_file": None,
+            "pipe_cmd": None,
+        }
+
+
 def make_scenarios() -> Dict[str, Scenario]:
     scenarios: Dict[str, Scenario] = {}
 
@@ -949,17 +1029,17 @@ def make_scenarios() -> Dict[str, Scenario]:
     # Category X, U, P: Special / UX / Pathological
     # -------------------------------------------------------------
     add(
-        StandardScenario(
+        XargsScenario(
             sid="X-01",
             category="X",
             description="git ls-files | xargs",
             is_core=False,
             is_sweep=False,
             equiv_mode="sorted_lines",
+            expected_exit=123,
             na_tools=["X1"],
             grep_args_fn=lambda c: ["--color=never", "-n", "-F", "spin_lock_irqsave"],
             rg_args_fn=lambda c: ["--color=never", "--no-heading", "-n", "-F", "spin_lock_irqsave"],
-            git_args_fn=lambda c: [],
         )
     )
 
