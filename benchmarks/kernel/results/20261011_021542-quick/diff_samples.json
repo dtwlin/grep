@@ -1,0 +1,8 @@
+{
+  "T-09": {
+    "R0": {
+      "classification": "KNOWN-SEMANTIC (BOM stripping)",
+      "diff_sample": "--- /dev/shm/kbench_out/ref_T-09_G0.sorted\t2026-10-11 03:19:43.475750474 +0000\n+++ /dev/shm/kbench_out/ref_T-09_R0.sorted\t2026-10-11 03:19:45.231748074 +0000\n@@ -780,9 +780,9 @@\n $K/Documentation/translations/sp_SP/process/kernel-enforcement-statement.rst:Aunque existe el derecho de hacer valer un copyright distinto en las\n $K/Documentation/translations/sp_SP/process/kernel-enforcement-statement.rst:nuestro y de cualquier sucesor de nuestros derechos de autor (copyright):\n $K/Documentation/translations/zh_CN/admin-guide/reporting-issues.rst:   way if you want to contribute changes to the text, but for copyright\n+$K/Documentation/translations/zh_CN/dev-tools/sparse.rst:Copyright 2004 Linus Torvalds\n $K/Documentation/translations/zh_CN/dev-tools/sparse.rst:Copyright 2004 Pavel Machek <pavel@ucw.cz>\n $K/Documentation/translations/zh_CN/dev-tools/sparse.rst:Copyright 2006 Bob Copeland <me@bobcopeland.com>\n-$K/Documentation/translations/zh_CN/dev-tools/sparse.rst:\ufeffCopyright 2004 Linus Torvalds"
+    }
+  }
+}
