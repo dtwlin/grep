@@ -676,15 +676,62 @@ class ReportGenerator:
 
         return "\n".join(lines)
 
+    def generate_matched_threads_table(self, target_threads: int = 32) -> str:
+        matched_sids = [
+            sid for sid in self.scenarios
+            if self.get_stat(sid, "R0", target_threads) is not None and self.get_stat(sid, "G1") is not None
+        ]
+        if not matched_sids:
+            return ""
+
+        lines = [
+            f"### Matched Thread Comparison: G1 ({target_threads}t) vs R0 (Default 12t) vs R0 (-j {target_threads})",
+            "",
+            f"> Side-by-side comparison of G1 (default {target_threads} threads) against both out-of-the-box R0 (default 12 threads) and thread-matched `R0 -j {target_threads}` ({target_threads} threads).",
+            "",
+            f"| Scenario | Cat | Description | G0 (1t) | G1 ({target_threads}t) | R0 (12t) | R0 (-j {target_threads}) | G1 vs R0 (12t) | G1 vs R0 ({target_threads}t) | G1 CPU | R0 ({target_threads}t) CPU |",
+            "| :--- | :-: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+
+        for sid in matched_sids:
+            g0 = self.get_stat(sid, "G0")
+            g1 = self.get_stat(sid, "G1")
+            r0_def = self.get_stat(sid, "R0")
+            r0_32 = self.get_stat(sid, "R0", target_threads)
+            if not g1 or not r0_32:
+                continue
+
+            cat = g1.get("category", "")
+            desc = g1.get("description", "").replace("|", "\\|")
+            g0_ms = g0["median_ms"] if g0 else None
+            g1_ms = g1["median_ms"]
+            r0_def_ms = r0_def["median_ms"] if r0_def else None
+            r0_32_ms = r0_32["median_ms"]
+
+            vs_def = (r0_def_ms / g1_ms) if (r0_def_ms and g1_ms > 0) else None
+            vs_32 = (r0_32_ms / g1_ms) if (r0_32_ms and g1_ms > 0) else None
+
+            lines.append(
+                f"| `{sid}` | {cat} | {desc} | {format_ms(g0_ms)} | {format_ms(g1_ms)} | "
+                f"{format_ms(r0_def_ms)} | {format_ms(r0_32_ms)} | "
+                f"**{format_ratio(vs_def)}** | **{format_ratio(vs_32)}** | "
+                f"{format_cpu(g1.get('mean_cpu_s'))} | {format_cpu(r0_32.get('mean_cpu_s'))} |"
+            )
+
+        return "\n".join(lines)
+
     def generate_scaling_summary(self) -> Tuple[str, List[Dict[str, Any]]]:
-        sweep_sids = [sid for sid in self.scenarios if any(k[0] == sid and k[2] is not None for k in self.stats.keys())]
+        sweep_sids = [
+            sid for sid in self.scenarios
+            if len(set(k[2] for k in self.stats.keys() if k[0] == sid and k[2] is not None)) > 1
+        ]
         csv_rows = []
         if not sweep_sids:
             return "No thread sweep data found.", csv_rows
 
         threads_set = set()
         for k in self.stats.keys():
-            if k[2] is not None:
+            if k[0] in sweep_sids and k[2] is not None:
                 threads_set.add(k[2])
         sorted_threads = sorted(threads_set)
 
@@ -1004,6 +1051,11 @@ class ReportGenerator:
         content.append("")
         content.append(scaling_text)
         content.append("")
+
+        matched_text = self.generate_matched_threads_table(32)
+        if matched_text:
+            content.append(matched_text)
+            content.append("")
 
         content.append("## 8. Hypothesis Scorecard")
         content.append("")
