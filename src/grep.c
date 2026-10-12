@@ -31,6 +31,26 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <dirent.h>
+
+#ifndef MAP_ANONYMOUS
+# ifdef MAP_ANON
+#  define MAP_ANONYMOUS MAP_ANON
+# else
+#  define MAP_ANONYMOUS 0
+# endif
+#endif
+
+#ifndef MAP_POPULATE
+# define MAP_POPULATE 0
+#endif
+
+#ifndef MAP_NORESERVE
+# define MAP_NORESERVE 0
+#endif
+
+#ifndef DTTOIF
+# define DTTOIF(dirtype) ((dirtype) << 12)
+#endif
 #if defined __linux__ && HAVE_SYS_VFS_H && HAVE_FSTATFS
 # include <sys/vfs.h>
 #endif
@@ -2209,7 +2229,11 @@ grep (int fd, struct stat *st, bool *ineof)
               char const *map = mmap (nullptr, st->st_size, PROT_READ, MAP_PRIVATE, fd, 0);
               if (map != MAP_FAILED)
                 {
+#ifdef MADV_SEQUENTIAL
                   madvise ((void *) map, st->st_size, MADV_SEQUENTIAL);
+#elif defined POSIX_MADV_SEQUENTIAL
+                  posix_madvise ((void *) map, st->st_size, POSIX_MADV_SEQUENTIAL);
+#endif
                   if (walk_cur_task && st->st_size >= 16 * 1024 * 1024 && pool_target > 1)
                     {
                       if (walk_bin_scan (map, st->st_size, bufoffset))
@@ -3434,8 +3458,10 @@ alloc_slice_buf_locked (void)
     return slice_freelist[--slice_freelist_cnt];
 
   size_t buf_sz = SLICE_BUF_SIZE + 2 + uword_size;
-  void *p = mmap (NULL, buf_sz, PROT_READ | PROT_WRITE,
-                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+  void *p = MAP_FAILED;
+  if (MAP_POPULATE)
+    p = mmap (NULL, buf_sz, PROT_READ | PROT_WRITE,
+              MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
   if (p == MAP_FAILED)
     {
       p = mmap (NULL, buf_sz, PROT_READ | PROT_WRITE,
@@ -6480,7 +6506,7 @@ walk_read_entries (int fd, struct walk_dir *d)
           if (nm[0] == '.' && (!nm[1] || (nm[1] == '.' && !nm[2])))
             continue;
           walk_add_ent (d, &nalloc, &namesalloc, &namesused, nm,
-# ifdef _DIRENT_HAVE_D_TYPE
+# if defined _DIRENT_HAVE_D_TYPE || defined DT_UNKNOWN
                         de->d_type,
 # else
                         DT_UNKNOWN,

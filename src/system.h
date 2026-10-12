@@ -33,6 +33,28 @@
 #include <string.h>
 #include <ctype.h>
 
+#ifndef HAVE_MEMRCHR
+# define HAVE_MEMRCHR 0
+#endif
+
+#if !HAVE_MEMRCHR
+static inline void *
+rpl_memrchr (void const *s, int c_in, size_t n)
+{
+  unsigned char const *p = (unsigned char const *) s;
+  unsigned char c = (unsigned char) c_in;
+  while (n > 0)
+    {
+      --n;
+      if (p[n] == c)
+        return (void *) (p + n);
+    }
+  return NULL;
+}
+# undef memrchr
+# define memrchr rpl_memrchr
+#endif
+
 enum { EXIT_TROUBLE = 2 };
 enum { NCHAR = UCHAR_MAX + 1 };
 

@@ -9,7 +9,7 @@
   <a href="COPYING"><img alt="License: GPLv3" src="https://img.shields.io/badge/license-GPLv3-blue.svg"></a>
   <img alt="Drop-in replacement" src="https://img.shields.io/badge/GNU%20grep-drop--in%20replacement-brightgreen.svg">
   <img alt="Output" src="https://img.shields.io/badge/output-byte--identical-success.svg">
-  <img alt="Platform" src="https://img.shields.io/badge/platform-Linux%20x86--64-lightgrey.svg">
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-blue.svg">
 </p>
 
 ---
@@ -89,6 +89,9 @@ Everything below lives behind GNU grep's unchanged command-line interface.
 sudo apt install build-essential git autoconf automake autopoint gettext gperf \
   texinfo pkg-config wget xz-utils libpcre2-dev
 
+# macOS (Homebrew)
+brew install autoconf automake gettext gperf texinfo pkg-config xz pcre2
+
 git clone --recurse-submodules https://github.com/dtwlin/grep.git
 cd grep
 ./bootstrap --skip-po
@@ -117,7 +120,7 @@ Output is identical for every thread count — only the wall-clock time changes.
 - **CPU and memory for time.** Parallel runs burn more CPU-seconds to finish sooner, and a whole-tree search peaks at ~250–360 MB of RSS (GNU grep and ripgrep: ≤ 40 MB). Turn it down with `GREP_THREADS` on shared machines.
 - **One known latency regression:** `grep -rq` with a match in the very first files of a tree takes ~10 ms instead of ~3 ms.
 - **Thread-matched ripgrep** (`rg -j 32`) is faster on 20 of the 59 scenarios: mostly sparse whole-tree scans (by 3–26%), plus two sub-20 ms runs and one `.*`-heavy regex (by up to ~50%). Supercharged grep wins 37, often by 2–80×; 2 are ties.
-- **Linux only for now.** Tested on x86-64; macOS and the BSDs are not supported yet.
+- **Linux & macOS.** Builds cleanly on Linux and macOS. Vectorized AVX2 search kernels run on x86-64 processors; systems without AVX2 (including Apple Silicon ARM64) use the portable SWAR and 64-bit word fallbacks.
 
 ## 🙏 Credits & license
 

@@ -210,7 +210,7 @@ AC_DEFINE([ARGMATCH_DIE], [usage (EXIT_FAILURE)],
 AC_DEFINE([ARGMATCH_DIE_DECL], [void usage (int _e)],
           [Define to the declaration of the xargmatch failure function.])
 
-AC_CHECK_FUNCS_ONCE([setlocale])
+AC_CHECK_FUNCS_ONCE([setlocale memrchr])
 
 dnl I18N feature
 AM_GNU_GETTEXT_VERSION([0.18.2])
