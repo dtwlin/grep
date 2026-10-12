@@ -502,6 +502,16 @@ static _Thread_local struct membuf tls_big;
 static _Thread_local bool tls_may_defer;
 static _Thread_local bool tls_deferred;
 
+/* A recursive search searches the files of a directory in batches.
+   Before it searches a regular file of at least WALK_SPLIT_SIZE bytes,
+   it lets other threads search the rest of the batch; see
+   walk_split_rest.  WALK_CUR_TASK is the batch that the current thread
+   is searching, if any.  */
+enum { WALK_SPLIT_SIZE = 2 * 1024 * 1024 };
+struct walk_task;
+static _Thread_local struct walk_task *walk_cur_task;
+static void walk_split_rest (void);
+
 static void
 membuf_init (struct membuf *mb, size_t initial_cap)
 {
@@ -1203,30 +1213,42 @@ init_worker_buffer (void)
   if (buffer)
     return;
 
-  size_t target_sizes[] = {
-    16 * 1024 * 1024,
-    2 * 1024 * 1024
-  };
-
-  for (size_t i = 0; i < sizeof target_sizes / sizeof target_sizes[0]; ++i)
-    {
-      size_t slab = target_sizes[i];
-      size_t alloc_sz = slab + pagesize + uword_size;
-      void *ptr = mmap (NULL, alloc_sz, PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-      if (ptr != MAP_FAILED)
-        {
-#ifdef MADV_NOHUGEPAGE
-          /* Reads slide through the start of the buffer, so huge pages
-             would not save page faults; they would only make the first
-             read of each thread clear 2 MiB.  */
-          madvise (ptr, alloc_sz, MADV_NOHUGEPAGE);
+#ifdef RLIMIT_AS
+  struct rlimit aslim;
+  bool as_limited = (getrlimit (RLIMIT_AS, &aslim) == 0
+                     && aslim.rlim_cur != RLIM_INFINITY
+                     && aslim.rlim_cur < (rlim_t) 4 * 1024 * 1024 * 1024);
+#else
+  bool as_limited = false;
 #endif
-          buffer = ptr;
-          bufalloc = alloc_sz;
-          buffer_is_mmap = true;
-          good_readsize = ALIGN_TO (GOOD_READSIZE_MIN, pagesize);
-          return;
+
+  if (!as_limited)
+    {
+      size_t target_sizes[] = {
+        16 * 1024 * 1024,
+        2 * 1024 * 1024
+      };
+
+      for (size_t i = 0; i < sizeof target_sizes / sizeof target_sizes[0]; ++i)
+        {
+          size_t slab = target_sizes[i];
+          size_t alloc_sz = slab + pagesize + uword_size;
+          void *ptr = mmap (NULL, alloc_sz, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+          if (ptr != MAP_FAILED)
+            {
+#ifdef MADV_NOHUGEPAGE
+              /* Reads slide through the start of the buffer, so huge pages
+                 would not save page faults; they would only make the first
+                 read of each thread clear 2 MiB.  */
+              madvise (ptr, alloc_sz, MADV_NOHUGEPAGE);
+#endif
+              buffer = ptr;
+              bufalloc = alloc_sz;
+              buffer_is_mmap = true;
+              good_readsize = ALIGN_TO (GOOD_READSIZE_MIN, pagesize);
+              return;
+            }
         }
     }
 
@@ -2294,6 +2316,9 @@ grepdesc (int desc, bool command_line)
       goto closeout;
     }
 
+  if (walk_cur_task && S_ISREG (st.st_mode) && WALK_SPLIT_SIZE <= st.st_size)
+    walk_split_rest ();
+
   if (desc != STDIN_FILENO && skip_devices (command_line)
       && is_device_mode (st.st_mode))
     goto closeout;
@@ -3129,6 +3154,7 @@ struct chunk_file_state
   size_t base_size;
   char *mmap_data;
   size_t mmap_size;
+  size_t file_size;
   int file_desc;
   bool close_fd;
   char const *fname;
@@ -4607,7 +4633,7 @@ cleanup_chunk_file_state (void *arg)
   else if (!state->close_fd && state->file_desc >= 0)
     {
       if (!exit_on_match)
-        lseek (state->file_desc, state->mmap_size, SEEK_SET);
+        lseek (state->file_desc, state->file_size, SEEK_SET);
     }
 
   free (state->bounds);
@@ -5033,14 +5059,18 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
       return;
     }
 
+  size_t effective_size = file_size
+    + (file_size > 0 && data[file_size - 1] != eolbyte);
+  data[effective_size] = eolbyte;
+
   size_t num_chunks = pool_nthreads * 2;
   if (num_chunks < 2)
     num_chunks = 2;
   if (num_chunks > 64)
     num_chunks = 64;
   size_t min_chunk_size = 2 * 1024 * 1024;
-  if (file_size / num_chunks < min_chunk_size)
-    num_chunks = file_size / min_chunk_size;
+  if (effective_size / num_chunks < min_chunk_size)
+    num_chunks = effective_size / min_chunk_size;
   if (num_chunks < 2)
     num_chunks = 2;
 
@@ -5048,20 +5078,25 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
   bounds[0] = 0;
   for (size_t k = 1; k < num_chunks; ++k)
     {
-      size_t target = k * (file_size / num_chunks);
-      char const *nl = memchr (data + target, eolbyte, file_size - target);
-      if (nl)
-        bounds[k] = nl + 1 - data;
+      size_t target = k * (effective_size / num_chunks);
+      if (target < bounds[k - 1])
+        target = bounds[k - 1];
+      if (target < effective_size)
+        {
+          char *nl = memchr (data + target, eolbyte, effective_size - target);
+          bounds[k] = nl ? (size_t) (nl - data) + 1 : effective_size;
+        }
       else
-        bounds[k] = file_size;
+        bounds[k] = effective_size;
     }
-  bounds[num_chunks] = file_size;
+  bounds[num_chunks] = effective_size;
 
   struct chunk_file_state *state = xzalloc (sizeof *state);
   state->base_addr = base;
   state->base_size = total_alloc;
   state->mmap_data = data;
-  state->mmap_size = file_size;
+  state->mmap_size = effective_size;
+  state->file_size = file_size;
   state->file_desc = fd;
   state->close_fd = close_fd;
   state->fname = xstrdup (fname);
@@ -5648,6 +5683,8 @@ struct walk_heap
   idx_t n, alloc;
 };
 
+enum { WALK_BUF_CAP = 256 * 1024 * 1024 };
+
 static struct
 {
   pthread_mutex_t mu;           /* protects the members up to INSIDE */
@@ -5659,6 +5696,7 @@ static struct
   int inside;                   /* threads in walk_participate */
   unsigned int gen;             /* number of the current traversal */
   bool done;                    /* the traversal is fully committed */
+  atomic_size_t buffered_bytes; /* bytes held in uncommitted walk_out records */
 
   bool logical;                 /* -R: use full names */
   int fd_cap;                   /* soft limit on open directories */
@@ -5778,14 +5816,16 @@ walk_diagnostic (int errnum, char const *fmt, char const *name)
   char *text = diagnostic_text (errnum, msg, &len);
   if (msg != buf)
     free (msg);
-  struct walk_out *o = ximalloc (sizeof *o + sizeof (struct errrec) + len);
+  size_t bytes = sizeof (struct errrec) + len;
+  struct walk_out *o = ximalloc (sizeof *o + bytes);
   o->outlen = o->nbig = 0;
-  o->errlen = sizeof (struct errrec) + len;
+  o->errlen = bytes;
   struct errrec h = { .outpos = 0, .len = len, .after_sep = false };
   char *p = (char *) o->big;
   memcpy (p, &h, sizeof h);
   memcpy (p + sizeof h, text, len);
   free (text);
+  atomic_fetch_add (&walk.buffered_bytes, bytes);
   return o;
 }
 
@@ -5907,7 +5947,12 @@ walk_heap_pop (struct walk_heap *h)
 static void
 walk_free_out (struct walk_out *o)
 {
-  free (o);
+  if (o)
+    {
+      size_t bytes = o->nbig * 2 * sizeof (size_t) + o->outlen + o->errlen;
+      atomic_fetch_sub (&walk.buffered_bytes, bytes);
+      free (o);
+    }
 }
 
 static void
@@ -6336,6 +6381,7 @@ walk_search (struct walk_dir *d, int dfd, struct walk_ent *e, bool may_defer)
         p = mempcpy (p, tls_out.data, tls_out.len);
       if (tls_err.len)
         memcpy (p, tls_err.data, tls_err.len);
+      atomic_fetch_add (&walk.buffered_bytes, tls_big.len + tls_out.len + tls_err.len);
       e->out = o;
     }
 }
@@ -6601,6 +6647,58 @@ walk_maybe_recruit (void)
 
 static void walk_commit (void);
 
+/* A batch of files that has been searched for this many nanoseconds
+   gives the second half of the files it has left to other threads, so
+   that a batch of files that are slow to search is spread over the
+   threads instead of keeping one of them busy while the others wait.  */
+#ifndef WALK_SPLIT_NS
+# define WALK_SPLIT_NS (3 * 1000 * 1000)
+#endif
+#ifndef WALK_SPLIT_FILE_NS
+# define WALK_SPLIT_FILE_NS (500 * 1000)
+#endif
+enum { WALK_SPLIT_MIN_REM = 8 };
+
+/* The entry of WALK_CUR_TASK whose file the current thread searches.  */
+static _Thread_local size_t walk_cur_index;
+
+/* Queue entries LO..T->hi-1 of the batch T as a new task, and keep the
+   entries before LO in T.  */
+static void
+walk_split (struct walk_task *t, size_t lo)
+{
+  struct walk_dir *d = t->dir;
+  struct walk_task *n = xmalloc (sizeof *n);
+  *n = (struct walk_task) { .dir = d, .lo = lo, .hi = t->hi, .read = false };
+  t->hi = lo;
+
+  /* T keeps its own reference and descriptor use until it ends, so
+     neither count can drop to zero before N takes its own.  */
+  atomic_fetch_add (&d->refs, 1);
+  if (!walk.logical)
+    atomic_fetch_add (&d->fd_users, 1);
+
+  pthread_mutex_lock (&walk.mu);
+  walk_heap_push (&walk.files, n);
+  if (walk.idle)
+    pthread_cond_signal (&walk.cv);
+  pthread_mutex_unlock (&walk.mu);
+}
+
+/* The current thread is about to search a large file of its batch; let
+   other threads search the files after it meanwhile.  */
+static void
+walk_split_rest (void)
+{
+  struct walk_task *t = walk_cur_task;
+  for (size_t i = walk_cur_index + 1; i < t->hi; i++)
+    if (t->dir->ents[i].kind == WALK_FILE)
+      {
+        walk_split (t, walk_cur_index + 1);
+        break;
+      }
+}
+
 /* Search the files of task T.  */
 static void
 walk_search_files (struct walk_task *t)
@@ -6608,6 +6706,9 @@ walk_search_files (struct walk_task *t)
   struct walk_dir *d = t->dir;
   int dfd = walk.logical ? AT_FDCWD : walk_dir_fd (d);
   int fderr = errno;
+  struct timespec start, prev;
+  clock_gettime (CLOCK_MONOTONIC, &start);
+  prev = start;
   for (size_t i = t->lo; i < t->hi; i++)
     {
       struct walk_ent *e = &d->ents[i];
@@ -6617,7 +6718,10 @@ walk_search_files (struct walk_task *t)
         walk_ent_error (d, e, fderr);
       else
         {
+          walk_cur_task = t;
+          walk_cur_index = i;
           walk_search (d, dfd, e, true);
+          walk_cur_task = nullptr;
           if (e->defer)
             {
               /* The committer will need the directory.  */
@@ -6632,6 +6736,24 @@ walk_search_files (struct walk_task *t)
       if (exit_on_match && !e->status)
         walk_commit ();
       walk_maybe_recruit ();
+
+      if (2 <= t->hi - (i + 1))
+        {
+          struct timespec now;
+          clock_gettime (CLOCK_MONOTONIC, &now);
+          intmax_t file_ns = ((now.tv_sec - prev.tv_sec) * 1000000000
+                              + now.tv_nsec - prev.tv_nsec);
+          intmax_t batch_ns = ((now.tv_sec - start.tv_sec) * 1000000000
+                               + now.tv_nsec - start.tv_nsec);
+          prev = now;
+          if (WALK_SPLIT_FILE_NS <= file_ns
+              || (WALK_SPLIT_NS <= batch_ns
+                  && WALK_SPLIT_MIN_REM <= t->hi - (i + 1)))
+            {
+              walk_split (t, i + 1 + (t->hi - i) / 2);
+              start = now;
+            }
+        }
     }
 }
 
@@ -6706,6 +6828,7 @@ walk_commit_locked (void)
 {
   bool saved_buffering = buffering_enabled;
   buffering_enabled = false;
+  size_t before_bytes = atomic_load (&walk.buffered_bytes);
   struct walk_dir *d = walk.cur;
   while (d)
     {
@@ -6740,6 +6863,14 @@ walk_commit_locked (void)
       d->cpos++;
     }
   buffering_enabled = saved_buffering;
+  if (WALK_BUF_CAP <= before_bytes
+      && atomic_load (&walk.buffered_bytes) < WALK_BUF_CAP)
+    {
+      pthread_mutex_lock (&walk.mu);
+      if (walk.idle)
+        pthread_cond_broadcast (&walk.cv);
+      pthread_mutex_unlock (&walk.mu);
+    }
   return !d;
 }
 
@@ -6772,6 +6903,8 @@ walk_commit (void)
 static struct walk_task *
 walk_pick (void)
 {
+  if (WALK_BUF_CAP <= atomic_load (&walk.buffered_bytes) && 0 < walk.running)
+    return nullptr;
   struct walk_task *r = walk.reads.n ? walk.reads.v[0] : nullptr;
   struct walk_task *f = walk.files.n ? walk.files.v[0] : nullptr;
   if (r && (!f || walk_task_before (r, f))
@@ -6881,6 +7014,7 @@ walk_run (char const *dir)
   walk.fd_cap = walk_fd_cap ();
   walk.cur = holder;
   walk.done = false;
+  atomic_store (&walk.buffered_bytes, 0);
   unsigned int gen = ++walk.gen;
   walk_heap_push (&walk.reads, t);
   pthread_mutex_unlock (&walk.mu);
@@ -7713,6 +7847,16 @@ main (int argc, char **argv)
       if (getrlimit (RLIMIT_NOFILE, &nofile) == 0
           && nofile.rlim_cur != RLIM_INFINITY)
         nthreads = MIN (nthreads, MAX (1, ((long) nofile.rlim_cur - 16) / 2));
+
+#ifdef RLIMIT_AS
+      /* Each worker thread reserves a stack, a read buffer, and a
+         per-thread allocator arena (typically 64 MiB on 64-bit glibc).  */
+      struct rlimit aslim;
+      if (getrlimit (RLIMIT_AS, &aslim) == 0
+          && aslim.rlim_cur != RLIM_INFINITY)
+        nthreads = MIN (nthreads,
+                        MAX (1, (long) (aslim.rlim_cur / (128 * 1024 * 1024))));
+#endif
     }
 
   if (nthreads <= 1)
