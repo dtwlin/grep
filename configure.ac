@@ -20,7 +20,7 @@ dnl along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 AC_INIT([GNU grep],
         m4_esyscmd([build-aux/git-version-gen .tarball-version]),
-        [bug-grep@gnu.org])
+        [dtwlin@gmail.com])
 
 AC_CONFIG_AUX_DIR([build-aux])
 AC_CONFIG_SRCDIR([src/grep.c])
