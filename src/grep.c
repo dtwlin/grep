@@ -901,8 +901,10 @@ skip_devices (bool command_line)
 static bool
 usable_st_size (struct stat const *st)
 {
-  return S_ISREG (st->st_mode) || S_TYPEISSHM (st) || S_TYPEISTMO (st);
+  return (S_ISREG (st->st_mode) && 0 <= st->st_size) || S_TYPEISSHM (st) || S_TYPEISTMO (st);
 }
+
+static _Thread_local bool known_reg_nostat;
 
 /* Lame substitutes for SEEK_DATA and SEEK_HOLE on platforms lacking them.
    Do not rely on these finding data or holes if they equal SEEK_SET.  */
@@ -930,11 +932,23 @@ static reg_syntax_t raw_matcher_syntax;
 static int raw_matcher_index;
 static bool raw_exact;
 
+struct walk_dir;
+struct walk_ent;
+static char *walk_ent_path (struct walk_dir const *d, struct walk_ent const *e);
+static char const *walk_shown_name (char const *path);
+static _Thread_local struct walk_dir const *walk_cur_dir;
+static _Thread_local struct walk_ent const *walk_cur_ent;
+
 char const *
 input_filename (void)
 {
   if (!filename)
-    filename = _("(standard input)");
+    {
+      if (walk_cur_dir && walk_cur_ent)
+        filename = walk_shown_name (walk_ent_path (walk_cur_dir, walk_cur_ent));
+      else
+        filename = _("(standard input)");
+    }
   return filename;
 }
 
@@ -1147,6 +1161,37 @@ exclude_options (bool command_line)
   return EXCLUDE_WILDCARDS | (command_line ? 0 : EXCLUDE_ANCHORED);
 }
 
+struct simple_include {
+  char const *suffix;
+  size_t len;
+};
+static struct simple_include simple_includes[16];
+static size_t num_simple_includes;
+static bool use_simple_includes;
+
+/* Return true if the file with NAME should be skipped.
+   If COMMAND_LINE, it is a command-line argument.
+   If IS_DIR, it is a directory.  */
+static bool
+skipped_file (char const *name, bool command_line, bool is_dir);
+
+static inline bool
+walk_file_skipped (char const *name, unsigned short namelen)
+{
+  if (use_simple_includes)
+    {
+      for (size_t i = 0; i < num_simple_includes; i++)
+        {
+          if (namelen >= simple_includes[i].len
+              && memcmp (name + namelen - simple_includes[i].len,
+                         simple_includes[i].suffix, simple_includes[i].len) == 0)
+            return false;
+        }
+      return true;
+    }
+  return skipped_file (name, false, false);
+}
+
 /* Return true if the file with NAME should be skipped.
    If COMMAND_LINE, it is a command-line argument.
    If IS_DIR, it is a directory.  */
@@ -1168,6 +1213,10 @@ skipped_file (char const *name, bool command_line, bool is_dir)
 /* Hairy buffering mechanism for grep.  The intent is to keep
    all reads aligned on a page boundary and multiples of the
    page size, unless a read yields a partial page.  */
+
+/* Keep these in sync with the 'matchers' table.  */
+enum { E_MATCHER_INDEX = 1, F_MATCHER_INDEX = 2, G_MATCHER_INDEX = 0 };
+static int pool_target;
 
 static _Thread_local char *buffer;		/* Base of buffer. */
 static _Thread_local idx_t bufalloc;		/* Allocated buffer size, counting slop. */
@@ -1326,7 +1375,7 @@ all_zeros (char const *buf, idx_t size)
 /* Reset the buffer for a new file, returning false if we should skip it.
    Initialize on the first time through. */
 static bool
-reset (int fd, struct stat const *st)
+reset (int fd, struct stat *st)
 {
   init_worker_buffer ();
   bufbeg = buflim = ALIGN_TO (buffer + 1, pagesize);
@@ -1356,7 +1405,7 @@ reset (int fd, struct stat const *st)
    to the beginning of the buffer contents, and 'buflim'
    points just after the end.  Return false if there's an error.  */
 static bool
-fillbuf (idx_t save, struct stat const *st)
+fillbuf (idx_t save, struct stat *st)
 {
   char *readbuf;
 
@@ -1434,6 +1483,24 @@ fillbuf (idx_t save, struct stat const *st)
             {
               fillsize = 0;
               cc = false;
+            }
+          else if (fillsize >= 0 && st->st_size < 0)
+            {
+              if (fillsize < good_readsize)
+                {
+                  st->st_size = fillsize;
+                  eof_known = true;
+                }
+              else
+                {
+                  if (fstat (bufdesc, st) != 0)
+                    {
+                      fillsize = 0;
+                      cc = false;
+                    }
+                  if (walk_cur_task && S_ISREG (st->st_mode) && WALK_SPLIT_SIZE <= st->st_size)
+                    walk_split_rest ();
+                }
             }
           /* Pseudo-files may report sizes of 0 or 4096, and files may
              grow, so trust the size only if one read returned exactly
@@ -1979,11 +2046,12 @@ grepbuf (char *beg, char const *lim)
 }
 
 static void walk_maybe_recruit (void);
+static bool walk_bin_scan (char const *map, size_t size, size_t scan_offset);
 
 /* Search a given (non-directory) file.  Return a count of lines printed.
    Set *INEOF to true if end-of-file reached.  */
 static intmax_t
-grep (int fd, struct stat const *st, bool *ineof)
+grep (int fd, struct stat *st, bool *ineof)
 {
   intmax_t nlines, i;
   idx_t residue, save;
@@ -2032,6 +2100,25 @@ grep (int fd, struct stat const *st, bool *ineof)
 
   for (bool firsttime = true; ; firsttime = false)
     {
+      ptrdiff_t defer_off = -1;
+      bool defer_nulls = (firsttime && eof_known && !out_invert
+                          && list_files != LISTFILES_NONMATCHING
+                          && raw_matcher_index == F_MATCHER_INDEX
+                          && !match_lines
+                          && bufbeg < buflim && buflim[-1] == eol
+                          && binary_files != TEXT_BINARY_FILES && eol);
+      if (defer_nulls)
+        {
+          idx_t msize = 0;
+          defer_off = execute (compiled_pattern, bufbeg, buflim - bufbeg,
+                               &msize, nullptr);
+          if (defer_off < 0)
+            {
+              *ineof = true;
+              goto finish_grep;
+            }
+        }
+
       if (nlines_first_null < 0 && eol && binary_files != TEXT_BINARY_FILES
           && (buf_has_nulls (bufbeg, buflim - bufbeg)
               || (firsttime && file_must_have_nulls (buflim - bufbeg, fd, st))))
@@ -2049,6 +2136,29 @@ grep (int fd, struct stat const *st, bool *ineof)
           skip_nuls = skip_empty_lines;
         }
 
+      if (defer_off >= 0 && nlines_first_null < 0)
+        {
+          if (list_files == LISTFILES_MATCHING
+              || (done_on_match && out_quiet && !count_matches))
+            {
+              nlines = 1;
+              *ineof = true;
+              goto finish_grep;
+            }
+          lastnl = bufbeg;
+          if (lastout)
+            lastout = bufbeg;
+          char *beg = (out_before <= 0) ? bufbeg + defer_off : bufbeg;
+          char *lim = buflim;
+          residue = 0;
+          if (outleft)
+            nlines += grepbuf (beg, lim);
+          if (pending)
+            prpending (lim);
+          *ineof = true;
+          goto finish_grep;
+        }
+
       lastnl = bufbeg;
       if (lastout)
         lastout = bufbeg;
@@ -2062,7 +2172,13 @@ grep (int fd, struct stat const *st, bool *ineof)
           break;
         }
 
-      zap_nuls (beg, buflim, nul_zapper);
+      bool skip_zap = (nlines_first_null == 0 && out_quiet && done_on_match
+                       && !out_invert && list_files == LISTFILES_NONE
+                       && raw_matcher_index == F_MATCHER_INDEX
+                       && !match_lines && eol != '\0'
+                       && (!localeinfo.multibyte || localeinfo.using_utf8));
+      if (!skip_zap)
+        zap_nuls (beg, buflim, nul_zapper);
 
       /* Determine new residue (the length of an incomplete line at the end of
          the buffer, 0 means there is no incomplete last line).  */
@@ -2080,6 +2196,37 @@ grep (int fd, struct stat const *st, bool *ineof)
           if ((!outleft && !pending)
               || (done_on_match && MAX (0, nlines_first_null) < nlines))
             goto finish_grep;
+        }
+
+      if (skip_zap && firsttime && !eof_known)
+        {
+          if (st->st_size < 0)
+            fstat (fd, st);
+          if (S_ISREG (st->st_mode) && st->st_size >= 2 * 1024 * 1024)
+            {
+              if (walk_cur_task)
+                walk_split_rest ();
+              char const *map = mmap (nullptr, st->st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+              if (map != MAP_FAILED)
+                {
+                  madvise ((void *) map, st->st_size, MADV_SEQUENTIAL);
+                  if (walk_cur_task && st->st_size >= 16 * 1024 * 1024 && pool_target > 1)
+                    {
+                      if (walk_bin_scan (map, st->st_size, bufoffset))
+                        nlines = 1;
+                    }
+                  else
+                    {
+                      idx_t msize = 0;
+                      ptrdiff_t off = execute (compiled_pattern, map + bufoffset,
+                                               st->st_size - bufoffset, &msize, nullptr);
+                      if (off >= 0)
+                        nlines = 1;
+                    }
+                  munmap ((void *) map, st->st_size);
+                  goto finish_grep;
+                }
+            }
         }
 
       /* The last OUT_BEFORE lines at the end of the buffer will be needed as
@@ -2304,6 +2451,15 @@ grepdesc (int desc, bool command_line)
   bool ineof = false;
   struct stat st;
 
+  if (known_reg_nostat)
+    {
+      known_reg_nostat = false;
+      st.st_mode = S_IFREG;
+      st.st_size = -1;
+      count = grep (desc, &st, &ineof);
+      goto post_grep;
+    }
+
   /* Get the file status, possibly for the second time.  This catches
      a race condition if the directory entry changes after the
      directory entry is read and before the file is opened.  For
@@ -2348,7 +2504,7 @@ grepdesc (int desc, bool command_line)
       if (close (desc) != 0)
         suppressible_error (errno);
 
-      fts_arg[0] = (char *) filename;
+      fts_arg[0] = (char *) input_filename ();
       fts_arg[1] = nullptr;
       fts = fts_open (fts_arg, opts, nullptr);
 
@@ -2408,6 +2564,7 @@ grepdesc (int desc, bool command_line)
     }
 
   count = grep (desc, &st, &ineof);
+ post_grep:
   if (count_matches)
     {
       if (out_file)
@@ -2585,8 +2742,6 @@ static struct
   { "perl", 0, Pcompile, Pexecute, },
 #endif
 };
-/* Keep these in sync with the 'matchers' table.  */
-enum { E_MATCHER_INDEX = 1, F_MATCHER_INDEX = 2, G_MATCHER_INDEX = 0 };
 
 /* Clone a compiled pattern instance for a worker thread.  */
 void *
@@ -2808,6 +2963,15 @@ setup_ok_fold (void)
           mbstate_t s; mbszero (&s);
           if (c32rtomb (buf, folded[n], &s) != 1)
             {
+              if (localeinfo.using_utf8 && (unsigned char) i < 128
+                  && (unsigned char) toupper (i) < 128
+                  && (unsigned char) tolower (i) < 128
+                  && toupper ('i') == 'I' && tolower ('I') == 'i')
+                {
+                  if ((folded[n] == 0x0131 && (i == 'i' || i == 'I'))
+                      || (folded[n] == 0x017F && (i == 's' || i == 'S')))
+                    continue;
+                }
               ok = -1;
               break;
             }
@@ -2934,6 +3098,7 @@ try_fgrep_pattern (int matcher, char *keys, idx_t *len_p)
   char *p = new_keys;
   char const *q = keys;
   mbstate_t mb_state; mbszero (&mb_state);
+  idx_t n_alts = 0;
 
   while (len != 0)
     {
@@ -2942,36 +3107,68 @@ try_fgrep_pattern (int matcher, char *keys, idx_t *len_p)
         case '$': case '*': case '.': case '[': case '^':
           goto fail;
 
-        case '(': case '+': case '?': case '{': case '|':
+        case '(': case '+': case '?': case '{':
           /* There is no "case ')'" here, as "grep -E ')'" acts like
              "grep -E '\)'".  */
           if (matcher != G_MATCHER_INDEX)
             goto fail;
           break;
 
+        case '|':
+          if (matcher == E_MATCHER_INDEX)
+            {
+              if (p > new_keys && p[-1] != '\n'
+                  && len > 1 && q[1] != '\n' && q[1] != '|')
+                {
+                  *p++ = '\n';
+                  n_alts++;
+                  q++;
+                  len--;
+                  continue;
+                }
+              goto fail;
+            }
+          break;
+
         case '\\':
           if (1 < len)
-            switch (q[1])
-              {
-              case '\n':
-              case 'B': case 'S': case 'W': case'\'': case '<':
-              case 'b': case 's': case 'w': case '`': case '>':
-              case '1': case '2': case '3': case '4':
-              case '5': case '6': case '7': case '8': case '9':
-                goto fail;
-
-              case '(': case '+': case '?': case '{': case '|':
-                /* Pass '\)' to GEAcompile so it can complain.  Otherwise,
-                   "grep '\)'" would act like "grep ')'" while "grep '.*\)'
-                   would be an error.  */
-              case ')':
-                if (matcher == G_MATCHER_INDEX)
+            {
+              if (matcher == G_MATCHER_INDEX && q[1] == '|')
+                {
+                  if (p > new_keys && p[-1] != '\n'
+                      && len > 2 && q[2] != '\n'
+                      && !(len > 3 && q[2] == '\\' && q[3] == '|'))
+                    {
+                      *p++ = '\n';
+                      n_alts++;
+                      q += 2;
+                      len -= 2;
+                      continue;
+                    }
                   goto fail;
-                FALLTHROUGH;
-              default:
-                q++, len--;
-                break;
-              }
+                }
+              switch (q[1])
+                {
+                case '\n':
+                case 'B': case 'S': case 'W': case'\'': case '<':
+                case 'b': case 's': case 'w': case '`': case '>':
+                case '1': case '2': case '3': case '4':
+                case '5': case '6': case '7': case '8': case '9':
+                  goto fail;
+
+                case '(': case '+': case '?': case '{': case '|':
+                  /* Pass '\)' to GEAcompile so it can complain.  Otherwise,
+                     "grep '\)'" would act like "grep ')'" while "grep '.*\)'"
+                     would be an error.  */
+                case ')':
+                  if (matcher == G_MATCHER_INDEX)
+                    goto fail;
+                  FALLTHROUGH;
+                default:
+                  q++, len--;
+                  break;
+                }
+            }
           break;
         }
 
@@ -2985,12 +3182,17 @@ try_fgrep_pattern (int matcher, char *keys, idx_t *len_p)
       len -= clen;
     }
 
-  if (*len_p != p - new_keys)
+  if (matcher != F_MATCHER_INDEX && n_patterns + n_alts <= 1
+      && !(match_icase && !(match_words && !localeinfo.multibyte)))
+    goto fail;
+
+  if (n_alts > 0 || *len_p != p - new_keys)
     {
       *len_p = p - new_keys;
       char *keys_end = mempcpy (keys, new_keys, p - new_keys);
       *keys_end = '\n';
     }
+  n_patterns += n_alts;
   result = F_MATCHER_INDEX;
 
  fail:
@@ -3272,7 +3474,6 @@ static pthread_t *pool_threads;
    directory traversal first runs on the main thread alone and recruits
    them only if it lasts long enough, so that small trees and early exits
    do not pay for starting and stopping threads.  */
-static int pool_target;
 static bool pool_started;
 
 /* The number of entries of POOL_THREADS that have been filled in, and
@@ -4966,6 +5167,29 @@ static void stream_slicer_stdin (void);
 static void
 chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st_in)
 {
+  if (exit_on_match && !out_invert && !pool_started)
+    {
+      char prebuf[65536 + 1];
+      prebuf[0] = eolbyte;
+      ssize_t n;
+      do
+        n = pread (fd, prebuf + 1, 65536, 0);
+      while (n < 0 && errno == EINTR);
+      if (n > 0 && (!eolbyte || binary_files == TEXT_BINARY_FILES || memchr (prebuf + 1, '\0', n) == nullptr))
+        {
+          char const *lim = memrchr (prebuf + 1, eolbyte, n);
+          if (lim && lim > prebuf + 1)
+            {
+              idx_t msize = 0;
+              ptrdiff_t off = execute (compiled_pattern, prebuf + 1, lim - (prebuf + 1), &msize, nullptr);
+              if (off >= 0)
+                {
+                  stdout_errno = -1;
+                  exit (EXIT_SUCCESS);
+                }
+            }
+        }
+    }
   ensure_pool ();
   struct stat st;
   if (st_in)
@@ -5636,6 +5860,7 @@ struct walk_ent
   ino_t ino;                    /* d_ino, for sorting */
   struct walk_out *out;         /* output to commit, or null */
   struct walk_dir *sub;         /* WALK_DIR: the directory, once read */
+  unsigned short namelen;       /* length of name */
   unsigned char type;           /* d_type */
   unsigned char kind;           /* enum walk_kind */
   bool status;                  /* true if no lines were selected */
@@ -5652,6 +5877,7 @@ struct walk_dir
   struct walk_dir *parent;      /* null for the holder of the root */
   size_t pindex;                /* index of this directory in PARENT */
   size_t depth;                 /* 0 for the holder of the root */
+  uint64_t key_lo, key_hi;      /* fts order key range */
   struct walk_ent *ents;
   size_t nents;
   size_t cpos;                  /* position of the commit cursor */
@@ -5664,6 +5890,7 @@ struct walk_dir
   atomic_int fd;                /* open descriptor, or -1 */
   atomic_int fd_users;          /* pending tasks that need FD */
   atomic_int refs;              /* references to this structure */
+  bool in_fd_list;              /* registered on walk.fd_list */
   struct walk_dir *fd_prev, *fd_next;   /* list of directories with FD */
 };
 
@@ -5673,6 +5900,7 @@ struct walk_task
 {
   struct walk_dir *dir;
   size_t lo, hi;
+  uint64_t key;
   bool read;
 };
 
@@ -5681,6 +5909,16 @@ struct walk_heap
 {
   struct walk_task **v;
   idx_t n, alloc;
+};
+
+struct walk_bin_job
+{
+  char const *data;
+  size_t size;
+  atomic_size_t next_offset;
+  atomic_bool found;
+  atomic_int active_workers;
+  size_t slice_size;
 };
 
 enum { WALK_BUF_CAP = 256 * 1024 * 1024 };
@@ -5697,6 +5935,7 @@ static struct
   unsigned int gen;             /* number of the current traversal */
   bool done;                    /* the traversal is fully committed */
   atomic_size_t buffered_bytes; /* bytes held in uncommitted walk_out records */
+  struct walk_bin_job *bin_job;
 
   bool logical;                 /* -R: use full names */
   int fd_cap;                   /* soft limit on open directories */
@@ -5707,7 +5946,7 @@ static struct
 
   pthread_mutex_t commit_mu;    /* held by the committer */
   atomic_ulong commit_req;      /* commit attempts so far */
-  struct walk_dir *cur;         /* directory of the commit cursor */
+  _Atomic (struct walk_dir *) cur; /* directory of the commit cursor */
 } walk =
   {
     .mu = PTHREAD_MUTEX_INITIALIZER,
@@ -5716,6 +5955,7 @@ static struct
     .fd_mu = PTHREAD_MUTEX_INITIALIZER,
     .commit_mu = PTHREAD_MUTEX_INITIALIZER,
   };
+
 
 /* Whether the worker threads were asked to join the current traversal,
    when it started, and whether the current thread is the main thread,
@@ -5766,15 +6006,14 @@ walk_fd_safer (int fd)
   return fd;
 }
 
-/* Store into WALK_PBUF the fts_path of entry NAME of directory D, and
+/* Store into WALK_PBUF the fts_path of entry NAME (length NLEN) of directory D, and
    return it.  */
 static char *
-walk_path (struct walk_dir const *d, char const *name)
+walk_path_len (struct walk_dir const *d, char const *name, size_t nlen)
 {
   size_t dlen = d->pathlen;
   if (dlen && d->path[dlen - 1] == '/')
     dlen--;
-  size_t nlen = strlen (name);
   idx_t need = dlen + 1 + nlen + 1;
   if (walk_pbufsize < need)
     {
@@ -5784,8 +6023,17 @@ walk_path (struct walk_dir const *d, char const *name)
     }
   char *p = mempcpy (walk_pbuf, d->path, dlen);
   *p++ = '/';
-  memcpy (p, name, nlen + 1);
+  memcpy (p, name, nlen);
+  p[nlen] = '\0';
   return walk_pbuf;
+}
+
+/* Store into WALK_PBUF the fts_path of entry NAME of directory D, and
+   return it.  */
+static char *
+walk_path (struct walk_dir const *d, char const *name)
+{
+  return walk_path_len (d, name, strlen (name));
 }
 
 /* Return how grep names file name PATH in diagnostics and output.  */
@@ -5800,7 +6048,10 @@ walk_shown_name (char const *path)
 static char *
 walk_ent_path (struct walk_dir const *d, struct walk_ent const *e)
 {
-  return d->parent ? walk_path (d, e->name) : (char *) e->name;
+  if (!d->parent)
+    return (char *) e->name;
+  size_t nlen = (e->namelen < 65535 && e->namelen > 0) ? e->namelen : strlen (e->name);
+  return walk_path_len (d, e->name, nlen);
 }
 
 /* Return a new output record holding diagnostic error (0, ERRNUM, FMT,
@@ -5901,6 +6152,8 @@ walk_before (struct walk_dir const *a, size_t i,
 static bool _GL_ATTRIBUTE_PURE
 walk_task_before (struct walk_task const *a, struct walk_task const *b)
 {
+  if (a->key != b->key)
+    return a->key < b->key;
   return walk_before (a->dir, a->lo, b->dir, b->lo);
 }
 
@@ -5981,6 +6234,7 @@ walk_set_fd_locked (struct walk_dir *d, int fd)
   if (walk.fd_list)
     walk.fd_list->fd_prev = d;
   walk.fd_list = d;
+  d->in_fd_list = true;
 }
 
 /* Close the descriptor of D.  WALK.fd_mu must be held.  */
@@ -5992,13 +6246,19 @@ walk_close_fd_locked (struct walk_dir *d)
     return;
   close (fd);
   atomic_store_explicit (&d->fd, -1, memory_order_relaxed);
-  atomic_fetch_sub (&walk.open_fds, 1);
-  if (d->fd_prev)
-    d->fd_prev->fd_next = d->fd_next;
-  else
-    walk.fd_list = d->fd_next;
-  if (d->fd_next)
-    d->fd_next->fd_prev = d->fd_prev;
+  if (d->in_fd_list)
+    {
+      atomic_fetch_sub (&walk.open_fds, 1);
+      if (d->fd_prev)
+        d->fd_prev->fd_next = d->fd_next;
+      else if (walk.fd_list == d)
+        walk.fd_list = d->fd_next;
+      if (d->fd_next)
+        d->fd_next->fd_prev = d->fd_prev;
+      d->fd_prev = nullptr;
+      d->fd_next = nullptr;
+      d->in_fd_list = false;
+    }
 }
 
 /* A task that needed the descriptor of D is done with it.  */
@@ -6007,6 +6267,14 @@ walk_fd_release (struct walk_dir *d)
 {
   if (!walk.logical && atomic_fetch_sub (&d->fd_users, 1) == 1)
     {
+      if (!d->in_fd_list)
+        {
+          int fd = atomic_load_explicit (&d->fd, memory_order_relaxed);
+          if (0 <= fd)
+            close (fd);
+          atomic_store_explicit (&d->fd, -1, memory_order_relaxed);
+          return;
+        }
       pthread_mutex_lock (&walk.fd_mu);
       walk_close_fd_locked (d);
       pthread_mutex_unlock (&walk.fd_mu);
@@ -6114,6 +6382,17 @@ walk_dir_new (struct walk_dir *parent, size_t pindex, char const *path,
   d->parent = parent;
   d->pindex = pindex;
   d->depth = parent ? parent->depth + 1 : 0;
+  if (!parent)
+    {
+      d->key_lo = 0;
+      d->key_hi = UINT64_MAX;
+    }
+  else
+    {
+      uint64_t pspan = (parent->key_hi - parent->key_lo) / (parent->nents + 1);
+      d->key_lo = parent->key_lo + pindex * pspan + (pspan > 0);
+      d->key_hi = parent->key_lo + (pindex + 1) * pspan;
+    }
   d->path = ximemdup0 (path, pathlen);
   d->pathlen = pathlen;
   atomic_init (&d->fd, -1);
@@ -6139,6 +6418,7 @@ walk_add_ent (struct walk_dir *d, idx_t *nalloc, idx_t *namesalloc,
   struct walk_ent *e = &d->ents[d->nents++];
   memset (e, 0, sizeof *e);
   e->name = (char const *) *namesused;
+  e->namelen = (unsigned short) MIN (len - 1, 65535);
   e->ino = ino;
   e->type = type;
   e->status = true;
@@ -6277,7 +6557,7 @@ walk_classify_stat (struct walk_dir *d, struct walk_ent *e,
 {
   if (S_ISDIR (st->st_mode))
     e->kind = WALK_DIR;
-  else if (skipped_file (e->name, false, false) || S_ISLNK (st->st_mode)
+  else if (walk_file_skipped (e->name, e->namelen) || S_ISLNK (st->st_mode)
            || (!S_ISREG (st->st_mode) && skip_devices (false)
                && is_device_mode (st->st_mode)))
     e->kind = WALK_SKIP;
@@ -6301,7 +6581,7 @@ walk_classify (struct walk_dir *d, int fd)
         {
           /* fts does not stat these; grepdirent checks the type.  */
           mode_t m = DTTOIF (t);
-          e->kind = (skipped_file (e->name, false, false)
+          e->kind = (walk_file_skipped (e->name, e->namelen)
                      || (t != DT_REG && skip_devices (false)
                          && is_device_mode (m))
                      ? WALK_SKIP : WALK_FILE);
@@ -6323,7 +6603,7 @@ walk_classify (struct walk_dir *d, int fd)
               if (!ok && errno == ENOENT && lstat (path, &st) == 0)
                 {
                   /* FTS_SLNONE: grep tries to open it.  */
-                  e->kind = (skipped_file (e->name, false, false)
+                  e->kind = (walk_file_skipped (e->name, e->namelen)
                              ? WALK_SKIP : WALK_FILE);
                   goto classified;
                 }
@@ -6350,12 +6630,41 @@ walk_classify (struct walk_dir *d, int fd)
 static void
 walk_search (struct walk_dir *d, int dfd, struct walk_ent *e, bool may_defer)
 {
-  char *path = walk_path (d, e->name);
   task_reset ();
-  filename = walk_shown_name (path);
   tls_may_defer = may_defer && exact_stdout;
-  e->status = grepfile (dfd, walk.logical ? path : e->name, walk.logical,
-                        false);
+
+  char const *search_name;
+  if (!d->parent)
+    {
+      filename = walk_shown_name (e->name);
+      walk_cur_dir = nullptr;
+      walk_cur_ent = nullptr;
+      search_name = e->name;
+    }
+  else if (walk.logical)
+    {
+      char *path = walk_ent_path (d, e);
+      filename = walk_shown_name (path);
+      walk_cur_dir = nullptr;
+      walk_cur_ent = nullptr;
+      search_name = path;
+    }
+  else
+    {
+      filename = nullptr;
+      walk_cur_dir = d;
+      walk_cur_ent = e;
+      search_name = e->name;
+    }
+
+  known_reg_nostat = (d->parent != nullptr && !walk.logical && e->type == DT_REG
+                      && !(S_ISREG (out_stat.st_mode)
+                           && (e->ino == 0 || e->ino == out_stat.st_ino)));
+  e->status = grepfile (dfd, search_name,
+                        walk.logical || !d->parent, !d->parent);
+  known_reg_nostat = false;
+  walk_cur_dir = nullptr;
+  walk_cur_ent = nullptr;
   tls_may_defer = false;
   e->errseen = tls_errseen;
   e->used = task_had_prtext;
@@ -6386,11 +6695,13 @@ walk_search (struct walk_dir *d, int dfd, struct walk_ent *e, bool may_defer)
     }
 }
 
-static void walk_push_dir (struct walk_dir *d);
+static struct walk_task * walk_push_dir (struct walk_dir *d, int fd);
+static void walk_search_files (struct walk_task *t);
+static void walk_commit (void);
 
 /* Read the directory named by entry PINDEX of P, as fts would when it
    reaches that entry, and record what to commit for it.  */
-static void
+static struct walk_task *
 walk_read_dir (struct walk_dir *p, size_t pindex)
 {
   struct walk_ent *e = &p->ents[pindex];
@@ -6409,23 +6720,23 @@ walk_read_dir (struct walk_dir *p, size_t pindex)
               if (err == ENOENT && lstat (path, &st) == 0)
                 goto search_as_file;
               walk_ent_stat_error (p, e, err);
-              return;
+              return nullptr;
             }
           if (!S_ISDIR (st.st_mode))
             goto search_as_file;
           if (skipped_file (e->name, false, true))
-            return;
+            return nullptr;
           if (walk_is_loop (p, st.st_dev, st.st_ino))
             {
               walk_ent_loop (p, e);
-              return;
+              return nullptr;
             }
         }
       fd = walk_fd_safer (open (path, WALK_DIR_FLAGS));
       if (fd < 0)
         {
           walk_ent_error (p, e, errno);
-          return;
+          return nullptr;
         }
     }
   else if (root)
@@ -6434,7 +6745,7 @@ walk_read_dir (struct walk_dir *p, size_t pindex)
       if (fd < 0)
         {
           walk_ent_error (p, e, errno);
-          return;
+          return nullptr;
         }
     }
   else
@@ -6443,7 +6754,7 @@ walk_read_dir (struct walk_dir *p, size_t pindex)
       if (pfd < 0)
         {
           walk_ent_error (p, e, errno);
-          return;
+          return nullptr;
         }
       if (skipped_file (e->name, false, true))
         {
@@ -6451,7 +6762,7 @@ walk_read_dir (struct walk_dir *p, size_t pindex)
              if that failed.  */
           if (fstatat (pfd, e->name, &st, AT_SYMLINK_NOFOLLOW) != 0)
             walk_ent_stat_error (p, e, errno);
-          return;
+          return nullptr;
         }
       fd = walk_fd_safer (openat (pfd, e->name, WALK_DIR_FLAGS | O_NOFOLLOW));
       if (fd < 0)
@@ -6465,7 +6776,7 @@ walk_read_dir (struct walk_dir *p, size_t pindex)
             walk_ent_loop (p, e);
           else
             walk_ent_error (p, e, err);
-          return;
+          return nullptr;
         }
     }
 
@@ -6474,13 +6785,13 @@ walk_read_dir (struct walk_dir *p, size_t pindex)
       int err = errno;
       close (fd);
       walk_ent_error (p, e, err);
-      return;
+      return nullptr;
     }
   if (!root && !walk.logical && walk_is_loop (p, st.st_dev, st.st_ino))
     {
       close (fd);
       walk_ent_loop (p, e);
-      return;
+      return nullptr;
     }
 
   struct walk_dir *d = walk_dir_new (p, pindex, path, strlen (path));
@@ -6493,7 +6804,7 @@ walk_read_dir (struct walk_dir *p, size_t pindex)
       close (fd);
       walk_unref (d);
       walk_ent_error (p, e, err);
-      return;
+      return nullptr;
     }
   if (err)
     {
@@ -6503,17 +6814,8 @@ walk_read_dir (struct walk_dir *p, size_t pindex)
     }
   walk_sort (d, fd);
   walk_classify (d, fd);
-  if (walk.logical)
-    close (fd);
-  else
-    {
-      pthread_mutex_lock (&walk.fd_mu);
-      walk_set_fd_locked (d, fd);
-      pthread_mutex_unlock (&walk.fd_mu);
-    }
   e->sub = d;
-  walk_push_dir (d);
-  return;
+  return walk_push_dir (d, fd);
 
  search_as_file:
   /* The entry is no longer a directory.  Search it as grepdirent would
@@ -6525,18 +6827,20 @@ walk_read_dir (struct walk_dir *p, size_t pindex)
       e->kind = WALK_FILE;
       walk_search (p, walk.logical ? AT_FDCWD : walk_dir_fd (p), e, false);
     }
+  return nullptr;
 }
 
 /* Queue the tasks for the entries of the directory D, which has just
    been read.  */
-static void
-walk_push_dir (struct walk_dir *d)
+static struct walk_task *
+walk_push_dir (struct walk_dir *d, int fd)
 {
   /* Build the tasks before taking the lock.  */
   struct walk_task *stackv[64];
   struct walk_task **v = stackv;
   idx_t nv = 0, valloc = sizeof stackv / sizeof *stackv;
   size_t batch_lo = 0, batch_files = 0;
+  uint64_t span = (d->key_hi - d->key_lo) / (d->nents + 1);
   for (size_t i = 0; i <= d->nents; i++)
     {
       struct walk_ent *e = i < d->nents ? &d->ents[i] : nullptr;
@@ -6548,6 +6852,7 @@ walk_push_dir (struct walk_dir *d)
             {
               t = xmalloc (sizeof *t);
               *t = (struct walk_task) { .dir = d, .lo = batch_lo, .hi = i,
+                                        .key = d->key_lo + batch_lo * span,
                                         .read = false };
               batch_files = 0;
             }
@@ -6555,6 +6860,7 @@ walk_push_dir (struct walk_dir *d)
             {
               t = xmalloc (sizeof *t);
               *t = (struct walk_task) { .dir = d, .lo = i, .hi = i + 1,
+                                        .key = d->key_lo + i * span,
                                         .read = true };
             }
           if (t)
@@ -6581,26 +6887,40 @@ walk_push_dir (struct walk_dir *d)
         }
     }
 
-  atomic_fetch_add (&d->refs, nv);
-  if (!walk.logical)
+  struct walk_task *next = nullptr;
+  if (nv > 0)
     {
-      if (nv)
-        atomic_fetch_add (&d->fd_users, nv);
-      else
-        {
-          pthread_mutex_lock (&walk.fd_mu);
-          walk_close_fd_locked (d);
-          pthread_mutex_unlock (&walk.fd_mu);
-        }
+      if (!v[0]->read || walk.logical || atomic_load (&walk.open_fds) < walk.fd_cap)
+        next = v[0];
+    }
+  atomic_fetch_add (&d->refs, nv);
+  if (walk.logical || nv == 0)
+    {
+      if (0 <= fd)
+        close (fd);
+    }
+  else if (nv == 1 && next != nullptr)
+    {
+      atomic_store_explicit (&d->fd, fd, memory_order_relaxed);
+      atomic_store_explicit (&d->fd_users, 1, memory_order_relaxed);
+    }
+  else
+    {
+      atomic_fetch_add (&d->fd_users, nv);
+      pthread_mutex_lock (&walk.fd_mu);
+      walk_set_fd_locked (d, fd);
+      pthread_mutex_unlock (&walk.fd_mu);
     }
 
-  if (nv)
+  idx_t start_k = (next != nullptr) ? 1 : 0;
+  if (start_k < nv)
     {
       pthread_mutex_lock (&walk.mu);
-      for (idx_t k = 0; k < nv; k++)
+      for (idx_t k = start_k; k < nv; k++)
         walk_heap_push (v[k]->read ? &walk.reads : &walk.files, v[k]);
-      if (nv < walk.idle)
-        for (idx_t k = 0; k < nv; k++)
+      idx_t pushed = nv - start_k;
+      if (pushed < walk.idle)
+        for (idx_t k = 0; k < pushed; k++)
           pthread_cond_signal (&walk.cv);
       else if (walk.idle)
         pthread_cond_broadcast (&walk.cv);
@@ -6608,6 +6928,8 @@ walk_push_dir (struct walk_dir *d)
     }
   if (v != stackv)
     free (v);
+
+  return next;
 }
 
 /* Ask the worker threads to join traversal number GEN.  */
@@ -6645,8 +6967,6 @@ walk_maybe_recruit (void)
     }
 }
 
-static void walk_commit (void);
-
 /* A batch of files that has been searched for this many nanoseconds
    gives the second half of the files it has left to other threads, so
    that a batch of files that are slow to search is spread over the
@@ -6669,14 +6989,27 @@ walk_split (struct walk_task *t, size_t lo)
 {
   struct walk_dir *d = t->dir;
   struct walk_task *n = xmalloc (sizeof *n);
-  *n = (struct walk_task) { .dir = d, .lo = lo, .hi = t->hi, .read = false };
+  uint64_t span = (d->key_hi - d->key_lo) / (d->nents + 1);
+  *n = (struct walk_task) { .dir = d, .lo = lo, .hi = t->hi,
+                            .key = d->key_lo + lo * span,
+                            .read = false };
   t->hi = lo;
 
   /* T keeps its own reference and descriptor use until it ends, so
      neither count can drop to zero before N takes its own.  */
   atomic_fetch_add (&d->refs, 1);
   if (!walk.logical)
-    atomic_fetch_add (&d->fd_users, 1);
+    {
+      atomic_fetch_add (&d->fd_users, 1);
+      pthread_mutex_lock (&walk.fd_mu);
+      if (!d->in_fd_list)
+        {
+          int cur_fd = atomic_load_explicit (&d->fd, memory_order_relaxed);
+          if (0 <= cur_fd)
+            walk_set_fd_locked (d, cur_fd);
+        }
+      pthread_mutex_unlock (&walk.fd_mu);
+    }
 
   pthread_mutex_lock (&walk.mu);
   walk_heap_push (&walk.files, n);
@@ -6704,7 +7037,7 @@ static void
 walk_search_files (struct walk_task *t)
 {
   struct walk_dir *d = t->dir;
-  int dfd = walk.logical ? AT_FDCWD : walk_dir_fd (d);
+  int dfd = (walk.logical || !d->parent) ? AT_FDCWD : walk_dir_fd (d);
   int fderr = errno;
   struct timespec start, prev;
   clock_gettime (CLOCK_MONOTONIC, &start);
@@ -6714,7 +7047,7 @@ walk_search_files (struct walk_task *t)
       struct walk_ent *e = &d->ents[i];
       if (e->kind != WALK_FILE)
         continue;
-      if (dfd < 0 && !walk.logical)
+      if (dfd < 0 && !walk.logical && d->parent)
         walk_ent_error (d, e, fderr);
       else
         {
@@ -6727,6 +7060,17 @@ walk_search_files (struct walk_task *t)
               /* The committer will need the directory.  */
               atomic_fetch_add (&d->refs, 1);
               atomic_fetch_add (&d->fd_users, 1);
+              if (!walk.logical)
+                {
+                  pthread_mutex_lock (&walk.fd_mu);
+                  if (!d->in_fd_list)
+                    {
+                      int cur_fd = atomic_load_explicit (&d->fd, memory_order_relaxed);
+                      if (0 <= cur_fd)
+                        walk_set_fd_locked (d, cur_fd);
+                    }
+                  pthread_mutex_unlock (&walk.fd_mu);
+                }
             }
         }
       atomic_store_explicit (&e->done, true, memory_order_release);
@@ -6737,7 +7081,7 @@ walk_search_files (struct walk_task *t)
         walk_commit ();
       walk_maybe_recruit ();
 
-      if (2 <= t->hi - (i + 1))
+      if (WALK_SPLIT_MIN_REM <= t->hi - (i + 1))
         {
           struct timespec now;
           clock_gettime (CLOCK_MONOTONIC, &now);
@@ -6747,8 +7091,7 @@ walk_search_files (struct walk_task *t)
                                + now.tv_nsec - start.tv_nsec);
           prev = now;
           if (WALK_SPLIT_FILE_NS <= file_ns
-              || (WALK_SPLIT_NS <= batch_ns
-                  && WALK_SPLIT_MIN_REM <= t->hi - (i + 1)))
+              || WALK_SPLIT_NS <= batch_ns)
             {
               walk_split (t, i + 1 + (t->hi - i) / 2);
               start = now;
@@ -6758,21 +7101,37 @@ walk_search_files (struct walk_task *t)
 }
 
 /* Run task T.  */
-static void
+static bool
 walk_run_task (struct walk_task *t)
 {
-  struct walk_dir *d = t->dir;
-  if (t->read)
+  bool any_commit = false;
+  while (t)
     {
-      walk_read_dir (d, t->lo);
-      atomic_store_explicit (&d->ents[t->lo].done, true,
-                             memory_order_release);
+      struct walk_dir *d = t->dir;
+      struct walk_task *next = nullptr;
+      if (t->read)
+        {
+          next = walk_read_dir (d, t->lo);
+          atomic_store_explicit (&d->ents[t->lo].done, true,
+                                 memory_order_release);
+        }
+      else
+        {
+          walk_search_files (t);
+        }
+      bool should_commit = (d == atomic_load_explicit (&walk.cur, memory_order_relaxed));
+      if (should_commit)
+        {
+          walk_commit ();
+          any_commit = true;
+        }
+      if (d->parent)
+        walk_fd_release (d);
+      walk_unref (d);
+      free (t);
+      t = next;
     }
-  else
-    walk_search_files (t);
-  walk_fd_release (d);
-  walk_unref (d);
-  free (t);
+  return any_commit;
 }
 
 /* Search the output file, entry E of D, now that everything before it
@@ -6829,7 +7188,7 @@ walk_commit_locked (void)
   bool saved_buffering = buffering_enabled;
   buffering_enabled = false;
   size_t before_bytes = atomic_load (&walk.buffered_bytes);
-  struct walk_dir *d = walk.cur;
+  struct walk_dir *d = atomic_load_explicit (&walk.cur, memory_order_acquire);
   while (d)
     {
       if (d->cpos == d->nents)
@@ -6843,7 +7202,7 @@ walk_commit_locked (void)
           struct walk_dir *p = d->parent;
           if (p)
             p->cpos++;
-          walk.cur = p;
+          atomic_store_explicit (&walk.cur, p, memory_order_release);
           walk_unref (d);
           d = p;
           continue;
@@ -6856,7 +7215,8 @@ walk_commit_locked (void)
       walk_commit_ent (e);
       if (e->sub)
         {
-          d = walk.cur = e->sub;
+          d = e->sub;
+          atomic_store_explicit (&walk.cur, d, memory_order_release);
           e->sub = nullptr;
           continue;
         }
@@ -6907,7 +7267,9 @@ walk_pick (void)
     return nullptr;
   struct walk_task *r = walk.reads.n ? walk.reads.v[0] : nullptr;
   struct walk_task *f = walk.files.n ? walk.files.v[0] : nullptr;
-  if (r && (!f || walk_task_before (r, f))
+  if (r && (!f || walk_task_before (r, f)
+            || (walk.files.n < 4 * pool_target
+                && atomic_load (&walk.buffered_bytes) < WALK_BUF_CAP / 2))
       && (walk.logical || atomic_load (&walk.open_fds) < walk.fd_cap))
     return walk_heap_pop (&walk.reads);
   if (f)
@@ -6918,6 +7280,55 @@ walk_pick (void)
       return walk_heap_pop (&walk.reads);
     }
   return nullptr;
+}
+
+static void
+walk_help_bin_job (struct walk_bin_job *job)
+{
+  size_t slice = job->slice_size;
+  while (!atomic_load_explicit (&job->found, memory_order_relaxed))
+    {
+      size_t off = atomic_fetch_add (&job->next_offset, slice);
+      if (off >= job->size)
+        break;
+      size_t len = MIN (slice + 65536, job->size - off);
+      idx_t msize = 0;
+      ptrdiff_t res = execute (compiled_pattern, job->data + off, len, &msize, nullptr);
+      if (res >= 0)
+        {
+          atomic_store_explicit (&job->found, true, memory_order_release);
+          break;
+        }
+    }
+}
+
+static bool
+walk_bin_scan (char const *map, size_t size, size_t scan_offset)
+{
+  struct walk_bin_job job;
+  job.data = map;
+  job.size = size;
+  atomic_init (&job.next_offset, scan_offset);
+  atomic_init (&job.found, false);
+  atomic_init (&job.active_workers, 1);
+  job.slice_size = 4 * 1024 * 1024;
+
+  pthread_mutex_lock (&walk.mu);
+  walk.bin_job = &job;
+  if (walk.idle)
+    pthread_cond_broadcast (&walk.cv);
+  pthread_mutex_unlock (&walk.mu);
+
+  walk_help_bin_job (&job);
+
+  pthread_mutex_lock (&walk.mu);
+  walk.bin_job = nullptr;
+  pthread_mutex_unlock (&walk.mu);
+
+  while (atomic_load (&job.active_workers) > 1)
+    sched_yield ();
+
+  return atomic_load (&job.found);
 }
 
 /* Take part in traversal number GEN until it is over.  */
@@ -6936,6 +7347,16 @@ walk_participate (unsigned int gen)
       struct walk_task *t = walk_pick ();
       if (!t)
         {
+          if (walk.bin_job)
+            {
+              struct walk_bin_job *job = walk.bin_job;
+              atomic_fetch_add (&job->active_workers, 1);
+              pthread_mutex_unlock (&walk.mu);
+              walk_help_bin_job (job);
+              atomic_fetch_sub (&job->active_workers, 1);
+              pthread_mutex_lock (&walk.mu);
+              continue;
+            }
           if (walk.done)
             break;
           walk.idle++;
@@ -6945,11 +7366,18 @@ walk_participate (unsigned int gen)
         }
       walk.running++;
       pthread_mutex_unlock (&walk.mu);
-      walk_run_task (t);
-      walk_commit ();
+      bool should_commit = walk_run_task (t);
+      if (should_commit)
+        walk_commit ();
       walk_maybe_recruit ();
       pthread_mutex_lock (&walk.mu);
       walk.running--;
+      if (!should_commit && walk.running == 0)
+        {
+          pthread_mutex_unlock (&walk.mu);
+          walk_commit ();
+          pthread_mutex_lock (&walk.mu);
+        }
     }
   if (--walk.inside == 0)
     pthread_cond_broadcast (&walk.left_cv);
@@ -6973,9 +7401,9 @@ walk_fd_cap (void)
   return MAX (2, MIN (cap, 4096));
 }
 
-/* Search directory DIR, a command-line operand, recursively.  */
+/* Search contiguous directory operands recursively.  */
 static void
-walk_run (char const *dir)
+walk_run_dirs (char *const *dirs, size_t ndirs)
 {
   /* Commit all output that precedes the traversal.  */
   producer_flush_batch ();
@@ -6991,36 +7419,150 @@ walk_run (char const *dir)
     }
   pthread_mutex_unlock (&pool_mutex);
 
-  /* Like fts_open, trim all but one trailing slash.  */
-  size_t len = strlen (dir);
-  if (2 < len && dir[len - 1] == '/')
-    while (1 < len && dir[len - 2] == '/')
-      --len;
-
   struct walk_dir *holder = walk_dir_new (nullptr, 0, "", 0);
-  holder->names = ximemdup0 (dir, len);
-  holder->ents = xzalloc (sizeof *holder->ents);
-  holder->nents = 1;
-  holder->ents[0].name = holder->names;
-  holder->ents[0].kind = WALK_DIR;
-  holder->ents[0].status = true;
-  atomic_init (&holder->refs, 2);
-  atomic_init (&holder->fd_users, 1);
-  struct walk_task *t = xmalloc (sizeof *t);
-  *t = (struct walk_task) { .dir = holder, .lo = 0, .hi = 1, .read = true };
+  holder->ents = xzalloc (ndirs * sizeof *holder->ents);
+  holder->nents = ndirs;
+
+  idx_t total_names_len = 0;
+  for (size_t i = 0; i < ndirs; i++)
+    {
+      size_t len = strlen (dirs[i]);
+      if (2 < len && dirs[i][len - 1] == '/')
+        while (1 < len && dirs[i][len - 2] == '/')
+          --len;
+      total_names_len += len + 1;
+    }
+  holder->names = ximalloc (total_names_len);
+  char *p = holder->names;
+  for (size_t i = 0; i < ndirs; i++)
+    {
+      size_t len = strlen (dirs[i]);
+      if (2 < len && dirs[i][len - 1] == '/')
+        while (1 < len && dirs[i][len - 2] == '/')
+          --len;
+      memcpy (p, dirs[i], len);
+      p[len] = '\0';
+      holder->ents[i].name = p;
+      holder->ents[i].namelen = (unsigned short) MIN (len, 65535);
+      holder->ents[i].kind = WALK_DIR;
+      holder->ents[i].status = true;
+      p += len + 1;
+    }
+
+  atomic_init (&holder->refs, ndirs + 1);
+  atomic_init (&holder->fd_users, ndirs);
 
   pthread_mutex_lock (&walk.mu);
   walk.logical = (fts_options & FTS_LOGICAL) != 0;
   walk.fd_cap = walk_fd_cap ();
-  walk.cur = holder;
+  atomic_store_explicit (&walk.cur, holder, memory_order_release);
   walk.done = false;
   atomic_store (&walk.buffered_bytes, 0);
   unsigned int gen = ++walk.gen;
-  walk_heap_push (&walk.reads, t);
+
+  uint64_t span = (holder->key_hi - holder->key_lo) / (holder->nents + 1);
+  for (size_t i = 0; i < ndirs; i++)
+    {
+      struct walk_task *t = xmalloc (sizeof *t);
+      *t = (struct walk_task) { .dir = holder, .lo = i, .hi = i + 1,
+                                .key = holder->key_lo + i * span,
+                                .read = true };
+      walk_heap_push (&walk.reads, t);
+    }
   pthread_mutex_unlock (&walk.mu);
 
   /* If the worker threads are running anyway, let them join now.
      Otherwise start alone; see WALK_RECRUIT_NS.  */
+  walk_recruited = false;
+  if (pool_started || WALK_RECRUIT_NS <= 0)
+    walk_recruit (gen);
+  else
+    clock_gettime (CLOCK_MONOTONIC, &walk_start);
+
+  bool saved_buffering = buffering_enabled;
+  buffering_enabled = true;
+  walk_is_main = true;
+  walk_participate (gen);
+  walk_is_main = false;
+  buffering_enabled = saved_buffering;
+
+  pthread_mutex_lock (&walk.mu);
+  while (walk.inside)
+    pthread_cond_wait (&walk.left_cv, &walk.mu);
+  pthread_mutex_unlock (&walk.mu);
+
+}
+
+/* Search directory DIR, a command-line operand, recursively.  */
+_GL_UNUSED static void
+walk_run (char const *dir)
+{
+  char *const d[1] = { (char *) dir };
+  walk_run_dirs (d, 1);
+}
+
+static void
+walk_run_cmd_files (char *const *files, size_t nfiles)
+{
+  /* Commit all output that precedes the traversal.  */
+  producer_flush_batch ();
+  pthread_mutex_lock (&pool_mutex);
+  while (commit_seq < next_seq)
+    {
+      rob_try_commit_locked ();
+      if (commit_seq >= next_seq)
+        break;
+      rob_done_waiters++;
+      pthread_cond_wait (&rob_done_cv, &pool_mutex);
+      rob_done_waiters--;
+    }
+  pthread_mutex_unlock (&pool_mutex);
+
+  struct walk_dir *holder = walk_dir_new (nullptr, 0, "", 0);
+  holder->ents = xzalloc (nfiles * sizeof *holder->ents);
+  holder->nents = nfiles;
+
+  for (size_t i = 0; i < nfiles; i++)
+    {
+      holder->ents[i].name = files[i];
+      holder->ents[i].namelen = (unsigned short) MIN (strlen (files[i]), 65535);
+      if (skipped_file (files[i], true, false))
+        {
+          holder->ents[i].kind = WALK_SKIP;
+          atomic_init (&holder->ents[i].done, true);
+        }
+      else
+        holder->ents[i].kind = WALK_FILE;
+      holder->ents[i].status = true;
+    }
+
+  size_t ntasks = (nfiles + 31) / 32;
+  atomic_init (&holder->refs, ntasks + 1);
+  atomic_init (&holder->fd_users, 0);
+
+  pthread_mutex_lock (&walk.mu);
+  walk.logical = (fts_options & FTS_LOGICAL) != 0;
+  walk.fd_cap = walk_fd_cap ();
+  atomic_store_explicit (&walk.cur, holder, memory_order_release);
+  walk.done = false;
+  atomic_store (&walk.buffered_bytes, 0);
+  unsigned int gen = ++walk.gen;
+
+  uint64_t span = (holder->key_hi - holder->key_lo) / (holder->nents + 1);
+  for (size_t b = 0; b < nfiles; b += 32)
+    {
+      struct walk_task *t = xmalloc (sizeof *t);
+      *t = (struct walk_task) {
+        .dir = holder,
+        .lo = b,
+        .hi = MIN (b + 32, nfiles),
+        .key = holder->key_lo + b * span,
+        .read = false
+      };
+      walk_heap_push (&walk.files, t);
+    }
+  pthread_mutex_unlock (&walk.mu);
+
   walk_recruited = false;
   if (pool_started || WALK_RECRUIT_NS <= 0)
     walk_recruit (gen);
@@ -7043,6 +7585,20 @@ walk_run (char const *dir)
 static void
 producer_run (char *const *files)
 {
+  size_t nfiles = 0;
+  bool has_stdin = false;
+  for (char *const *f = files; *f; ++f)
+    {
+      if (STREQ (*f, "-"))
+        has_stdin = true;
+      nfiles++;
+    }
+  if (!has_stdin && nfiles >= 16 && pool_target > 1 && directories != RECURSE_DIRECTORIES)
+    {
+      walk_run_cmd_files (files, nfiles);
+      return;
+    }
+
   for (char *const *f = files; *f; ++f)
     {
       if (STREQ (*f, "-"))
@@ -7075,7 +7631,20 @@ producer_run (char *const *files)
                 continue;
 
               if (S_ISDIR (st.st_mode) && directories == RECURSE_DIRECTORIES)
-                walk_run (*f);
+                {
+                  char *const *f_end = f + 1;
+                  while (*f_end)
+                    {
+                      struct stat st_next;
+                      if (stat (*f_end, &st_next) == 0 && S_ISDIR (st_next.st_mode)
+                          && !skipped_file (*f_end, true, true))
+                        f_end++;
+                      else
+                        break;
+                    }
+                  walk_run_dirs (f, f_end - f);
+                  f = f_end - 1;
+                }
               else if (S_ISREG (st.st_mode) && st.st_size >= 2 * 1024 * 1024 && pool_target > 1
                        && (!out_invert || (out_before <= 0 && out_after <= 0))
                        && max_count == INTMAX_MAX)
@@ -7239,6 +7808,9 @@ main (int argc, char **argv)
                                    nullptr);
   if (!pattern_table)
     xalloc_die ();
+
+  use_simple_includes = true;
+  num_simple_includes = 0;
 
   while (prev_optind = optind,
          (opt = get_nondigit_option (argc, argv, &default_context)) != -1)
@@ -7496,7 +8068,26 @@ main (int argc, char **argv)
         break;
 
       case EXCLUDE_OPTION:
+        use_simple_includes = false;
+        goto handle_exclude;
+
       case INCLUDE_OPTION:
+        if (use_simple_includes)
+          {
+            if (optarg[0] == '*' && optarg[1] == '.'
+                && strpbrk (optarg + 1, "*?[\\]") == nullptr
+                && num_simple_includes < 16)
+              {
+                simple_includes[num_simple_includes++] = (struct simple_include) {
+                  optarg + 1, strlen (optarg + 1)
+                };
+              }
+            else
+              use_simple_includes = false;
+          }
+        goto handle_exclude;
+
+      handle_exclude:
         for (int cmd = 0; cmd < 2; cmd++)
           {
             if (!excluded_patterns[cmd])
@@ -7507,6 +8098,7 @@ main (int argc, char **argv)
           }
         break;
       case EXCLUDE_FROM_OPTION:
+        use_simple_includes = false;
         for (int cmd = 0; cmd < 2; cmd++)
           {
             if (!excluded_patterns[cmd])
@@ -7550,6 +8142,9 @@ main (int argc, char **argv)
         break;
 
       }
+
+  if (num_simple_includes == 0)
+    use_simple_includes = false;
 
   if (show_version)
     {
@@ -7701,9 +8296,10 @@ main (int argc, char **argv)
               matcher = G_MATCHER_INDEX;
             }
         }
-      /* With two or more patterns, if -F works then switch from either -E
-         or -G, as -F is probably faster then.  */
-      else if (1 < n_patterns)
+      /* If -F works, switch from either -E or -G when there are multiple
+         patterns, when case is ignored, or when patterns contain '|'
+         (which try_fgrep_pattern can convert to newlines).  */
+      else if (1 < n_patterns || match_icase || memchr (keys, '|', keycc) != nullptr)
         matcher = try_fgrep_pattern (matcher, keys, &keycc);
     }
 

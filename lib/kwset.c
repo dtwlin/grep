@@ -1440,7 +1440,9 @@ acexec_trans (kwset_t kwset, char const *text, idx_t len,
               trie = kwset->next[c];
             }
 
+#if defined __AVX2__
         have_first_trie:
+#endif
           while (true)
             {
               if (trie->accepting)

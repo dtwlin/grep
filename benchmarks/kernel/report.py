@@ -684,18 +684,31 @@ class ReportGenerator:
         if not matched_sids:
             return ""
 
-        lines = [
-            f"### Matched Thread Comparison: G1 ({target_threads}t) vs R0 (Default 12t) vs R0 (-j {target_threads})",
-            "",
-            f"> Side-by-side comparison of G1 (default {target_threads} threads) against both out-of-the-box R0 (default 12 threads) and thread-matched `R0 -j {target_threads}` ({target_threads} threads).",
-            "",
-            f"| Scenario | Cat | Description | G0 (1t) | G1 ({target_threads}t) | R0 (12t) | R0 (-j {target_threads}) | G1 vs R0 (12t) | G1 vs R0 ({target_threads}t) | G1 CPU | R0 ({target_threads}t) CPU |",
-            "| :--- | :-: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-        ]
+        has_g1_12 = any(self.get_stat(sid, "G1", 12) is not None for sid in matched_sids)
+
+        if has_g1_12:
+            lines = [
+                f"### Matched Thread Comparison: G1 ({target_threads}t) vs G1 (12t) vs R0 (Default 12t) vs R0 (-j {target_threads})",
+                "",
+                f"> Side-by-side comparison of G1 (default {target_threads} threads and matched 12 threads) against both out-of-the-box R0 (default 12 threads) and thread-matched `R0 -j {target_threads}` ({target_threads} threads).",
+                "",
+                f"| Scenario | Cat | Description | G0 (1t) | G1 (12t) | R0 (12t) | G1 vs R0 (12t) | G1 ({target_threads}t) | R0 (-j {target_threads}) | G1 vs R0 ({target_threads}t) | G1 ({target_threads}t) vs R0 (12t) |",
+                "| :--- | :-: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        else:
+            lines = [
+                f"### Matched Thread Comparison: G1 ({target_threads}t) vs R0 (Default 12t) vs R0 (-j {target_threads})",
+                "",
+                f"> Side-by-side comparison of G1 (default {target_threads} threads) against both out-of-the-box R0 (default 12 threads) and thread-matched `R0 -j {target_threads}` ({target_threads} threads).",
+                "",
+                f"| Scenario | Cat | Description | G0 (1t) | G1 ({target_threads}t) | R0 (12t) | R0 (-j {target_threads}) | G1 vs R0 (12t) | G1 vs R0 ({target_threads}t) | G1 CPU | R0 ({target_threads}t) CPU |",
+                "| :--- | :-: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
 
         for sid in matched_sids:
             g0 = self.get_stat(sid, "G0")
             g1 = self.get_stat(sid, "G1")
+            g1_12 = self.get_stat(sid, "G1", 12)
             r0_def = self.get_stat(sid, "R0")
             r0_32 = self.get_stat(sid, "R0", target_threads)
             if not g1 or not r0_32:
@@ -705,18 +718,27 @@ class ReportGenerator:
             desc = g1.get("description", "").replace("|", "\\|")
             g0_ms = g0["median_ms"] if g0 else None
             g1_ms = g1["median_ms"]
+            g1_12_ms = g1_12["median_ms"] if g1_12 else None
             r0_def_ms = r0_def["median_ms"] if r0_def else None
             r0_32_ms = r0_32["median_ms"]
 
             vs_def = (r0_def_ms / g1_ms) if (r0_def_ms and g1_ms > 0) else None
             vs_32 = (r0_32_ms / g1_ms) if (r0_32_ms and g1_ms > 0) else None
+            vs_12 = (r0_def_ms / g1_12_ms) if (r0_def_ms and g1_12_ms and g1_12_ms > 0) else None
 
-            lines.append(
-                f"| `{sid}` | {cat} | {desc} | {format_ms(g0_ms)} | {format_ms(g1_ms)} | "
-                f"{format_ms(r0_def_ms)} | {format_ms(r0_32_ms)} | "
-                f"**{format_ratio(vs_def)}** | **{format_ratio(vs_32)}** | "
-                f"{format_cpu(g1.get('mean_cpu_s'))} | {format_cpu(r0_32.get('mean_cpu_s'))} |"
-            )
+            if has_g1_12:
+                lines.append(
+                    f"| `{sid}` | {cat} | {desc} | {format_ms(g0_ms)} | {format_ms(g1_12_ms)} | "
+                    f"{format_ms(r0_def_ms)} | **{format_ratio(vs_12)}** | {format_ms(g1_ms)} | "
+                    f"{format_ms(r0_32_ms)} | **{format_ratio(vs_32)}** | **{format_ratio(vs_def)}** |"
+                )
+            else:
+                lines.append(
+                    f"| `{sid}` | {cat} | {desc} | {format_ms(g0_ms)} | {format_ms(g1_ms)} | "
+                    f"{format_ms(r0_def_ms)} | {format_ms(r0_32_ms)} | "
+                    f"**{format_ratio(vs_def)}** | **{format_ratio(vs_32)}** | "
+                    f"{format_cpu(g1.get('mean_cpu_s'))} | {format_cpu(r0_32.get('mean_cpu_s'))} |"
+                )
 
         return "\n".join(lines)
 

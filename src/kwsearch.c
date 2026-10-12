@@ -21,6 +21,10 @@
 
 #include <stdatomic.h>
 
+#if defined __AVX2__
+# include <immintrin.h>
+#endif
+
 /* A kwset compiled from a pattern list.  All compilations of the same
    pattern list with the same options share it, as it is read-only
    after kwsprep; this saves each worker thread from building its own
@@ -42,6 +46,7 @@ struct shared_kwset
   idx_t size;
   bool match_icase, match_words, match_lines, exact;
   char eolbyte;
+  unsigned char utf8_quirk_mask;
 };
 
 /* The first shared kwset, kept for the life of the process.  It is set
@@ -69,6 +74,7 @@ struct kwsearch
   /* The user's pattern compiled as a regular expression,
      or null if it has not been compiled.  */
   void *re;
+  unsigned char utf8_quirk_mask;
 };
 
 /* Return a shared kwset for the -F style PATTERN, containing SIZE bytes
@@ -138,6 +144,18 @@ shared_kwset_get (char const *pattern, idx_t size, bool exact)
   sk->match_lines = match_lines;
   sk->exact = exact;
   sk->eolbyte = eolbyte;
+  unsigned char qmask = 0;
+  if (match_icase && localeinfo.using_utf8)
+    {
+      for (idx_t i = 0; i < size; i++)
+        {
+          if (pattern[i] == 'i' || pattern[i] == 'I')
+            qmask |= 1;
+          else if (pattern[i] == 's' || pattern[i] == 'S')
+            qmask |= 2;
+        }
+    }
+  sk->utf8_quirk_mask = qmask;
   bool cache = !kwset_cache;
   atomic_init (&sk->refs, 1 + cache);
   if (cache)
@@ -160,6 +178,7 @@ Fcompile (char *pattern, idx_t size, reg_syntax_t ignored, bool exact)
   kwsearch->pattern = ximemdup0 (pattern, size);
   kwsearch->size = size;
   kwsearch->re = nullptr;
+  kwsearch->utf8_quirk_mask = sk->utf8_quirk_mask;
 
   if (!localeinfo.multibyte && match_words)
     {
@@ -172,13 +191,52 @@ Fcompile (char *pattern, idx_t size, reg_syntax_t ignored, bool exact)
   return kwsearch;
 }
 
-/* Use the compiled pattern VCP to search the buffer BUF of size SIZE.
-   If found, return the offset of the first match and store its
-   size into *MATCH_SIZE.  If not found, return -1.
-   If START_PTR is nonnull, start searching there.  */
-ptrdiff_t
-Fexecute (void *vcp, char const *buf, idx_t size, idx_t *match_size,
-          char const *start_ptr)
+static char const * _GL_ATTRIBUTE_PURE
+find_utf8_icase_quirk (char const *buf, idx_t len, unsigned char mask)
+{
+  if (!mask || len < 2)
+    return nullptr;
+
+  char const *p = buf;
+  char const *end = buf + len;
+
+#if defined __AVX2__
+  while (p + 32 <= end)
+    {
+      __m256i chunk = _mm256_loadu_si256 ((void const *) p);
+      unsigned int high_mask = (unsigned int) _mm256_movemask_epi8 (chunk);
+      if (high_mask == 0)
+        {
+          p += 32;
+          continue;
+        }
+      char const *chunk_end = p + 32;
+      if (chunk_end > end - 1)
+        chunk_end = end - 1;
+      for (; p < chunk_end; p++)
+        {
+          if ((mask & 1) && (unsigned char) p[0] == 0xc4 && (unsigned char) p[1] == 0xb1)
+            return p;
+          if ((mask & 2) && (unsigned char) p[0] == 0xc5 && (unsigned char) p[1] == 0xbf)
+            return p;
+        }
+    }
+#endif
+
+  for (; p + 1 < end; p++)
+    {
+      if ((mask & 1) && (unsigned char) p[0] == 0xc4 && (unsigned char) p[1] == 0xb1)
+        return p;
+      if ((mask & 2) && (unsigned char) p[0] == 0xc5 && (unsigned char) p[1] == 0xbf)
+        return p;
+    }
+
+  return nullptr;
+}
+
+static ptrdiff_t
+Fexecute_core (void *vcp, char const *buf, idx_t size, idx_t *match_size,
+               char const *start_ptr)
 {
   char const *beg, *end, *mb_start;
   idx_t len;
@@ -264,8 +322,8 @@ Fexecute (void *vcp, char const *buf, idx_t size, idx_t *match_size,
                   }
                 if (beg + len < buf + size)
                   {
-                    end = rawmemchr (beg + len, eol);
-                    end++;
+                    char const *nl = memchr (beg + len, eol, buf + size - (beg + len));
+                    end = nl ? nl + 1 : buf + size;
                   }
                 else
                   end = buf + size;
@@ -297,8 +355,8 @@ Fexecute (void *vcp, char const *buf, idx_t size, idx_t *match_size,
  success:
   if (beg + len < buf + size)
     {
-      end = rawmemchr (beg + len, eol);
-      end++;
+      char const *nl = memchr (beg + len, eol, buf + size - (beg + len));
+      end = nl ? nl + 1 : buf + size;
     }
   else
     end = buf + size;
@@ -309,6 +367,167 @@ Fexecute (void *vcp, char const *buf, idx_t size, idx_t *match_size,
  success_in_beg_and_len:;
   *match_size = len;
   return beg - buf;
+}
+
+static ptrdiff_t
+Fexecute_with_utf8_quirk (struct kwsearch *kwsearch, char const *buf,
+                          idx_t size, idx_t *match_size,
+                          char const *start_ptr)
+{
+  char eol = eolbyte;
+  unsigned char mask = kwsearch->utf8_quirk_mask;
+  char const *p = start_ptr ? start_ptr : buf;
+  char const *buflim = buf + size;
+
+  while (p < buflim)
+    {
+      char const *quirk_pos = find_utf8_icase_quirk (p, buflim - p, mask);
+      if (!quirk_pos)
+        {
+          ptrdiff_t off = Fexecute_core (kwsearch, p, buflim - p, match_size,
+                                         p == start_ptr ? start_ptr : nullptr);
+          if (off < 0)
+            return -1;
+          return (p - buf) + off;
+        }
+
+      char const *quirk_line_start = memrchr (p, eol, quirk_pos - p);
+      quirk_line_start = quirk_line_start ? quirk_line_start + 1 : p;
+
+      if (quirk_line_start > p)
+        {
+          ptrdiff_t off = Fexecute_core (kwsearch, p, quirk_line_start - p,
+                                         match_size,
+                                         p == start_ptr ? start_ptr : nullptr);
+          if (off >= 0)
+            return (p - buf) + off;
+          p = quirk_line_start;
+        }
+
+      char const *line_beg = p;
+      char const *nl = memchr (line_beg, eol, buflim - line_beg);
+      char const *line_end = nl ? nl + 1 : buflim;
+      idx_t line_len = line_end - line_beg;
+
+      char stack_norm[1024];
+      idx_t stack_orig[1024];
+      char *norm;
+      char *norm_alloc = nullptr;
+      idx_t *orig_off;
+      idx_t *orig_alloc = nullptr;
+
+      if (line_len + 8 <= sizeof stack_norm)
+        {
+          norm = stack_norm + 1;
+          orig_off = stack_orig;
+        }
+      else
+        {
+          norm_alloc = ximalloc (line_len + 8);
+          norm = norm_alloc + 1;
+          orig_alloc = ximalloc ((line_len + 8) * sizeof *orig_off);
+          orig_off = orig_alloc;
+        }
+
+      norm[-1] = eol;
+
+      idx_t nlen = 0;
+      idx_t i = 0;
+      while (i < line_len)
+        {
+          orig_off[nlen] = i;
+          if (i + 1 < line_len)
+            {
+              if ((mask & 1) && (unsigned char) line_beg[i] == 0xc4
+                  && (unsigned char) line_beg[i + 1] == 0xb1)
+                {
+                  norm[nlen++] = 'i';
+                  i += 2;
+                  continue;
+                }
+              if ((mask & 2) && (unsigned char) line_beg[i] == 0xc5
+                  && (unsigned char) line_beg[i + 1] == 0xbf)
+                {
+                  norm[nlen++] = 's';
+                  i += 2;
+                  continue;
+                }
+            }
+          norm[nlen++] = line_beg[i++];
+        }
+      orig_off[nlen] = line_len;
+      orig_off[nlen + 1] = line_len;
+      orig_off[nlen + 2] = line_len;
+      orig_off[nlen + 3] = line_len;
+      norm[nlen] = (nl ? eol : 0);
+      norm[nlen + 1] = 0;
+
+      char const *norm_start = nullptr;
+      if (start_ptr && start_ptr >= line_beg && start_ptr < line_end)
+        {
+          idx_t target_orig = start_ptr - line_beg;
+          idx_t j = 0;
+          while (j < nlen && orig_off[j] < target_orig)
+            j++;
+          norm_start = norm + j;
+        }
+
+      idx_t norm_msize = 0;
+      ptrdiff_t norm_off = Fexecute_core (kwsearch, norm, nlen, &norm_msize, norm_start);
+
+      if (norm_off >= 0)
+        {
+          idx_t orig_mstart = orig_off[norm_off];
+          idx_t orig_mend = orig_off[norm_off + norm_msize];
+          *match_size = orig_mend - orig_mstart;
+          if (norm_alloc)
+            free (norm_alloc);
+          if (orig_alloc)
+            free (orig_alloc);
+          return (line_beg - buf) + orig_mstart;
+        }
+
+      if (norm_alloc)
+        free (norm_alloc);
+      if (orig_alloc)
+        free (orig_alloc);
+
+      p = line_end;
+    }
+
+  return -1;
+}
+
+/* Use the compiled pattern VCP to search the buffer BUF of size SIZE.
+   If found, return the offset of the first match and store its
+   size into *MATCH_SIZE.  If not found, return -1.
+   If START_PTR is nonnull, start searching there.  */
+ptrdiff_t
+Fexecute (void *vcp, char const *buf, idx_t size, idx_t *match_size,
+          char const *start_ptr)
+{
+  struct kwsearch *kwsearch = vcp;
+  if (!kwsearch->utf8_quirk_mask)
+    return Fexecute_core (vcp, buf, size, match_size, start_ptr);
+
+  idx_t core_msize = 0;
+  ptrdiff_t off = Fexecute_core (vcp, buf, size, &core_msize, start_ptr);
+
+  char const *search_start = start_ptr ? start_ptr : buf;
+  if (off >= 0)
+    {
+      idx_t check_len = (off + core_msize) - (search_start - buf);
+      if (find_utf8_icase_quirk (search_start, check_len, kwsearch->utf8_quirk_mask))
+        return Fexecute_with_utf8_quirk (kwsearch, buf, size, match_size, start_ptr);
+      *match_size = core_msize;
+      return off;
+    }
+
+  idx_t search_len = (buf + size) - search_start;
+  if (find_utf8_icase_quirk (search_start, search_len, kwsearch->utf8_quirk_mask))
+    return Fexecute_with_utf8_quirk (kwsearch, buf, size, match_size, start_ptr);
+
+  return -1;
 }
 
 void

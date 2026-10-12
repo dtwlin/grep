@@ -329,10 +329,20 @@ Pcompile (char *pattern, idx_t size, reg_syntax_t ignored, bool exact)
     {
       uint32_t unicode;
       if (pcre2_config (PCRE2_CONFIG_UNICODE, &unicode) < 0 || !unicode)
-        die (EXIT_TROUBLE, 0,
-             _("-P supports only unibyte locales on this platform"));
+        {
+          pcre2_compile_context_free (ccontext);
+          pcre2_general_context_free (gcontext);
+          free (pc);
+          die (EXIT_TROUBLE, 0,
+               _("-P supports only unibyte locales on this platform"));
+        }
       if (! localeinfo.using_utf8)
-        die (EXIT_TROUBLE, 0, _("-P supports only unibyte and UTF-8 locales"));
+        {
+          pcre2_compile_context_free (ccontext);
+          pcre2_general_context_free (gcontext);
+          free (pc);
+          die (EXIT_TROUBLE, 0, _("-P supports only unibyte and UTF-8 locales"));
+        }
 
       flags |= PCRE2_UTF;
 
@@ -355,7 +365,12 @@ Pcompile (char *pattern, idx_t size, reg_syntax_t ignored, bool exact)
 
   /* FIXME: Remove this restriction.  */
   if (rawmemchr (pattern, '\n') != patlim)
-    die (EXIT_TROUBLE, 0, _("the -P option only supports a single pattern"));
+    {
+      pcre2_compile_context_free (ccontext);
+      pcre2_general_context_free (gcontext);
+      free (pc);
+      die (EXIT_TROUBLE, 0, _("the -P option only supports a single pattern"));
+    }
 
 #ifdef PCRE2_EXTRA_MATCH_LINE
   uint32_t extra_options = (PCRE2_EXTRA_ASCII_BSD
@@ -403,6 +418,10 @@ Pcompile (char *pattern, idx_t size, reg_syntax_t ignored, bool exact)
       enum { ERRBUFSIZ = 256 }; /* Taken from pcre2grep.c ERRBUFSIZ.  */
       PCRE2_UCHAR8 ep[ERRBUFSIZ];
       pcre2_get_error_message (ec, ep, sizeof ep);
+      free (re_storage);
+      pcre2_compile_context_free (ccontext);
+      pcre2_general_context_free (gcontext);
+      free (pc);
       die (EXIT_TROUBLE, 0, "%s", ep);
     }
 

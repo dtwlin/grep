@@ -147,6 +147,7 @@ TESTS =						\
   parallel-env-limits				\
   parallel-kwset-ac				\
   parallel-pcre-must				\
+  parallel-stage1-optim				\
   parallel-stream-stdin				\
   parallel-tree-walk				\
   pcre						\

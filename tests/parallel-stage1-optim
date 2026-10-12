@@ -1,0 +1,140 @@
+#! /bin/sh
+# Test Stage 1 optimizations: UTF-8 case quirks, alternation promotion, backref filter.
+#
+# Copyright (C) 2026 Free Software Foundation, Inc.
+#
+# Copying and distribution of this file, with or without modification,
+# are permitted in any medium without royalty provided the copyright
+# notice and this notice are preserved.
+
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+
+fail=0
+
+LC_ALL=en_US.UTF-8
+export LC_ALL
+
+# -------------------------------------------------------------------------
+# 1. UTF-8 case quirks: U+0131 (\xc4\xb1) and U+017F (\xc5\xbf)
+# -------------------------------------------------------------------------
+
+# Generate input with dotless i (\xc4\xb1) and long s (\xc5\xbf)
+printf 'line 1: ascii test input\n' > in_utf8 || framework_failure_
+printf 'line 2: quirk dotless te\xc4\xb1t word\n' >> in_utf8 || framework_failure_
+printf 'line 3: quirk long \xc5\xbfoup dish\n' >> in_utf8 || framework_failure_
+printf 'line 4: normal soup and test\n' >> in_utf8 || framework_failure_
+printf 'line 5: capital TEST and SOUP\n' >> in_utf8 || framework_failure_
+
+# Test -F -i matching "test" (matches lines 1, 4, 5)
+grep -F -i 'test' in_utf8 > exp_test || fail=1
+test $(wc -l < exp_test) -eq 3 || fail=1
+
+for t in 1 2 4 8; do
+  GREP_THREADS=$t grep -F -i 'test' in_utf8 > "out_test_$t" || fail=1
+  compare exp_test "out_test_$t" || fail=1
+done
+
+# Test -F -i matching "teit" (matches line 2 via U+0131 dotless i)
+grep -F -i 'teit' in_utf8 > exp_teit || fail=1
+test $(wc -l < exp_teit) -eq 1 || fail=1
+
+for t in 1 2 4 8; do
+  GREP_THREADS=$t grep -F -i 'teit' in_utf8 > "out_teit_$t" || fail=1
+  compare exp_teit "out_teit_$t" || fail=1
+done
+
+# Test -F -i matching "soup" (matches lines 3, 4, 5 via U+017F long s)
+grep -F -i 'soup' in_utf8 > exp_soup || fail=1
+test $(wc -l < exp_soup) -eq 3 || fail=1
+
+for t in 1 2 4 8; do
+  GREP_THREADS=$t grep -F -i 'soup' in_utf8 > "out_soup_$t" || fail=1
+  compare exp_soup "out_soup_$t" || fail=1
+done
+
+# Test -F -i -w word matching
+grep -F -i -w 'teit' in_utf8 > exp_w || fail=1
+test $(wc -l < exp_w) -eq 1 || fail=1
+for t in 1 2 4; do
+  GREP_THREADS=$t grep -F -i -w 'teit' in_utf8 > "out_w_$t" || fail=1
+  compare exp_w "out_w_$t" || fail=1
+done
+
+# Test -F -i -o only-matching
+grep -F -i -o 'teit' in_utf8 > exp_o || fail=1
+for t in 1 2 4; do
+  GREP_THREADS=$t grep -F -i -o 'teit' in_utf8 > "out_o_$t" || fail=1
+  compare exp_o "out_o_$t" || fail=1
+done
+
+# -------------------------------------------------------------------------
+# 2. Regex alternation promotion: ERE '|' and BRE '\|'
+# -------------------------------------------------------------------------
+
+cat << 'EOF' > in_alts
+apple pie
+banana bread
+cherry tart
+date shake
+elderberry jam
+fig bar
+grape juice
+EOF
+
+# -E alternation
+grep -E 'banana|date|grape' in_alts > exp_alts_e || fail=1
+test $(wc -l < exp_alts_e) -eq 3 || fail=1
+for t in 1 2 4; do
+  GREP_THREADS=$t grep -E 'banana|date|grape' in_alts > "out_alts_e_$t" || fail=1
+  compare exp_alts_e "out_alts_e_$t" || fail=1
+done
+
+# -G alternation with \|
+grep -G 'banana\|date\|grape' in_alts > exp_alts_g || fail=1
+test $(wc -l < exp_alts_g) -eq 3 || fail=1
+compare exp_alts_e exp_alts_g || fail=1
+for t in 1 2 4; do
+  GREP_THREADS=$t grep -G 'banana\|date\|grape' in_alts > "out_alts_g_$t" || fail=1
+  compare exp_alts_g "out_alts_g_$t" || fail=1
+done
+
+# Alternation with -w, -x, -i, -o
+grep -E -w -i 'BANANA|DATE' in_alts > exp_alts_wi || fail=1
+test $(wc -l < exp_alts_wi) -eq 2 || fail=1
+for t in 1 2 4; do
+  GREP_THREADS=$t grep -E -w -i 'BANANA|DATE' in_alts > "out_alts_wi_$t" || fail=1
+  compare exp_alts_wi "out_alts_wi_$t" || fail=1
+done
+
+# -------------------------------------------------------------------------
+# 3. Backreference line pre-filter
+# -------------------------------------------------------------------------
+
+cat << 'EOF' > in_bref
+regular_variable_name
+kernel_buffer_pointer
+repeated_repeated
+another_line_without_repetition
+test_test
+short_short
+system_call_handler
+dispatch_dispatch
+single_occurrence_word
+EOF
+
+# Pattern: \b([a-z]{4,})_\1\b
+grep -E '\b([a-z]{4,})_\1\b' in_bref > exp_bref || fail=1
+cat << 'EOF' > exp_bref_expected
+repeated_repeated
+test_test
+short_short
+dispatch_dispatch
+EOF
+compare exp_bref_expected exp_bref || fail=1
+
+for t in 1 2 4 8 16; do
+  GREP_THREADS=$t grep -E '\b([a-z]{4,})_\1\b' in_bref > "out_bref_$t" || fail=1
+  compare exp_bref "out_bref_$t" || fail=1
+done
+
+Exit $fail

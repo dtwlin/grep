@@ -21,6 +21,32 @@
 #include <search.h>
 #include "die.h"
 #include <error.h>
+#include <stdatomic.h>
+
+struct backref_filter
+{
+  bool enabled;
+  idx_t min_len;
+  idx_t sep_len;
+  char sep[8];
+};
+
+struct shared_dfa_kwset
+{
+  kwset_t kwset;
+  idx_t kwset_exact_matches;
+  bool begline;
+  atomic_ptrdiff_t refs;
+  char *pattern;
+  idx_t size;
+  bool match_icase, match_words, match_lines, exact;
+  char eolbyte;
+  reg_syntax_t syntax_bits;
+  bool dfa_supported;
+  bool dfa_fast;
+};
+
+static struct shared_dfa_kwset *dfa_kwset_cache;
 
 struct dfa_comp
 {
@@ -28,13 +54,19 @@ struct dfa_comp
      a list of strings, at least one of which is known to occur in
      any string matching the regexp. */
   kwset_t kwset;
+  struct shared_dfa_kwset *shared_kwset;
 
   /* DFA compiled regexp. */
   struct dfa *dfa;
+  char *dfa_pattern;
+  idx_t dfa_pattern_size;
+  bool dfa_compiled;
 
   /* Regex compiled regexps. */
   struct re_pattern_buffer *patterns;
   struct re_pattern_buffer *patterns_alloc;
+  struct backref_filter *bref_filters;
+  struct backref_filter *bref_filters_alloc;
   idx_t pcount;
   struct re_registers regs;
 
@@ -62,16 +94,502 @@ dfawarn (char const *mesg)
   error (0, 0, _("warning: %s"), mesg);
 }
 
+static bool _GL_ATTRIBUTE_PURE
+is_quantifier (char const *p, char const *lim, reg_syntax_t syntax_bits)
+{
+  if (p >= lim)
+    return false;
+  if (syntax_bits & RE_NO_BK_VBAR) /* ERE */
+    {
+      if (*p == '*' || *p == '+' || *p == '?')
+        return true;
+      if (*p == '{')
+        return true;
+      return false;
+    }
+  else /* BRE */
+    {
+      if (*p == '*')
+        return true;
+      if (p + 1 < lim && *p == '\\')
+        {
+          if (p[1] == '+' || p[1] == '?' || p[1] == '{')
+            return true;
+        }
+      return false;
+    }
+}
+
+struct branch_info
+{
+  char *best_lit;
+  idx_t best_len;
+  bool is_exact;
+};
+
+static void
+kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
+                reg_syntax_t syntax_bits)
+{
+  char const *p = raw_pat;
+  char const *lim = raw_pat + raw_size;
+
+  idx_t branch_cap = 16;
+  idx_t nbranches = 0;
+  struct branch_slice
+  {
+    char const *start;
+    idx_t len;
+  } *slices = xnmalloc (branch_cap, sizeof *slices);
+
+  char const *b_start = p;
+  idx_t paren_depth = 0;
+  bool in_bracket = false;
+
+  while (p < lim)
+    {
+      if (in_bracket)
+        {
+          if (*p == '[' && p + 1 < lim && (p[1] == ':' || p[1] == '=' || p[1] == '.'))
+            {
+              char delim = p[1];
+              p += 2;
+              while (p + 1 < lim && !(p[0] == delim && p[1] == ']'))
+                p++;
+              if (p + 1 < lim)
+                p += 2;
+              continue;
+            }
+          if (*p == ']')
+            {
+              in_bracket = false;
+              p++;
+              continue;
+            }
+          p++;
+          continue;
+        }
+
+      /* !in_bracket */
+      if (*p == '[')
+        {
+          in_bracket = true;
+          p++;
+          if (p < lim && *p == '^')
+            p++;
+          if (p < lim && *p == ']')
+            p++;
+          continue;
+        }
+
+      /* Check parens */
+      if (syntax_bits & RE_NO_BK_PARENS) /* ERE */
+        {
+          if (*p == '(')
+            {
+              paren_depth++;
+              p++;
+              continue;
+            }
+          if (*p == ')')
+            {
+              if (paren_depth == 0)
+                goto fail_slices;
+              paren_depth--;
+              p++;
+              continue;
+            }
+          if (*p == '\\')
+            {
+              if (p + 1 >= lim)
+                goto fail_slices;
+              p += 2;
+              continue;
+            }
+        }
+      else /* BRE */
+        {
+          if (*p == '\\' && p + 1 < lim && p[1] == '(')
+            {
+              paren_depth++;
+              p += 2;
+              continue;
+            }
+          if (*p == '\\' && p + 1 < lim && p[1] == ')')
+            {
+              if (paren_depth == 0)
+                goto fail_slices;
+              paren_depth--;
+              p += 2;
+              continue;
+            }
+          if (*p == '\\')
+            {
+              if (p + 1 >= lim)
+                goto fail_slices;
+              p += 2;
+              continue;
+            }
+        }
+
+      /* Top-level branch separators */
+      if (paren_depth == 0)
+        {
+          idx_t sep_len = 0;
+          if (*p == '\n')
+            sep_len = 1;
+          else if ((syntax_bits & RE_NO_BK_VBAR) && *p == '|')
+            sep_len = 1;
+          else if (!(syntax_bits & RE_NO_BK_VBAR) && !(syntax_bits & RE_LIMITED_OPS)
+                   && *p == '\\' && p + 1 < lim && p[1] == '|')
+            sep_len = 2;
+
+          if (sep_len > 0)
+            {
+              idx_t blen = p - b_start;
+              if (blen == 0)
+                goto fail_slices;
+              if (nbranches == branch_cap)
+                slices = xpalloc (slices, &branch_cap, 1, -1, sizeof *slices);
+              slices[nbranches].start = b_start;
+              slices[nbranches].len = blen;
+              nbranches++;
+              p += sep_len;
+              b_start = p;
+              continue;
+            }
+        }
+
+      p++;
+    }
+
+  if (in_bracket || paren_depth != 0)
+    goto fail_slices;
+
+  if (b_start < lim)
+    {
+      if (nbranches == branch_cap)
+        slices = xpalloc (slices, &branch_cap, 1, -1, sizeof *slices);
+      slices[nbranches].start = b_start;
+      slices[nbranches].len = lim - b_start;
+      nbranches++;
+    }
+  else
+    goto fail_slices;
+
+  if (nbranches < 2)
+    goto fail_slices;
+
+  /* Now parse each branch */
+  struct branch_info *branches = xnmalloc (nbranches, sizeof *branches);
+  memset (branches, 0, nbranches * sizeof *branches);
+
+  for (idx_t i = 0; i < nbranches; i++)
+    {
+      char const *bp = slices[i].start;
+      char const *blim = slices[i].start + slices[i].len;
+      idx_t blen = slices[i].len;
+
+      char *cur_lit = xmalloc (blen + 1);
+      char *best_lit = xmalloc (blen + 1);
+      idx_t cur_len = 0;
+      idx_t best_len = 0;
+      bool branch_is_pure = true;
+      idx_t b_paren = 0;
+      bool b_bracket = false;
+
+      while (bp < blim)
+        {
+          if (b_bracket)
+            {
+              branch_is_pure = false;
+              if (cur_len > best_len)
+                {
+                  memcpy (best_lit, cur_lit, cur_len);
+                  best_len = cur_len;
+                }
+              cur_len = 0;
+
+              if (*bp == '[' && bp + 1 < blim && (bp[1] == ':' || bp[1] == '=' || bp[1] == '.'))
+                {
+                  char delim = bp[1];
+                  bp += 2;
+                  while (bp + 1 < blim && !(bp[0] == delim && bp[1] == ']'))
+                    bp++;
+                  if (bp + 1 < blim)
+                    bp += 2;
+                  continue;
+                }
+              if (*bp == ']')
+                {
+                  b_bracket = false;
+                  bp++;
+                  continue;
+                }
+              bp++;
+              continue;
+            }
+
+          /* !b_bracket */
+          if (*bp == '[')
+            {
+              branch_is_pure = false;
+              if (cur_len > best_len)
+                {
+                  memcpy (best_lit, cur_lit, cur_len);
+                  best_len = cur_len;
+                }
+              cur_len = 0;
+              b_bracket = true;
+              bp++;
+              if (bp < blim && *bp == '^')
+                bp++;
+              if (bp < blim && *bp == ']')
+                bp++;
+              continue;
+            }
+
+          /* Parens */
+          if (syntax_bits & RE_NO_BK_PARENS)
+            {
+              if (*bp == '(')
+                {
+                  branch_is_pure = false;
+                  if (cur_len > best_len)
+                    {
+                      memcpy (best_lit, cur_lit, cur_len);
+                      best_len = cur_len;
+                    }
+                  cur_len = 0;
+                  b_paren++;
+                  bp++;
+                  continue;
+                }
+              if (*bp == ')')
+                {
+                  branch_is_pure = false;
+                  if (cur_len > best_len)
+                    {
+                      memcpy (best_lit, cur_lit, cur_len);
+                      best_len = cur_len;
+                    }
+                  cur_len = 0;
+                  if (b_paren > 0)
+                    b_paren--;
+                  bp++;
+                  continue;
+                }
+            }
+          else
+            {
+              if (*bp == '\\' && bp + 1 < blim && bp[1] == '(')
+                {
+                  branch_is_pure = false;
+                  if (cur_len > best_len)
+                    {
+                      memcpy (best_lit, cur_lit, cur_len);
+                      best_len = cur_len;
+                    }
+                  cur_len = 0;
+                  b_paren++;
+                  bp += 2;
+                  continue;
+                }
+              if (*bp == '\\' && bp + 1 < blim && bp[1] == ')')
+                {
+                  branch_is_pure = false;
+                  if (cur_len > best_len)
+                    {
+                      memcpy (best_lit, cur_lit, cur_len);
+                      best_len = cur_len;
+                    }
+                  cur_len = 0;
+                  if (b_paren > 0)
+                    b_paren--;
+                  bp += 2;
+                  continue;
+                }
+            }
+
+          if (b_paren > 0)
+            {
+              branch_is_pure = false;
+              if (cur_len > best_len)
+                {
+                  memcpy (best_lit, cur_lit, cur_len);
+                  best_len = cur_len;
+                }
+              cur_len = 0;
+              if (*bp == '\\' && bp + 1 < blim)
+                bp += 2;
+              else
+                bp++;
+              continue;
+            }
+
+          /* At b_paren == 0 && !b_bracket: check if unquantified literal byte */
+          if (*bp == '\\')
+            {
+              if (bp + 1 >= blim)
+                {
+                  branch_is_pure = false;
+                  if (cur_len > best_len)
+                    {
+                      memcpy (best_lit, cur_lit, cur_len);
+                      best_len = cur_len;
+                    }
+                  cur_len = 0;
+                  break;
+                }
+              char c = bp[1];
+              if (strchr ("^.[$()|*+?{\\", c) != nullptr)
+                {
+                  if (is_quantifier (bp + 2, blim, syntax_bits))
+                    {
+                      branch_is_pure = false;
+                      if (cur_len > best_len)
+                        {
+                          memcpy (best_lit, cur_lit, cur_len);
+                          best_len = cur_len;
+                        }
+                      cur_len = 0;
+                      bp += 2;
+                    }
+                  else
+                    {
+                      cur_lit[cur_len++] = c;
+                      bp += 2;
+                    }
+                }
+              else
+                {
+                  /* Special escape (\b, \w, \s, etc.) */
+                  branch_is_pure = false;
+                  if (cur_len > best_len)
+                    {
+                      memcpy (best_lit, cur_lit, cur_len);
+                      best_len = cur_len;
+                    }
+                  cur_len = 0;
+                  bp += 2;
+                }
+              continue;
+            }
+
+          /* Check metacharacters */
+          bool is_meta = false;
+          if (syntax_bits & RE_NO_BK_VBAR) /* ERE */
+            {
+              if (*bp == '^' || *bp == '$' || *bp == '.' || *bp == '*'
+                  || *bp == '+' || *bp == '?' || *bp == '{' || *bp == '|')
+                is_meta = true;
+            }
+          else /* BRE */
+            {
+              if (*bp == '^' || *bp == '$' || *bp == '.' || *bp == '*')
+                is_meta = true;
+            }
+
+          if (is_meta)
+            {
+              branch_is_pure = false;
+              if (cur_len > best_len)
+                {
+                  memcpy (best_lit, cur_lit, cur_len);
+                  best_len = cur_len;
+                }
+              cur_len = 0;
+              bp++;
+              continue;
+            }
+
+          /* Ordinary character */
+          if (is_quantifier (bp + 1, blim, syntax_bits))
+            {
+              branch_is_pure = false;
+              if (cur_len > best_len)
+                {
+                  memcpy (best_lit, cur_lit, cur_len);
+                  best_len = cur_len;
+                }
+              cur_len = 0;
+              bp++;
+            }
+          else
+            {
+              cur_lit[cur_len++] = *bp;
+              bp++;
+            }
+        }
+
+      if (cur_len > best_len)
+        {
+          memcpy (best_lit, cur_lit, cur_len);
+          best_len = cur_len;
+        }
+      free (cur_lit);
+
+      if (best_len < 2)
+        {
+          free (best_lit);
+          for (idx_t j = 0; j < i; j++)
+            free (branches[j].best_lit);
+          free (branches);
+          goto fail_slices;
+        }
+
+      branches[i].best_lit = best_lit;
+      branches[i].best_len = best_len;
+      branches[i].is_exact = branch_is_pure && !match_words && !match_lines;
+    }
+
+  /* Success! Initialize kwset with kwsinit(true) */
+  dc->kwset = kwsinit (true);
+
+  /* Pass 1: exact keywords */
+  for (idx_t i = 0; i < nbranches; i++)
+    {
+      if (branches[i].is_exact)
+        {
+          kwsincr (dc->kwset, branches[i].best_lit, branches[i].best_len);
+          dc->kwset_exact_matches++;
+        }
+    }
+
+  /* Pass 2: non-exact keywords */
+  for (idx_t i = 0; i < nbranches; i++)
+    {
+      if (!branches[i].is_exact)
+        kwsincr (dc->kwset, branches[i].best_lit, branches[i].best_len);
+    }
+
+  kwsprep (dc->kwset);
+
+  for (idx_t i = 0; i < nbranches; i++)
+    free (branches[i].best_lit);
+  free (branches);
+
+ fail_slices:
+  free (slices);
+}
+
 /* If the DFA turns out to have some set of fixed strings one of
    which must occur in the match, then we build a kwset matcher
    to find those strings, and thus quickly filter out impossible
    matches. */
 static void
-kwsmusts (struct dfa_comp *dc)
+kwsmusts (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
+          reg_syntax_t syntax_bits)
 {
   struct dfamust *dm = dfamust (dc->dfa);
   if (!dm)
-    return;
+    {
+      if (dc->pcount == 0
+          && (!localeinfo.multibyte || localeinfo.using_utf8)
+          && (!match_icase || !localeinfo.multibyte))
+        kwsmusts_multi (dc, raw_pat, raw_size, syntax_bits);
+      return;
+    }
   dc->kwset = kwsinit (false);
   if (dm->exact)
     {
@@ -137,6 +655,307 @@ possible_backrefs_in_pattern (char const *keys, idx_t len, bool bs_safe)
               if (p == lim)
                 break;
             }
+        }
+    }
+  return false;
+}
+
+static void
+analyze_backref_filter (char const *p, idx_t len, reg_syntax_t syntax_bits,
+                        struct backref_filter *bf)
+{
+  bf->enabled = false;
+  bf->min_len = 0;
+  bf->sep_len = 0;
+
+  bool no_bk_parens = (syntax_bits & RE_NO_BK_PARENS) != 0;
+  char const *lim = p + len;
+
+  int depth = 0;
+  char const *g1_start = nullptr;
+  char const *g1_end = nullptr;
+
+  for (char const *s = p; s < lim; s++)
+    {
+      if (*s == '\\')
+        {
+          s++;
+          if (s >= lim)
+            break;
+          if (!no_bk_parens)
+            {
+              if (*s == '(')
+                {
+                  if (depth == 0 && !g1_start)
+                    g1_start = s + 1;
+                  depth++;
+                }
+              else if (*s == ')')
+                {
+                  depth--;
+                  if (depth == 0 && g1_start && !g1_end)
+                    g1_end = s - 1;
+                }
+              else if (*s == '|' && depth == 0)
+                return;
+            }
+          continue;
+        }
+
+      if (no_bk_parens)
+        {
+          if (*s == '(')
+            {
+              if (depth == 0 && !g1_start)
+                g1_start = s + 1;
+              depth++;
+            }
+          else if (*s == ')')
+            {
+              depth--;
+              if (depth == 0 && g1_start && !g1_end)
+                g1_end = s;
+            }
+          else if (*s == '|' && depth == 0)
+            return;
+        }
+    }
+
+  if (!g1_start || !g1_end || g1_start > g1_end)
+    return;
+
+  for (char const *s = g1_start; s < g1_end; s++)
+    {
+      if (*s == '\\')
+        {
+          s++;
+          if (s >= g1_end)
+            break;
+          if (!no_bk_parens && (*s == '(' || *s == ')' || *s == '|'))
+            return;
+          continue;
+        }
+      if (no_bk_parens && (*s == '(' || *s == ')' || *s == '|'))
+        return;
+    }
+
+  idx_t min_len = 0;
+  char const *s = g1_start;
+  while (s < g1_end)
+    {
+      idx_t atom_base = 1;
+      if (*s == '[')
+        {
+          s++;
+          if (s < g1_end && *s == '^')
+            s++;
+          if (s < g1_end && *s == ']')
+            s++;
+          while (s < g1_end && *s != ']')
+            s++;
+          if (s < g1_end)
+            s++;
+        }
+      else if (*s == '\\')
+        {
+          s++;
+          if (s < g1_end)
+            {
+              if (*s == 'b' || *s == 'B')
+                atom_base = 0;
+              s++;
+            }
+        }
+      else
+        {
+          s++;
+        }
+
+      idx_t qmin = 1;
+      if (s < g1_end)
+        {
+          if (no_bk_parens)
+            {
+              if (*s == '*')
+                {
+                  qmin = 0;
+                  s++;
+                }
+              else if (*s == '?')
+                {
+                  qmin = 0;
+                  s++;
+                }
+              else if (*s == '+')
+                {
+                  qmin = 1;
+                  s++;
+                }
+              else if (*s == '{')
+                {
+                  s++;
+                  qmin = 0;
+                  while (s < g1_end && *s >= '0' && *s <= '9')
+                    {
+                      qmin = qmin * 10 + (*s - '0');
+                      s++;
+                    }
+                  while (s < g1_end && *s != '}')
+                    s++;
+                  if (s < g1_end)
+                    s++;
+                }
+            }
+          else
+            {
+              if (*s == '*')
+                {
+                  qmin = 0;
+                  s++;
+                }
+              else if (*s == '\\' && s + 1 < g1_end)
+                {
+                  if (s[1] == '?')
+                    {
+                      qmin = 0;
+                      s += 2;
+                    }
+                  else if (s[1] == '+')
+                    {
+                      qmin = 1;
+                      s += 2;
+                    }
+                  else if (s[1] == '{')
+                    {
+                      s += 2;
+                      qmin = 0;
+                      while (s < g1_end && *s >= '0' && *s <= '9')
+                        {
+                          qmin = qmin * 10 + (*s - '0');
+                          s++;
+                        }
+                      while (s + 1 < g1_end && !(s[0] == '\\' && s[1] == '}'))
+                        s++;
+                      if (s + 1 < g1_end)
+                        s += 2;
+                    }
+                }
+            }
+        }
+      min_len += atom_base * qmin;
+    }
+
+  bf->min_len = min_len;
+
+  char const *after_g = no_bk_parens ? (g1_end + 1) : (g1_end + 2);
+  idx_t sep_len = 0;
+  while (after_g + sep_len < lim && sep_len < 8)
+    {
+      char c = after_g[sep_len];
+      if (c == '^' || c == '$' || c == '.' || c == '[' || c == ']'
+          || c == '*' || c == '+' || c == '?' || c == '(' || c == ')'
+          || c == '{' || c == '}' || c == '|' || c == '\\')
+        break;
+      bf->sep[sep_len] = c;
+      sep_len++;
+    }
+  bf->sep_len = sep_len;
+
+  char const *bref = after_g + sep_len;
+  if (bref + 1 >= lim || bref[0] != '\\' || bref[1] != '1')
+    return;
+
+  char const *after_1 = bref + 2;
+  if (after_1 < lim)
+    {
+      if (no_bk_parens)
+        {
+          if (*after_1 == '?' || *after_1 == '*')
+            return;
+          if (*after_1 == '{' && after_1 + 1 < lim && after_1[1] == '0')
+            return;
+        }
+      else
+        {
+          if (*after_1 == '*')
+            return;
+          if (*after_1 == '\\' && after_1 + 1 < lim)
+            {
+              if (after_1[1] == '?')
+                return;
+              if (after_1[1] == '{' && after_1 + 2 < lim && after_1[2] == '0')
+                return;
+            }
+        }
+    }
+
+  if (bf->min_len >= 2 || (bf->sep_len >= 1 && bf->min_len >= 1))
+    bf->enabled = true;
+}
+
+static bool _GL_ATTRIBUTE_PURE
+backref_line_can_match (struct backref_filter const *bf, char const *line, idx_t len)
+{
+  if (len < 2 * bf->min_len + bf->sep_len)
+    return false;
+
+  if (bf->sep_len > 0)
+    {
+      char const *lim = line + len - bf->sep_len - bf->min_len;
+      char const *pos = line + bf->min_len;
+
+      while (pos <= lim)
+        {
+          pos = memchr (pos, (unsigned char) bf->sep[0], lim - pos + 1);
+          if (!pos)
+            break;
+
+          if (bf->sep_len > 1 && memcmp (pos + 1, bf->sep + 1, bf->sep_len - 1) != 0)
+            {
+              pos++;
+              continue;
+            }
+
+          char const *after = pos + bf->sep_len;
+          idx_t rem = line + len - after;
+          if (rem < bf->min_len)
+            break;
+          char const *q_lim = pos - bf->min_len;
+          char const *q_min = pos - rem;
+          char const *q = q_min > line ? q_min : line;
+
+          while (q <= q_lim)
+            {
+              q = memchr (q, (unsigned char) after[0], q_lim - q + 1);
+              if (!q)
+                break;
+              idx_t k = pos - q;
+              if (after[k - 1] == pos[-1] && memcmp (q, after, k) == 0)
+                return true;
+              q++;
+            }
+
+          pos++;
+        }
+      return false;
+    }
+
+  char const *pos;
+  char const *lim = line + len - bf->min_len;
+  for (pos = line + bf->min_len; pos <= lim; pos++)
+    {
+      char const *after = pos;
+      char const *q_lim = pos - bf->min_len;
+      char const *q = line;
+      while (q <= q_lim)
+        {
+          q = memchr (q, (unsigned char) after[0], q_lim - q + 1);
+          if (!q)
+            break;
+          idx_t k = pos - q;
+          if (after + k <= line + len && memcmp (q, after, k) == 0)
+            return true;
+          q++;
         }
     }
   return false;
@@ -224,6 +1043,8 @@ GEAcompile (char *pattern, idx_t size, reg_syntax_t syntax_bits,
 
   dc->patterns_alloc = xmalloc (sizeof *dc->patterns);
   dc->patterns = dc->patterns_alloc + 1;
+  dc->bref_filters_alloc = xcalloc (1, sizeof *dc->bref_filters);
+  dc->bref_filters = dc->bref_filters_alloc + 1;
   dc->pcount = 0;
   idx_t palloc = 1;
 
@@ -262,17 +1083,29 @@ GEAcompile (char *pattern, idx_t size, reg_syntax_t syntax_bits,
           dc->patterns_alloc = xpalloc (dc->patterns_alloc, &palloc, shortage, -1,
                                         sizeof *dc->patterns);
           dc->patterns = dc->patterns_alloc + 1;
+          dc->bref_filters_alloc = xrealloc (dc->bref_filters_alloc,
+                                             palloc * sizeof *dc->bref_filters);
+          memset (dc->bref_filters_alloc + (dc->pcount + 1), 0,
+                  (palloc - (dc->pcount + 1)) * sizeof *dc->bref_filters);
+          dc->bref_filters = dc->bref_filters_alloc + 1;
         }
 
-      if (!regex_compile (dc, p, len, dc->pcount, lineno, syntax_bits,
-                          !backref))
-        compilation_failed = true;
+      if (!suppress_dfawarn || backref)
+        {
+          if (!regex_compile (dc, p, len, dc->pcount, lineno, syntax_bits,
+                              !backref))
+            compilation_failed = true;
+        }
 
+      char const *pat_line = p;
       p = sep + 1;
       lineno++;
 
       if (backref)
         {
+          if (!match_icase)
+            analyze_backref_filter (pat_line, len, syntax_bits,
+                                    &dc->bref_filters[dc->pcount]);
           dc->pcount++;
           prev = p;
         }
@@ -296,6 +1129,9 @@ GEAcompile (char *pattern, idx_t size, reg_syntax_t syntax_bits,
       buf = pattern;
       buflen = size;
     }
+
+  char const *raw_pat = pattern;
+  idx_t raw_size = size;
 
   /* In the match_words and match_lines cases, we use a different pattern
      for the DFA matcher that will quickly throw out cases that won't work.
@@ -329,16 +1165,68 @@ GEAcompile (char *pattern, idx_t size, reg_syntax_t syntax_bits,
   else
     motif = nullptr;
 
-  dfaparse (pattern, size, dc->dfa);
-  kwsmusts (dc);
-  dfacomp (nullptr, 0, dc->dfa, 1);
+  struct shared_dfa_kwset *sk = dfa_kwset_cache;
+  if (sk && sk->size == size && memcmp (sk->pattern, pattern, size) == 0
+      && sk->match_icase == match_icase && sk->match_words == match_words
+      && sk->match_lines == match_lines && sk->exact == exact
+      && sk->eolbyte == eolbyte && sk->syntax_bits == syntax_bits)
+    {
+      dc->shared_kwset = sk;
+      dc->kwset = sk->kwset;
+      dc->kwset_exact_matches = sk->kwset_exact_matches;
+      dc->begline = sk->begline;
+      atomic_fetch_add (&sk->refs, 1);
+
+      if (suppress_dfawarn && sk->dfa_supported && !exact && dc->pcount == 0)
+        {
+          dc->dfa_compiled = false;
+          dc->dfa_pattern = sk->pattern;
+          dc->dfa_pattern_size = sk->size;
+        }
+      else
+        {
+          dfaparse (pattern, size, dc->dfa);
+          dfacomp (nullptr, 0, dc->dfa, 1);
+          dc->dfa_compiled = true;
+        }
+    }
+  else
+    {
+      dfaparse (pattern, size, dc->dfa);
+      kwsmusts (dc, raw_pat, raw_size, syntax_bits);
+      dfacomp (nullptr, 0, dc->dfa, 1);
+      dc->dfa_compiled = true;
+
+      if (dc->kwset && !dfa_kwset_cache)
+        {
+          sk = xmalloc (sizeof *sk);
+          sk->kwset = dc->kwset;
+          sk->kwset_exact_matches = dc->kwset_exact_matches;
+          sk->begline = dc->begline;
+          sk->pattern = ximemdup (pattern, size);
+          sk->size = size;
+          sk->match_icase = match_icase;
+          sk->match_words = match_words;
+          sk->match_lines = match_lines;
+          sk->exact = exact;
+          sk->eolbyte = eolbyte;
+          sk->syntax_bits = syntax_bits;
+          sk->dfa_supported = dfasupported (dc->dfa);
+          sk->dfa_fast = dfaisfast (dc->dfa);
+          atomic_init (&sk->refs, 2);
+          dfa_kwset_cache = sk;
+          dc->shared_kwset = sk;
+        }
+    }
 
   if (buf)
     {
-      if (exact || !dfasupported (dc->dfa))
+      if (exact || !(dc->shared_kwset ? dc->shared_kwset->dfa_supported : dfasupported (dc->dfa)))
         {
           dc->patterns--;
+          dc->bref_filters--;
           dc->pcount++;
+          dc->bref_filters[0].enabled = false;
 
           if (!regex_compile (dc, buf, buflen, 0, -1, syntax_bits, false))
             abort ();
@@ -429,8 +1317,8 @@ EGexecute (void *vdc, char const *buf, idx_t size, idx_t *match_size,
   struct kwsmatch kwsm;
   idx_t i;
   struct dfa_comp *dc = vdc;
-  struct dfa *superset = dfasuperset (dc->dfa);
-  bool dfafast = dfaisfast (dc->dfa);
+  bool dfafast = dc->shared_kwset ? dc->shared_kwset->dfa_fast
+                                  : (dc->dfa_compiled ? dfaisfast (dc->dfa) : false);
 
   mb_start = buf;
   buflim = buf + size;
@@ -501,6 +1389,14 @@ EGexecute (void *vdc, char const *buf, idx_t size, idx_t *match_size,
                 }
             }
 
+          if (!dc->dfa_compiled)
+            {
+              dfaparse (dc->dfa_pattern, dc->dfa_pattern_size, dc->dfa);
+              dfacomp (nullptr, 0, dc->dfa, 1);
+              dc->dfa_compiled = true;
+            }
+          struct dfa *superset = dfasuperset (dc->dfa);
+
           /* Try matching with the superset of DFA, if it's defined.  */
           if (superset && !exact_kwset_match)
             {
@@ -565,6 +1461,10 @@ EGexecute (void *vdc, char const *buf, idx_t size, idx_t *match_size,
       best_len = 0;
       for (i = 0; i < dc->pcount; i++)
         {
+          if (dc->bref_filters && dc->bref_filters[i].enabled
+              && !backref_line_can_match (&dc->bref_filters[i], beg, end - beg - 1))
+            continue;
+
           dc->patterns[i].not_eol = 0;
           dc->patterns[i].newline_anchor = eolbyte == '\n';
           start = re_search (&dc->patterns[i], beg, end - beg - 1,
@@ -679,7 +1579,19 @@ EGfree (void *vdc)
       dfafree (dc->dfa);
       free (dc->dfa);
     }
-  if (dc->kwset)
+  if (dc->bref_filters_alloc)
+    free (dc->bref_filters_alloc);
+  if (dc->shared_kwset)
+    {
+      struct shared_dfa_kwset *sk = dc->shared_kwset;
+      if (atomic_fetch_sub (&sk->refs, 1) == 1)
+        {
+          kwsfree (sk->kwset);
+          free (sk->pattern);
+          free (sk);
+        }
+    }
+  else if (dc->kwset)
     kwsfree (dc->kwset);
   if (dc->patterns_alloc)
     {

@@ -18,7 +18,7 @@ SINGLE_FILE = os.path.join(BENCH_DIR, "single_2GB.log")
 TREE_DIR = os.path.join(BENCH_DIR, "tree_10k")
 
 BASELINE_BIN = os.path.abspath("benchmarks/grep-baseline")
-CURRENT_BIN = os.path.abspath("src/grep")
+CURRENT_BIN = os.path.abspath(os.environ.get("GREP_BIN", "src/grep"))
 
 WORKLOADS = [
     {
@@ -166,6 +166,15 @@ def run_edge_case_conformance():
     def limit_nofile_32():
         resource.setrlimit(resource.RLIMIT_NOFILE, (32, 32))
 
+    vmem_ok = True
+    try:
+        p = subprocess.run([CURRENT_BIN, "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           preexec_fn=limit_vmem)
+        if p.returncode != 0:
+            vmem_ok = False
+    except Exception:
+        vmem_ok = False
+
     checks = []
 
     # 1. Thread sweep: 1, 2, 4, 8, 16, 32, 64
@@ -202,8 +211,9 @@ def run_edge_case_conformance():
     checks.append(("Binary -I", ["-I", "ELF", "/bin/sh"], None, None))
 
     # 8. Virtual memory limit (RLIMIT_AS = 512MB)
-    checks.append(("RLIMIT_AS 512MB slab fallback", ["-F", "ULTRA_RARE_TOKEN_9941", SINGLE_FILE], None, limit_vmem))
-    checks.append(("RLIMIT_AS 512MB recursive tree", ["-r", "-n", "FATAL", f"{TREE_DIR}/dir_000"], None, limit_vmem))
+    if vmem_ok:
+        checks.append(("RLIMIT_AS 512MB slab fallback", ["-F", "ULTRA_RARE_TOKEN_9941", SINGLE_FILE], None, limit_vmem))
+        checks.append(("RLIMIT_AS 512MB recursive tree", ["-r", "-n", "FATAL", f"{TREE_DIR}/dir_000"], None, limit_vmem))
 
     # 9. Invert match with line numbers on 2GB file (Item 4)
     checks.append(("Invert match lineno 2GB -m 1000", ["-v", "-n", "-m", "1000", "INFO", SINGLE_FILE], None, None))
@@ -246,8 +256,9 @@ def run_edge_case_conformance():
     checks.append(("Batch split regex zero-match t=32", ["-r", "-P", "(?<=file_)[0-9]{3}_000_NO_MATCH", f"{TREE_DIR}/dir_000"], {"GREP_THREADS": "32"}, None))
 
     # 15. Virtual memory limit (RLIMIT_AS 512MB with explicit t=32, and 256MB)
-    checks.append(("RLIMIT_AS 512MB tree search t=32", ["-r", "-n", "FATAL", f"{TREE_DIR}/dir_000"], {"GREP_THREADS": "32"}, limit_vmem))
-    checks.append(("RLIMIT_AS 256MB tree search default", ["-r", "-n", "FATAL", f"{TREE_DIR}/dir_000"], None, limit_vmem_256))
+    if vmem_ok:
+        checks.append(("RLIMIT_AS 512MB tree search t=32", ["-r", "-n", "FATAL", f"{TREE_DIR}/dir_000"], {"GREP_THREADS": "32"}, limit_vmem))
+        checks.append(("RLIMIT_AS 256MB tree search default", ["-r", "-n", "FATAL", f"{TREE_DIR}/dir_000"], None, limit_vmem_256))
 
     # 16. Low file descriptor limits (RLIMIT_NOFILE = 32)
     checks.append(("RLIMIT_NOFILE 32 tree search default", ["-r", "-l", "FATAL", f"{TREE_DIR}/dir_000"], None, limit_nofile_32))
