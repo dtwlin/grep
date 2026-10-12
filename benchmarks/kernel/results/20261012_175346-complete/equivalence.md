@@ -133,8 +133,8 @@
 #### `T-07` vs R0 (`SOFT_DIFF`)
 
 ```diff
---- /dev/shm/kbench_out/ref_T-07_G0.sorted	2026-10-12 03:01:54.896160261 +0000
-+++ /dev/shm/kbench_out/ref_T-07_R0.sorted	2026-10-12 03:01:55.670441394 +0000
+--- /dev/shm/kbench_out/ref_T-07_G0.sorted	2026-10-12 18:15:40.696617926 +0000
++++ /dev/shm/kbench_out/ref_T-07_R0.sorted	2026-10-12 18:15:41.726724279 +0000
 @@ -2450,7 +2450,6 @@
  $K/Documentation/iio/iio_configfs.rst
  $K/Documentation/iio/opt4060.rst
@@ -150,8 +150,8 @@
 Ripgrep strips the UTF-8 BOM at the start of `Documentation/translations/zh_CN/dev-tools/sparse.rst` (`\ufeffCopyright 2004 Linus Torvalds`), whereas GNU grep prints the BOM bytes (12,577,386 vs 12,577,383 bytes).
 
 ```diff
---- /dev/shm/kbench_out/ref_T-09_G0.sorted	2026-10-12 03:02:42.193126560 +0000
-+++ /dev/shm/kbench_out/ref_T-09_R0.sorted	2026-10-12 03:02:43.553124671 +0000
+--- /dev/shm/kbench_out/ref_T-09_G0.sorted	2026-10-12 18:16:40.150676367 +0000
++++ /dev/shm/kbench_out/ref_T-09_R0.sorted	2026-10-12 18:16:42.622673670 +0000
 @@ -780,9 +780,9 @@
  $K/Documentation/translations/sp_SP/process/kernel-enforcement-statement.rst:Aunque existe el derecho de hacer valer un copyright distinto en las
  $K/Documentation/translations/sp_SP/process/kernel-enforcement-statement.rst:nuestro y de cualquier sucesor de nuestros derechos de autor (copyright):
@@ -165,8 +165,8 @@ Ripgrep strips the UTF-8 BOM at the start of `Documentation/translations/zh_CN/d
 #### `T-21` vs R0 (`SOFT_DIFF`)
 
 ```diff
---- /dev/shm/kbench_out/ref_T-21_G0.sorted	2026-10-12 03:08:56.302165213 +0000
-+++ /dev/shm/kbench_out/ref_T-21_R0.sorted	2026-10-12 03:08:58.282174739 +0000
+--- /dev/shm/kbench_out/ref_T-21_G0.sorted	2026-10-12 18:23:39.527386934 +0000
++++ /dev/shm/kbench_out/ref_T-21_R0.sorted	2026-10-12 18:23:43.368297704 +0000
 @@ -1 +1 @@
 -SUM:32347857
 +SUM:32247077
