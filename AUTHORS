@@ -48,6 +48,11 @@ fixes, particularly to multi-byte matchers.
 Paul Eggert contributed support for recursive grep, as well as several
 performance improvements such as searching file holes efficiently.
 
+David Lin <dtwlin@gmail.com> created the Supercharged grep fork,
+adding multi-threaded execution, parallel directory traversal and
+file chunking, SIMD-accelerated search kernels, and the dense
+Aho-Corasick automaton.
+
 Many other folks contributed.  See THANKS; if someone is omitted
 please file a bug report.
 
