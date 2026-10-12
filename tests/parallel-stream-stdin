@@ -1,0 +1,107 @@
+#! /bin/sh
+# Test parallel stdin stream slicer across thread counts.
+#
+# Copyright (C) 2026 Free Software Foundation, Inc.
+#
+# Copying and distribution of this file, with or without modification,
+# are permitted in any medium without royalty provided the copyright
+# notice and this notice are preserved.
+
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+
+fail=0
+
+# Generate 20,000 lines of data (~1.2 MiB)
+awk 'BEGIN {
+  for (i = 1; i <= 20000; i++) {
+    if (i % 250 == 0)
+      printf "stream_rec_%06d STATUS_ALERT level=high id=%d\n", i, i;
+    else if (i % 50 == 0)
+      printf "stream_rec_%06d STATUS_WARN level=medium id=%d\n", i, i;
+    else
+      printf "stream_rec_%06d STATUS_OK message=normal_operation_%d\n", i, i;
+  }
+}' > in_stream || framework_failure_
+
+# 1. Plain match via pipe compared to direct file search
+grep 'STATUS_ALERT' in_stream > exp_plain || fail=1
+for t in 1 2 4 8 16; do
+  cat in_stream | GREP_THREADS=$t grep 'STATUS_ALERT' > "out_pipe_$t" || fail=1
+  compare exp_plain "out_pipe_$t" || fail=1
+done
+
+# 2. Line numbers (-n) via pipe
+grep -n 'STATUS_ALERT' in_stream > exp_n || fail=1
+for t in 1 2 4 8 16; do
+  cat in_stream | GREP_THREADS=$t grep -n 'STATUS_ALERT' > "out_n_$t" || fail=1
+  compare exp_n "out_n_$t" || fail=1
+done
+
+# 3. Match count (-c) via pipe
+grep -c 'STATUS_WARN' in_stream > exp_c || fail=1
+for t in 1 2 4 8 16; do
+  cat in_stream | GREP_THREADS=$t grep -c 'STATUS_WARN' > "out_c_$t" || fail=1
+  compare exp_c "out_c_$t" || fail=1
+done
+
+# 4. Context lines (-C 2) via pipe
+grep -n -C 2 'STATUS_ALERT' in_stream > exp_ctx || fail=1
+for t in 1 2 4 8 16; do
+  cat in_stream | GREP_THREADS=$t grep -n -C 2 'STATUS_ALERT' > "out_ctx_$t" || fail=1
+  compare exp_ctx "out_ctx_$t" || fail=1
+done
+
+# 5. Invert match count (-v -c) via pipe
+grep -v -c 'STATUS_OK' in_stream > exp_vc || fail=1
+for t in 1 2 4 8 16; do
+  cat in_stream | GREP_THREADS=$t grep -v -c 'STATUS_OK' > "out_vc_$t" || fail=1
+  compare exp_vc "out_vc_$t" || fail=1
+done
+
+# 6. Max count (-m 5) with early exit
+grep -m 5 'STATUS_ALERT' in_stream > exp_m5 || fail=1
+for t in 1 2 4 8 16; do
+  cat in_stream | GREP_THREADS=$t grep -m 5 'STATUS_ALERT' > "out_m5_$t" || fail=1
+  compare exp_m5 "out_m5_$t" || fail=1
+done
+
+# 7. Quiet mode (-q) exit status via pipe
+for t in 1 4 16; do
+  cat in_stream | GREP_THREADS=$t grep -q 'STATUS_ALERT' || fail=1
+  cat in_stream | GREP_THREADS=$t grep -q 'NON_EXISTENT_TOKEN' && fail=1
+done
+
+# 8. Large multi-slice stream (>= 10 MiB) exercising > 8 MiB STREAM_CHUNK_TARGET
+awk 'BEGIN {
+  for (i = 1; i <= 160000; i++) {
+    if (i % 25000 == 0)
+      printf "stream_rec_%07d STATUS_CRITICAL error_code=%d\n", i, i;
+    else if (i % 5000 == 0)
+      printf "stream_rec_%07d STATUS_WARN warn_code=%d\n", i, i;
+    else
+      printf "stream_rec_%07d standard payload data line filler text 1234567890\n", i;
+  }
+}' > in_stream_10m || framework_failure_
+
+grep -n -b -C 1 'STATUS_CRITICAL' in_stream_10m > exp_10m_nbc || fail=1
+for t in 1 2 4 8 16; do
+  cat in_stream_10m | GREP_THREADS=$t grep -n -b -C 1 'STATUS_CRITICAL' > "out_10m_nbc_$t" || fail=1
+  compare exp_10m_nbc "out_10m_nbc_$t" || fail=1
+done
+
+# 9. Late NUL byte in >= 10 MiB stream (inserted at 9 MiB)
+cp in_stream_10m in_stream_bin || framework_failure_
+printf '\0' | dd of=in_stream_bin bs=1 seek=9437184 c\onv=notrunc 2>/dev/null || framework_failure_
+
+for opt in "-c" "-l" "-q"; do
+  if [ "$opt" = "-q" ]; then
+    cat in_stream_bin | GREP_THREADS=1 grep -q 'STATUS_CRITICAL' || fail=1
+    cat in_stream_bin | GREP_THREADS=4 grep -q 'STATUS_CRITICAL' || fail=1
+  else
+    cat in_stream_bin | GREP_THREADS=1 grep $opt 'STATUS_CRITICAL' > "exp_bin_stream_$opt" || fail=1
+    cat in_stream_bin | GREP_THREADS=4 grep $opt 'STATUS_CRITICAL' > "out_bin_stream_$opt" || fail=1
+    compare "exp_bin_stream_$opt" "out_bin_stream_$opt" || fail=1
+  fi
+done
+
+Exit $fail

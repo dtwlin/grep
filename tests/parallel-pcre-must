@@ -1,0 +1,69 @@
+#! /bin/sh
+# Test PCRE2 must-literal pre-filter and parallel search.
+#
+# Copyright (C) 2026 Free Software Foundation, Inc.
+#
+# Copying and distribution of this file, with or without modification,
+# are permitted in any medium without royalty provided the copyright
+# notice and this notice are preserved.
+
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+require_pcre_
+
+fail=0
+
+# Generate corpus
+awk 'BEGIN {
+  for (i = 1; i <= 6000; i++) {
+    if (i % 100 == 0)
+      printf "log_entry_%05d session=user_adm_%04d role=admin auth=ok\n", i, i;
+    else if (i % 25 == 0)
+      printf "log_entry_%05d session=user_reg_%04d role=regular host=server_%d.example.com\n", i, i, i % 5;
+    else
+      printf "log_entry_%05d msg=heartbeat_tick seq=%06d code=%03d-%03d-%04d\n", i, i, (i*3)%1000, (i*7)%1000, (i*13)%10000;
+  }
+}' > in_pcre || framework_failure_
+
+# 1. Lookbehind pattern: extracts "user_adm_" as must-literal
+GREP_THREADS=1 grep -P '(?<=session=)user_adm_[0-9]+' in_pcre > exp_lb || fail=1
+for t in 2 4 8 16; do
+  GREP_THREADS=$t grep -P '(?<=session=)user_adm_[0-9]+' in_pcre > "out_lb_$t" || fail=1
+  compare exp_lb "out_lb_$t" || fail=1
+done
+
+# 2. Lookahead pattern: extracts ".example.com" as must-literal
+GREP_THREADS=1 grep -P '\w+(?=\.example\.com)' in_pcre > exp_la || fail=1
+for t in 2 4 8 16; do
+  GREP_THREADS=$t grep -P '\w+(?=\.example\.com)' in_pcre > "out_la_$t" || fail=1
+  compare exp_la "out_la_$t" || fail=1
+done
+
+# 3. Case-insensitive PCRE (-i)
+GREP_THREADS=1 grep -P -i 'ROLE=(ADMIN|REGULAR)' in_pcre > exp_pci || fail=1
+for t in 2 4 8 16; do
+  GREP_THREADS=$t grep -P -i 'ROLE=(ADMIN|REGULAR)' in_pcre > "out_pci_$t" || fail=1
+  compare exp_pci "out_pci_$t" || fail=1
+done
+
+# 4. Inline (?i) flag
+GREP_THREADS=1 grep -P '(?i)role=admin' in_pcre > exp_inline || fail=1
+for t in 2 4 8 16; do
+  GREP_THREADS=$t grep -P '(?i)role=admin' in_pcre > "out_inline_$t" || fail=1
+  compare exp_inline "out_inline_$t" || fail=1
+done
+
+# 5. Pattern with no must-literal (full JIT execution)
+GREP_THREADS=1 grep -P '[0-9]{3}-[0-9]{3}-[0-9]{4}' in_pcre > exp_nojit || fail=1
+for t in 2 4 8 16; do
+  GREP_THREADS=$t grep -P '[0-9]{3}-[0-9]{3}-[0-9]{4}' in_pcre > "out_nojit_$t" || fail=1
+  compare exp_nojit "out_nojit_$t" || fail=1
+done
+
+# 6. Only matching (-o) with lookaround
+GREP_THREADS=1 grep -o -P '(?<=session=)\w+' in_pcre > exp_o || fail=1
+for t in 2 4 8 16; do
+  GREP_THREADS=$t grep -o -P '(?<=session=)\w+' in_pcre > "out_o_$t" || fail=1
+  compare exp_o "out_o_$t" || fail=1
+done
+
+Exit $fail

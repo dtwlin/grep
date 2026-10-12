@@ -1,0 +1,98 @@
+#! /bin/sh
+# Test multi-pattern keyword searches (Teddy SIMD and Dense Aho-Corasick DFA).
+#
+# Copyright (C) 2026 Free Software Foundation, Inc.
+#
+# Copying and distribution of this file, with or without modification,
+# are permitted in any medium without royalty provided the copyright
+# notice and this notice are preserved.
+
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+
+fail=0
+
+# Generate corpus
+awk 'BEGIN {
+  for (i = 1; i <= 5000; i++) {
+    printf "record_%05d alpha_%d beta_%d gamma_%d host_node_%d payload_data\n", i, i % 17, i % 31, i % 53, i % 7;
+  }
+}' > in_corpus || framework_failure_
+
+# 1. Small pattern set (16 patterns <= 32: exercises AVX2 Teddy filter)
+cat << 'EOF' > pat_small.txt
+alpha_1
+alpha_3
+alpha_5
+alpha_7
+alpha_9
+alpha_11
+alpha_13
+alpha_15
+beta_2
+beta_4
+beta_6
+beta_8
+beta_10
+beta_12
+beta_14
+beta_16
+EOF
+
+GREP_THREADS=1 grep -F -f pat_small.txt in_corpus > exp_small || fail=1
+for t in 2 4 8 16; do
+  GREP_THREADS=$t grep -F -f pat_small.txt in_corpus > "out_small_$t" || fail=1
+  compare exp_small "out_small_$t" || fail=1
+done
+
+# 2. Large pattern set (64 patterns > 32: exercises dense AC DFA & q-gram filter)
+awk 'BEGIN {
+  for (i = 0; i < 64; i++)
+    printf "gamma_%d\n", i;
+}' > pat_large.txt || framework_failure_
+
+GREP_THREADS=1 grep -F -f pat_large.txt in_corpus > exp_large || fail=1
+for t in 2 4 8 16; do
+  GREP_THREADS=$t grep -F -f pat_large.txt in_corpus > "out_large_$t" || fail=1
+  compare exp_large "out_large_$t" || fail=1
+done
+
+# 3. Case-insensitive multi-pattern search (-i)
+cat << 'EOF' > pat_case.txt
+ALPHA_1
+BETA_2
+GAMMA_3
+HOST_NODE_0
+EOF
+
+GREP_THREADS=1 grep -F -i -f pat_case.txt in_corpus > exp_case || fail=1
+for t in 2 4 8 16; do
+  GREP_THREADS=$t grep -F -i -f pat_case.txt in_corpus > "out_case_$t" || fail=1
+  compare exp_case "out_case_$t" || fail=1
+done
+
+# 4. Word boundary matching (-w)
+cat << 'EOF' > pat_word.txt
+alpha_1
+gamma_2
+payload
+EOF
+
+GREP_THREADS=1 grep -F -w -f pat_word.txt in_corpus > exp_word || fail=1
+for t in 2 4 8 16; do
+  GREP_THREADS=$t grep -F -w -f pat_word.txt in_corpus > "out_word_$t" || fail=1
+  compare exp_word "out_word_$t" || fail=1
+done
+
+# 5. Whole line matching (-x)
+awk 'BEGIN {
+  for (i = 10; i <= 20; i++)
+    printf "record_%05d alpha_%d beta_%d gamma_%d host_node_%d payload_data\n", i, i % 17, i % 31, i % 53, i % 7;
+}' > pat_exact.txt || framework_failure_
+
+GREP_THREADS=1 grep -F -x -f pat_exact.txt in_corpus > exp_exact || fail=1
+for t in 2 4 8 16; do
+  GREP_THREADS=$t grep -F -x -f pat_exact.txt in_corpus > "out_exact_$t" || fail=1
+  compare exp_exact "out_exact_$t" || fail=1
+done
+
+Exit $fail

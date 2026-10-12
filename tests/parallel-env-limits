@@ -1,0 +1,68 @@
+#! /bin/sh
+# Test GREP_THREADS environment variable and resource limit bounds.
+#
+# Copyright (C) 2026 Free Software Foundation, Inc.
+#
+# Copying and distribution of this file, with or without modification,
+# are permitted in any medium without royalty provided the copyright
+# notice and this notice are preserved.
+
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+
+fail=0
+
+mkdir -p env_tree/dir1 env_tree/dir2 || framework_failure_
+
+for i in $(seq 1 30); do
+  printf "env_record_%03d DATA_TARGET id=%d\n" "$i" "$i" > "env_tree/dir1/f$i.txt" || framework_failure_
+  printf "env_record_%03d DATA_TARGET id=%d\n" "$i" "$i" > "env_tree/dir2/g$i.txt" || framework_failure_
+done
+
+# Baseline expected output
+GREP_THREADS=1 grep -r 'DATA_TARGET' env_tree > exp_all || fail=1
+
+# 1. Invalid or boundary GREP_THREADS values
+# Non-numeric should default gracefully
+GREP_THREADS=invalid_str grep -r 'DATA_TARGET' env_tree > out_inv || fail=1
+compare exp_all out_inv || fail=1
+
+# Zero should default gracefully
+GREP_THREADS=0 grep -r 'DATA_TARGET' env_tree > out_zero || fail=1
+compare exp_all out_zero || fail=1
+
+# Negative should default gracefully
+GREP_THREADS=-10 grep -r 'DATA_TARGET' env_tree > out_neg || fail=1
+compare exp_all out_neg || fail=1
+
+# Large thread count should clamp to maximum
+GREP_THREADS=99999 grep -r 'DATA_TARGET' env_tree > out_large || fail=1
+compare exp_all out_large || fail=1
+
+# 2. Low file descriptor limits (RLIMIT_NOFILE)
+# Subshell with ulimit -n 48 should complete without 'Too many open files'
+(
+  ulimit -n 48 2>/dev/null || exit 0
+  grep -r 'DATA_TARGET' env_tree > out_nofile || exit 1
+  compare exp_all out_nofile || exit 1
+) || fail=1
+
+# 3. Low address space limits (RLIMIT_AS)
+# Skip if running under AddressSanitizer or ThreadSanitizer where virtual address
+# space is required for shadow memory.
+if (ulimit -v 524288 2>/dev/null && grep --version >/dev/null 2>&1); then
+  # Subshell with ulimit -v 524288 (512 MiB virtual address space)
+  (
+    ulimit -v 524288 2>/dev/null || exit 0
+    grep -r 'DATA_TARGET' env_tree > out_as_512 || exit 1
+    compare exp_all out_as_512 || exit 1
+  ) || fail=1
+
+  # Subshell with ulimit -v 262144 (256 MiB virtual address space)
+  (
+    ulimit -v 262144 2>/dev/null || exit 0
+    grep -r 'DATA_TARGET' env_tree > out_as_256 || exit 1
+    compare exp_all out_as_256 || exit 1
+  ) || fail=1
+fi
+
+Exit $fail

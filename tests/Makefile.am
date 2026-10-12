@@ -143,6 +143,12 @@ TESTS =						\
   multiple-begin-or-end-line			\
   null-byte					\
   options					\
+  parallel-chunked-mmap				\
+  parallel-env-limits				\
+  parallel-kwset-ac				\
+  parallel-pcre-must				\
+  parallel-stream-stdin				\
+  parallel-tree-walk				\
   pcre						\
   pcre-abort					\
   pcre-ascii-digits				\

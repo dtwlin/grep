@@ -1,0 +1,122 @@
+#! /bin/sh
+# Test parallel intra-file chunked mmap processing for files >= 2 MiB.
+#
+# Copyright (C) 2026 Free Software Foundation, Inc.
+#
+# Copying and distribution of this file, with or without modification,
+# are permitted in any medium without royalty provided the copyright
+# notice and this notice are preserved.
+
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+
+fail=0
+
+# Generate 40,000 lines of ~64 bytes each = ~2.56 MiB (exceeding 2 MiB chunk threshold)
+awk 'BEGIN {
+  for (i = 1; i <= 40000; i++) {
+    if (i == 5000 || i == 15000 || i == 25000 || i == 35000)
+      printf "line %06d: MATCH_TARGET_SPECIAL error_code=500\n", i;
+    else if (i % 1000 == 0)
+      printf "line %06d: REGULAR_SPARSE_MARKER tag=ok\n", i;
+    else
+      printf "line %06d: standard filler text payload data block 0123456789\n", i;
+  }
+}' > in_2m || framework_failure_
+
+# 1. Exact match with line numbers (-n) and byte offsets (-b)
+GREP_THREADS=1 grep -n -b 'MATCH_TARGET_SPECIAL' in_2m > exp_nb || fail=1
+for t in 2 4 8 16; do
+  GREP_THREADS=$t grep -n -b 'MATCH_TARGET_SPECIAL' in_2m > "out_nb_$t" || fail=1
+  compare exp_nb "out_nb_$t" || fail=1
+done
+
+# 2. Context search (-C 2) across chunk boundaries
+GREP_THREADS=1 grep -n -C 2 'MATCH_TARGET_SPECIAL' in_2m > exp_c2 || fail=1
+for t in 2 4 8 16; do
+  GREP_THREADS=$t grep -n -C 2 'MATCH_TARGET_SPECIAL' in_2m > "out_c2_$t" || fail=1
+  compare exp_c2 "out_c2_$t" || fail=1
+done
+
+# 3. Only matching (-o) with regex
+GREP_THREADS=1 grep -o -E 'error_code=[0-9]+' in_2m > exp_o || fail=1
+for t in 2 4 8 16; do
+  GREP_THREADS=$t grep -o -E 'error_code=[0-9]+' in_2m > "out_o_$t" || fail=1
+  compare exp_o "out_o_$t" || fail=1
+done
+
+# 4. Max count (-m 2)
+GREP_THREADS=1 grep -m 2 'MATCH_TARGET_SPECIAL' in_2m > exp_m2 || fail=1
+for t in 2 4 8 16; do
+  GREP_THREADS=$t grep -m 2 'MATCH_TARGET_SPECIAL' in_2m > "out_m2_$t" || fail=1
+  compare exp_m2 "out_m2_$t" || fail=1
+done
+
+# 5. Invert match count (-v -c)
+GREP_THREADS=1 grep -v -c 'filler' in_2m > exp_vc || fail=1
+for t in 2 4 8 16; do
+  GREP_THREADS=$t grep -v -c 'filler' in_2m > "out_vc_$t" || fail=1
+  compare exp_vc "out_vc_$t" || fail=1
+done
+
+# 6. Binary file handling with late NUL byte (> 64 KiB)
+cp in_2m in_bin || framework_failure_
+# Insert NUL byte around byte 100,000
+printf '\0' | dd of=in_bin bs=1 seek=100000 c\onv=notrunc 2>/dev/null || framework_failure_
+
+GREP_THREADS=1 grep 'MATCH_TARGET_SPECIAL' in_bin > exp_bin 2>&1
+rc_exp=$?
+for t in 2 4 8 16; do
+  GREP_THREADS=$t grep 'MATCH_TARGET_SPECIAL' in_bin > "out_bin_$t" 2>&1
+  rc_cur=$?
+  test $rc_exp -eq $rc_cur || fail=1
+  compare exp_bin "out_bin_$t" || fail=1
+done
+
+# 7. File >= 2 MiB without a trailing newline
+# Strip final newline from in_2m and append match at EOF without newline
+head -c -1 in_2m > in_nonl || framework_failure_
+printf "line 40001: MATCH_EOF_NONL final_record" >> in_nonl || framework_failure_
+
+for opt in "-n" "-b" "-c" "-o"; do
+  GREP_THREADS=1 grep $opt 'MATCH_EOF_NONL' in_nonl > "exp_nonl_$opt" || fail=1
+  GREP_THREADS=4 grep $opt 'MATCH_EOF_NONL' in_nonl > "out_nonl_$opt" || fail=1
+  compare "exp_nonl_$opt" "out_nonl_$opt" || fail=1
+done
+
+# 8. File >= 2.5 MiB where the final line is > 1.5 MiB long without a trailing newline
+awk 'BEGIN {
+  for (i = 1; i <= 15000; i++)
+    printf "line %06d: header segment payload\n", i;
+}' > in_huge_line || framework_failure_
+# Append 1.6 MiB continuous characters ending with match without newline
+awk 'BEGIN {
+  for (i = 1; i <= 25000; i++)
+    printf "abcdefghijklmnopqrstuvwxyz0123456789____";
+  printf "TARGET_HUGE_LINE_MATCH";
+}' >> in_huge_line || framework_failure_
+
+for opt in "-n" "-b" "-c" "-o"; do
+  GREP_THREADS=1 grep $opt 'TARGET_HUGE_LINE_MATCH' in_huge_line > "exp_huge_$opt" || fail=1
+  GREP_THREADS=4 grep $opt 'TARGET_HUGE_LINE_MATCH' in_huge_line > "out_huge_$opt" || fail=1
+  compare "exp_huge_$opt" "out_huge_$opt" || fail=1
+done
+
+# 9. safe_dfaexec regression test on >= 2 MiB file
+# EGexecute's prefer-the-DFA heuristic can set END before BEGIN when DFA lookahead
+# lands on a keyword hit across large chunked buffers.
+awk 'BEGIN {
+  for (i = 1; i <= 40000; i++) {
+    printf "void msrs_free_%05d(struct msr __percpu *msrs)\n{\n\tfree_percpu(msrs);\n}\nEXPORT_SYMBOL(msrs_free_%05d);\n", i, i;
+  }
+}' > in_dfa_2m || framework_failure_
+
+dfa_pat='EXPORT_SYMBOL(_GPL)?\([a-z_0-9]+\)'
+GREP_THREADS=1 grep -E "$dfa_pat" in_dfa_2m > exp_dfa || fail=1
+GREP_THREADS=4 grep -E "$dfa_pat" in_dfa_2m > out_dfa_4 || fail=1
+compare exp_dfa out_dfa_4 || fail=1
+
+GREP_THREADS=1 grep -c -E "$dfa_pat" in_dfa_2m > exp_dfa_c || fail=1
+GREP_THREADS=4 grep -c -E "$dfa_pat" in_dfa_2m > out_dfa_c4 || fail=1
+compare exp_dfa_c out_dfa_c4 || fail=1
+
+Exit $fail

@@ -1,0 +1,129 @@
+#! /bin/sh
+# Test multi-threaded recursive tree traversal.
+#
+# Copyright (C) 2026 Free Software Foundation, Inc.
+#
+# Copying and distribution of this file, with or without modification,
+# are permitted in any medium without royalty provided the copyright
+# notice and this notice are preserved.
+
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+
+fail=0
+
+mkdir -p tree/sub1/sub2 tree/sub2 tree/empty || framework_failure_
+
+for i in $(seq 1 40); do
+  printf "file %03d info line\nfile %03d match TARGET_ALPHA\nfile %03d extra\n" "$i" "$i" "$i" > "tree/sub1/f$i.txt" || framework_failure_
+done
+
+for i in $(seq 1 20); do
+  printf "sub2 file %03d TARGET_BETA\n" "$i" > "tree/sub2/g$i.txt" || framework_failure_
+done
+
+echo "deep target TARGET_GAMMA" > tree/sub1/sub2/deep.txt || framework_failure_
+
+# 1. Deterministic output ordering across thread sweeps
+GREP_THREADS=1 grep -r 'TARGET_ALPHA' tree > out1 || fail=1
+GREP_THREADS=2 grep -r 'TARGET_ALPHA' tree > out2 || fail=1
+GREP_THREADS=4 grep -r 'TARGET_ALPHA' tree > out4 || fail=1
+GREP_THREADS=16 grep -r 'TARGET_ALPHA' tree > out16 || fail=1
+compare out1 out2 || fail=1
+compare out1 out4 || fail=1
+compare out1 out16 || fail=1
+
+# 2. List matching files (-l) and non-matching (-L)
+GREP_THREADS=1 grep -r -l 'TARGET_BETA' tree > out_l1 || fail=1
+GREP_THREADS=8 grep -r -l 'TARGET_BETA' tree > out_l8 || fail=1
+compare out_l1 out_l8 || fail=1
+
+GREP_THREADS=1 grep -r -L 'TARGET_BETA' tree/sub2 > out_L1 || fail=1
+GREP_THREADS=8 grep -r -L 'TARGET_BETA' tree/sub2 > out_L8 || fail=1
+compare out_L1 out_L8 || fail=1
+
+# 3. Line numbers (-n)
+GREP_THREADS=1 grep -r -n 'TARGET_GAMMA' tree > out_n1 || fail=1
+GREP_THREADS=8 grep -r -n 'TARGET_GAMMA' tree > out_n8 || fail=1
+compare out_n1 out_n8 || fail=1
+
+# 4. Count (-c)
+GREP_THREADS=1 grep -r -c 'TARGET_ALPHA' tree/sub1 > out_c1 || fail=1
+GREP_THREADS=8 grep -r -c 'TARGET_ALPHA' tree/sub1 > out_c8 || fail=1
+compare out_c1 out_c8 || fail=1
+
+# 5. Max-count (-m 1)
+GREP_THREADS=1 grep -r -m 1 'TARGET_ALPHA' tree/sub1 > out_m1 || fail=1
+GREP_THREADS=8 grep -r -m 1 'TARGET_ALPHA' tree/sub1 > out_m8 || fail=1
+compare out_m1 out_m8 || fail=1
+
+# 6. Invert match (-v -c)
+GREP_THREADS=1 grep -r -v -c 'TARGET_ALPHA' tree/sub1 > out_vc1 || fail=1
+GREP_THREADS=8 grep -r -v -c 'TARGET_ALPHA' tree/sub1 > out_vc8 || fail=1
+compare out_vc1 out_vc8 || fail=1
+
+# 7. Symlink behavior: -r does not follow directory symlinks, -R does
+ln -s sub1 tree/link_sub1 || framework_failure_
+
+GREP_THREADS=4 grep -r 'TARGET_ALPHA' tree > out_r || fail=1
+compare out1 out_r || fail=1
+
+GREP_THREADS=1 grep -R 'TARGET_ALPHA' tree > out_R1 || fail=1
+GREP_THREADS=4 grep -R 'TARGET_ALPHA' tree > out_R4 || fail=1
+compare out_R1 out_R4 || fail=1
+
+# 8. Mixed directory tree: large files (>= 2.5 MiB) alongside small files
+mkdir -p tree/mixed || framework_failure_
+awk 'BEGIN {
+  for (i = 1; i <= 40000; i++) {
+    if (i % 8000 == 0)
+      printf "big file line %06d: MIXED_TARGET_ALPHA hit\n", i;
+    else
+      printf "big file line %06d: filler payload block 0123456789abcdef\n", i;
+  }
+}' > tree/mixed/big.txt || framework_failure_
+
+for i in $(seq 1 25); do
+  if [ $((i % 5)) -eq 0 ]; then
+    printf "small file %03d MIXED_TARGET_ALPHA\n" "$i" > "tree/mixed/s$i.txt" || framework_failure_
+  else
+    printf "small file %03d other content\n" "$i" > "tree/mixed/s$i.txt" || framework_failure_
+  fi
+done
+
+for opt in "" "-n" "-c" "-l"; do
+  GREP_THREADS=1 grep -r $opt 'MIXED_TARGET_ALPHA' tree/mixed > "exp_mix_$opt" || fail=1
+  for t in 2 4 8; do
+    GREP_THREADS=$t grep -r $opt 'MIXED_TARGET_ALPHA' tree/mixed > "out_mix_${opt}_$t" || fail=1
+    compare "exp_mix_$opt" "out_mix_${opt}_$t" || fail=1
+  done
+done
+
+# 9. Output file located inside the searched tree (loop detection)
+GREP_THREADS=4 grep -r 'TARGET_ALPHA' tree > tree/out_in_tree 2> err_out_loop
+rc_loop=$?
+test $rc_loop -eq 2 || fail=1
+grep -q 'input file is also the output' err_out_loop || fail=1
+rm -f tree/out_in_tree err_out_loop
+
+# 10. Symlink loop warning and unreadable file handling
+mkdir -p tree/err_dir || framework_failure_
+ln -s . tree/err_dir/loop || framework_failure_
+echo "secret" > tree/err_dir/unreadable.txt || framework_failure_
+chmod 000 tree/err_dir/unreadable.txt || framework_failure_
+echo "regular match TARGET_ALPHA" > tree/err_dir/reg.txt || framework_failure_
+
+GREP_THREADS=1 grep -R 'TARGET_ALPHA' tree/err_dir > out_err1 2> err1
+rc_err1=$?
+GREP_THREADS=4 grep -R 'TARGET_ALPHA' tree/err_dir > out_err4 2> err4
+rc_err4=$?
+
+chmod 600 tree/err_dir/unreadable.txt
+
+test $rc_err1 -eq 2 || fail=1
+test $rc_err4 -eq 2 || fail=1
+compare out_err1 out_err4 || fail=1
+compare err1 err4 || fail=1
+grep -q 'recursive directory loop' err1 || fail=1
+grep -q 'Permission denied' err1 || fail=1
+
+Exit $fail

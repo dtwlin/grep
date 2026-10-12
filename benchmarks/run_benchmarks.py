@@ -160,6 +160,12 @@ def run_edge_case_conformance():
     def limit_vmem():
         resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 * 1024, 512 * 1024 * 1024))
 
+    def limit_vmem_256():
+        resource.setrlimit(resource.RLIMIT_AS, (256 * 1024 * 1024, 256 * 1024 * 1024))
+
+    def limit_nofile_32():
+        resource.setrlimit(resource.RLIMIT_NOFILE, (32, 32))
+
     checks = []
 
     # 1. Thread sweep: 1, 2, 4, 8, 16, 32, 64
@@ -232,6 +238,20 @@ def run_edge_case_conformance():
     checks.append(("DFA end before line start -o", ["-o", "-E", dfa_end_pat, dfa_end_small], {"GREP_THREADS": "1"}, None))
     checks.append(("DFA end before line start large -c", ["-c", "-E", dfa_end_pat, dfa_end_large], None, None))
     checks.append(("DFA end before line start large -n", ["-n", "-E", dfa_end_pat, dfa_end_large], {"GREP_THREADS": "16"}, None))
+
+    # 14. Batch-splitting and timed split behavior
+    checks.append(("Batch split regex match t=1", ["-r", "-P", "(?<=user=)regular_user_[0-9]+", f"{TREE_DIR}/dir_000"], {"GREP_THREADS": "1"}, None))
+    checks.append(("Batch split regex match t=32", ["-r", "-P", "(?<=user=)regular_user_[0-9]+", f"{TREE_DIR}/dir_000"], {"GREP_THREADS": "32"}, None))
+    checks.append(("Batch split regex zero-match t=1", ["-r", "-P", "(?<=file_)[0-9]{3}_000_NO_MATCH", f"{TREE_DIR}/dir_000"], {"GREP_THREADS": "1"}, None))
+    checks.append(("Batch split regex zero-match t=32", ["-r", "-P", "(?<=file_)[0-9]{3}_000_NO_MATCH", f"{TREE_DIR}/dir_000"], {"GREP_THREADS": "32"}, None))
+
+    # 15. Virtual memory limit (RLIMIT_AS 512MB with explicit t=32, and 256MB)
+    checks.append(("RLIMIT_AS 512MB tree search t=32", ["-r", "-n", "FATAL", f"{TREE_DIR}/dir_000"], {"GREP_THREADS": "32"}, limit_vmem))
+    checks.append(("RLIMIT_AS 256MB tree search default", ["-r", "-n", "FATAL", f"{TREE_DIR}/dir_000"], None, limit_vmem_256))
+
+    # 16. Low file descriptor limits (RLIMIT_NOFILE = 32)
+    checks.append(("RLIMIT_NOFILE 32 tree search default", ["-r", "-l", "FATAL", f"{TREE_DIR}/dir_000"], None, limit_nofile_32))
+    checks.append(("RLIMIT_NOFILE 32 tree search t=16", ["-r", "-l", "FATAL", f"{TREE_DIR}/dir_000"], {"GREP_THREADS": "16"}, limit_nofile_32))
 
     passed = 0
     total = len(checks)
