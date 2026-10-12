@@ -113,7 +113,7 @@ GREP_THREADS=8 grep -rn pattern .   # use 8 threads
 GREP_THREADS=1 grep -rn pattern .   # single-threaded
 ```
 
-Output is identical for every thread count — only the wall-clock time changes.
+Changing `GREP_THREADS` only affects speed — the output and line order are always identical.
 
 ## ⚠️ Honest notes
 
