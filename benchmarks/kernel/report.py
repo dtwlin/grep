@@ -287,10 +287,17 @@ class ReportGenerator:
         return "SOFT_DIFF", "Diff / binary formatting"
 
     def generate_headline_table(self) -> str:
-        lines = [
-            "| Scenario | Description | G0 (ms) | G1 (ms) | R0 (ms) | G2 (ms) | X1 (ms) | G1 vs G0 | R0 vs G0 | G1 vs R0 | G1 CPU | R0 CPU | G2 CPU | X1 CPU | G1 RSS | R0 RSS | G2 RSS | X1 RSS | Gate A | Gate B |",
-            "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: | :---: |",
-        ]
+        has_other = any(k[1] in ("G2", "X1") for k in self.stats.keys())
+        if has_other:
+            lines = [
+                "| Scenario | Description | G0 (ms) | G1 (ms) | R0 (ms) | G2 (ms) | X1 (ms) | G1 vs G0 | R0 vs G0 | G1 vs R0 | G1 CPU | R0 CPU | G2 CPU | X1 CPU | G1 RSS | R0 RSS | G2 RSS | X1 RSS | Gate A | Gate B |",
+                "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: | :---: |",
+            ]
+        else:
+            lines = [
+                "| Scenario | Description | G0 (ms) | G1 (ms) | R0 (ms) | G1 vs G0 | R0 vs G0 | G1 vs R0 | G1 CPU | R0 CPU | G1 RSS | R0 RSS | Gate A | Gate B |",
+                "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: | :---: |",
+            ]
 
         for sid in self.scenarios:
             g0 = self.get_stat(sid, "G0")
@@ -345,14 +352,23 @@ class ReportGenerator:
                 g1_vs_g0 = (g0_ms / g1_ms) if (g0_ms and g1_ms and g1_ms > 0) else None
                 g1_vs_r0 = (r0_ms / g1_ms) if (r0_ms and g1_ms and g1_ms > 0) else None
 
-            row = (
-                f"| `{sid}` | {desc} | "
-                f"{format_ms(g0_ms)} | {g1_str} | {r0_str} | "
-                f"{format_ms(g2_ms)} | {x1_str} | "
-                f"**{format_ratio(g1_vs_g0)}** | {format_ratio(r0_vs_g0)} | "
-                f"**{format_ratio(g1_vs_r0)}** | {g1_cpu} | {r0_cpu} | {g2_cpu} | {x1_cpu} | "
-                f"{g1_rss} | {r0_rss} | {g2_rss} | {x1_rss} | {gate_a_str} | {gate_b_str} |"
-            )
+            if has_other:
+                row = (
+                    f"| `{sid}` | {desc} | "
+                    f"{format_ms(g0_ms)} | {g1_str} | {r0_str} | "
+                    f"{format_ms(g2_ms)} | {x1_str} | "
+                    f"**{format_ratio(g1_vs_g0)}** | {format_ratio(r0_vs_g0)} | "
+                    f"**{format_ratio(g1_vs_r0)}** | {g1_cpu} | {r0_cpu} | {g2_cpu} | {x1_cpu} | "
+                    f"{g1_rss} | {r0_rss} | {g2_rss} | {x1_rss} | {gate_a_str} | {gate_b_str} |"
+                )
+            else:
+                row = (
+                    f"| `{sid}` | {desc} | "
+                    f"{format_ms(g0_ms)} | {g1_str} | {r0_str} | "
+                    f"**{format_ratio(g1_vs_g0)}** | {format_ratio(r0_vs_g0)} | "
+                    f"**{format_ratio(g1_vs_r0)}** | {g1_cpu} | {r0_cpu} | "
+                    f"{g1_rss} | {r0_rss} | {gate_a_str} | {gate_b_str} |"
+                )
             lines.append(row)
 
         failed_sids = [sid for sid in self.scenarios if self.get_stat(sid, "G1") and self.check_gate_a(sid)[0] != "PASS"]
@@ -380,12 +396,21 @@ class ReportGenerator:
         }
         title = cat_names.get(category, f"Category {category}")
 
-        lines = [
-            f"### Category {category} — {title}",
-            "",
-            "| Scenario | Description | G0 (ms) | G1 (ms) | R0 (ms) | G2 (ms) | X1 (ms) | Speedup (vs G0) | G1 vs R0 | G1 CPU | R0 CPU | G2 CPU | X1 CPU | G1 RSS | R0 RSS | G2 RSS | X1 RSS | Gate A |",
-            "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |",
-        ]
+        has_other = any(k[1] in ("G2", "X1") for k in self.stats.keys())
+        if has_other:
+            lines = [
+                f"### Category {category} — {title}",
+                "",
+                "| Scenario | Description | G0 (ms) | G1 (ms) | R0 (ms) | G2 (ms) | X1 (ms) | Speedup (vs G0) | G1 vs R0 | G1 CPU | R0 CPU | G2 CPU | X1 CPU | G1 RSS | R0 RSS | G2 RSS | X1 RSS | Gate A |",
+                "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |",
+            ]
+        else:
+            lines = [
+                f"### Category {category} — {title}",
+                "",
+                "| Scenario | Description | G0 (ms) | G1 (ms) | R0 (ms) | Speedup (vs G0) | G1 vs R0 | G1 CPU | R0 CPU | G1 RSS | R0 RSS | Gate A |",
+                "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |",
+            ]
 
         for sid in sids:
             g0 = self.get_stat(sid, "G0")
@@ -432,11 +457,18 @@ class ReportGenerator:
             g2_rss = format_rss(g2["max_rss_mb"] if g2 else None)
             x1_rss = format_rss(x1["max_rss_mb"] if (x1 and not (sid == "M-02" and x1.get("timed_out"))) else None)
 
-            lines.append(
-                f"| `{sid}` | {desc} | {format_ms(g0_ms)} | {g1_str} | {r0_str} | "
-                f"{format_ms(g2_ms)} | {x1_str} | **{format_ratio(g1_vs_g0)}** | **{format_ratio(g1_vs_r0)}** | "
-                f"{g1_cpu} | {r0_cpu} | {g2_cpu} | {x1_cpu} | {g1_rss} | {r0_rss} | {g2_rss} | {x1_rss} | {gate_a_str} |"
-            )
+            if has_other:
+                lines.append(
+                    f"| `{sid}` | {desc} | {format_ms(g0_ms)} | {g1_str} | {r0_str} | "
+                    f"{format_ms(g2_ms)} | {x1_str} | **{format_ratio(g1_vs_g0)}** | **{format_ratio(g1_vs_r0)}** | "
+                    f"{g1_cpu} | {r0_cpu} | {g2_cpu} | {x1_cpu} | {g1_rss} | {r0_rss} | {g2_rss} | {x1_rss} | {gate_a_str} |"
+                )
+            else:
+                lines.append(
+                    f"| `{sid}` | {desc} | {format_ms(g0_ms)} | {g1_str} | {r0_str} | "
+                    f"**{format_ratio(g1_vs_g0)}** | **{format_ratio(g1_vs_r0)}** | "
+                    f"{g1_cpu} | {r0_cpu} | {g1_rss} | {r0_rss} | {gate_a_str} |"
+                )
 
         cat_fails = [sid for sid in sids if self.get_stat(sid, "G1") and self.check_gate_a(sid)[0] != "PASS"]
         if cat_fails:
@@ -495,13 +527,18 @@ class ReportGenerator:
                     f"{cpu_str} | {rss_str} |"
                 )
 
+        has_other = any(k[1] in ("G2", "X1") for k in self.stats.keys())
         lines.extend([
             "",
             "#### Summary Comparison (Net Latency Median)",
             "",
-            "| Scenario | Description | G0 Net | G1 Net | R0 Net | G2 Net | X1 Net | G1 vs G0 | G1 vs R0 | Gate A |",
-            "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |",
         ])
+        if has_other:
+            lines.append("| Scenario | Description | G0 Net | G1 Net | R0 Net | G2 Net | X1 Net | G1 vs G0 | G1 vs R0 | Gate A |")
+            lines.append("| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |")
+        else:
+            lines.append("| Scenario | Description | G0 Net | G1 Net | R0 Net | G1 vs G0 | G1 vs R0 | Gate A |")
+            lines.append("| :--- | :--- | ---: | ---: | ---: | ---: | ---: | :---: |")
 
         for sid in sids:
             g0 = self.get_stat(sid, "G0")
@@ -531,10 +568,16 @@ class ReportGenerator:
             gate_a, _ = self.check_gate_a(sid)
             gate_a_str = f"**{gate_a}**" if gate_a == "PASS" else f"❌ {gate_a}"
 
-            lines.append(
-                f"| `{sid}` | {desc} | {format_ms(g0_net)} | {format_ms(g1_net)} | {format_ms(r0_net)} | "
-                f"{format_ms(g2_net)} | {format_ms(x1_net)} | **{format_ratio(g1_vs_g0)}** | **{format_ratio(g1_vs_r0)}** | {gate_a_str} |"
-            )
+            if has_other:
+                lines.append(
+                    f"| `{sid}` | {desc} | {format_ms(g0_net)} | {format_ms(g1_net)} | {format_ms(r0_net)} | "
+                    f"{format_ms(g2_net)} | {format_ms(x1_net)} | **{format_ratio(g1_vs_g0)}** | **{format_ratio(g1_vs_r0)}** | {gate_a_str} |"
+                )
+            else:
+                lines.append(
+                    f"| `{sid}` | {desc} | {format_ms(g0_net)} | {format_ms(g1_net)} | {format_ms(r0_net)} | "
+                    f"**{format_ratio(g1_vs_g0)}** | **{format_ratio(g1_vs_r0)}** | {gate_a_str} |"
+                )
 
         return "\n".join(lines)
 
@@ -543,14 +586,19 @@ class ReportGenerator:
         if not c_sids:
             return ""
 
+        has_other = any(k[1] in ("G2", "X1") for k in self.stats.keys())
         lines = [
             "### Locale Sensitivity: en_US.UTF-8 vs LC_ALL=C (22 Scenarios)",
             "",
             "> Ratio = UTF-8 median / C median. A ratio > 1.00× indicates that the C locale is faster (multibyte/case-folding overhead in UTF-8).",
             "",
-            "| Scenario | Description | G0 UTF-8 | G0 C | G0 (U/C) | G1 UTF-8 | G1 C | G1 (U/C) | R0 UTF-8 | R0 C | R0 (U/C) | G2 (U/C) | X1 (U/C) |",
-            "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
+        if has_other:
+            lines.append("| Scenario | Description | G0 UTF-8 | G0 C | G0 (U/C) | G1 UTF-8 | G1 C | G1 (U/C) | R0 UTF-8 | R0 C | R0 (U/C) | G2 (U/C) | X1 (U/C) |")
+            lines.append("| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+        else:
+            lines.append("| Scenario | Description | G0 UTF-8 | G0 C | G0 (U/C) | G1 UTF-8 | G1 C | G1 (U/C) | R0 UTF-8 | R0 C | R0 (U/C) |")
+            lines.append("| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
 
         for sid in c_sids:
             g0_u = self.get_stat(sid, "G0", locale="en_US.UTF-8")
@@ -578,12 +626,19 @@ class ReportGenerator:
             r0_u_ms = format_ms(r0_u["median_ms"]) if r0_u else "—"
             r0_c_ms = format_ms(r0_c["median_ms"]) if r0_c else "—"
 
-            lines.append(
-                f"| `{sid}` | {desc} | {g0_u_ms} | {g0_c_ms} | **{calc_ratio(g0_u, g0_c)}** | "
-                f"{g1_u_ms} | {g1_c_ms} | **{calc_ratio(g1_u, g1_c)}** | "
-                f"{r0_u_ms} | {r0_c_ms} | **{calc_ratio(r0_u, r0_c)}** | "
-                f"{calc_ratio(g2_u, g2_c)} | {calc_ratio(x1_u, x1_c)} |"
-            )
+            if has_other:
+                lines.append(
+                    f"| `{sid}` | {desc} | {g0_u_ms} | {g0_c_ms} | **{calc_ratio(g0_u, g0_c)}** | "
+                    f"{g1_u_ms} | {g1_c_ms} | **{calc_ratio(g1_u, g1_c)}** | "
+                    f"{r0_u_ms} | {r0_c_ms} | **{calc_ratio(r0_u, r0_c)}** | "
+                    f"{calc_ratio(g2_u, g2_c)} | {calc_ratio(x1_u, x1_c)} |"
+                )
+            else:
+                lines.append(
+                    f"| `{sid}` | {desc} | {g0_u_ms} | {g0_c_ms} | **{calc_ratio(g0_u, g0_c)}** | "
+                    f"{g1_u_ms} | {g1_c_ms} | **{calc_ratio(g1_u, g1_c)}** | "
+                    f"{r0_u_ms} | {r0_c_ms} | **{calc_ratio(r0_u, r0_c)}** |"
+                )
 
         return "\n".join(lines)
 
@@ -823,12 +878,21 @@ class ReportGenerator:
                 tree_regressed = True
                 t_msg = f"Tree regresses past 16 th ({m16:.0f} ms @16 → {m64:.0f} ms @64)"
 
+        aff_cnt = self.env_meta.get("affinity_count")
+        numa_node = self.env_meta.get("numa_node")
+        if aff_cnt == 128:
+            sweep_msg = "1..128 thread sweep across 128 logical CPUs (2 NUMA nodes)"
+        elif numa_node is not None:
+            sweep_msg = f"1..64 sweep on NUMA node {numa_node}; 96/128 covered in quick run"
+        else:
+            sweep_msg = "1..128 thread sweep"
+
         if tree_regressed:
             h9_status = "❌ FAIL (scaling bottleneck / regression on tree)"
-            h9_outcome = f"B-01 ($BIG): {b01_gain:.2f}× (16→64 th); {t_msg} (1..64 sweep on NUMA node 0; 96/128 covered in quick run)"
+            h9_outcome = f"B-01 ($BIG): {b01_gain:.2f}× (16→64 th); {t_msg} ({sweep_msg})"
         else:
             h9_status = "✅ PASS"
-            h9_outcome = f"B-01: {b01_gain:.2f}× (16→64 th); 1..64 sweep on NUMA node 0"
+            h9_outcome = f"B-01: {b01_gain:.2f}× (16→64 th); {sweep_msg}"
 
         scorecard.append(
             f"| **H9** | Scaling past 16 threads | Gains throughput past 16 threads | {h9_outcome} | {h9_status} |"
@@ -878,7 +942,12 @@ class ReportGenerator:
         numa_node = self.env_meta.get("numa_node")
         aff_cnt = self.env_meta.get("affinity_count")
         if aff_cpus:
-            content.append(f"- **Isolation**: NUMA node {numa_node} (CPUs {aff_cpus}, {aff_cnt} logical CPUs)")
+            if aff_cnt == 128:
+                content.append(f"- **Isolation**: All 128 logical CPUs (2 NUMA nodes, CPUs {aff_cpus})")
+            elif numa_node is not None:
+                content.append(f"- **Isolation**: NUMA node {numa_node} (CPUs {aff_cpus}, {aff_cnt} logical CPUs)")
+            else:
+                content.append(f"- **Isolation**: CPUs {aff_cpus} ({aff_cnt} logical CPUs)")
         note = self.env_meta.get("note")
         if note:
             content.append(f"- **Run Note**: {note}")

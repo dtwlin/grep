@@ -1,0 +1,20 @@
+{
+  "T-07": {
+    "R0": {
+      "classification": "SOFT_DIFF",
+      "diff_sample": "--- /dev/shm/kbench_out/ref_T-07_G0.sorted\t2026-10-12 03:01:54.896160261 +0000\n+++ /dev/shm/kbench_out/ref_T-07_R0.sorted\t2026-10-12 03:01:55.670441394 +0000\n@@ -2450,7 +2450,6 @@\n $K/Documentation/iio/iio_configfs.rst\n $K/Documentation/iio/opt4060.rst\n $K/Documentation/images/COPYING-logo\n-$K/Documentation/images/logo.gif\n $K/Documentation/images/logo.svg\n $K/Documentation/infiniband/core_locking.rst\n $K/Documentation/infiniband/ipoib.rst"
+    }
+  },
+  "T-09": {
+    "R0": {
+      "classification": "KNOWN-SEMANTIC (BOM stripping)",
+      "diff_sample": "--- /dev/shm/kbench_out/ref_T-09_G0.sorted\t2026-10-12 03:02:42.193126560 +0000\n+++ /dev/shm/kbench_out/ref_T-09_R0.sorted\t2026-10-12 03:02:43.553124671 +0000\n@@ -780,9 +780,9 @@\n $K/Documentation/translations/sp_SP/process/kernel-enforcement-statement.rst:Aunque existe el derecho de hacer valer un copyright distinto en las\n $K/Documentation/translations/sp_SP/process/kernel-enforcement-statement.rst:nuestro y de cualquier sucesor de nuestros derechos de autor (copyright):\n $K/Documentation/translations/zh_CN/admin-guide/reporting-issues.rst:   way if you want to contribute changes to the text, but for copyright\n+$K/Documentation/translations/zh_CN/dev-tools/sparse.rst:Copyright 2004 Linus Torvalds\n $K/Documentation/translations/zh_CN/dev-tools/sparse.rst:Copyright 2004 Pavel Machek <pavel@ucw.cz>\n $K/Documentation/translations/zh_CN/dev-tools/sparse.rst:Copyright 2006 Bob Copeland <me@bobcopeland.com>\n-$K/Documentation/translations/zh_CN/dev-tools/sparse.rst:\ufeffCopyright 2004 Linus Torvalds"
+    }
+  },
+  "T-21": {
+    "R0": {
+      "classification": "SOFT_DIFF",
+      "diff_sample": "--- /dev/shm/kbench_out/ref_T-21_G0.sorted\t2026-10-12 03:08:56.302165213 +0000\n+++ /dev/shm/kbench_out/ref_T-21_R0.sorted\t2026-10-12 03:08:58.282174739 +0000\n@@ -1 +1 @@\n-SUM:32347857\n+SUM:32247077"
+    }
+  }
+}
