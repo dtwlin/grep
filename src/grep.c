@@ -8180,7 +8180,18 @@ main (int argc, char **argv)
               "<https://git.savannah.gnu.org/cgit/grep.git/tree/AUTHORS>."));
 #if HAVE_LIBPCRE
       Pprint_version ();
+#else
+      putchar ('\n');
 #endif
+#if defined __AVX2__
+      char const *simd = "AVX2";
+#else
+      char const *simd = "SWAR";
+#endif
+      int nthreads = get_num_threads ();
+      printf (_("Supercharged grep (up to %d %s, %s)"
+                " <https://github.com/dtwlin/grep>\n"),
+              nthreads, nthreads == 1 ? "thread" : "threads", simd);
       return EXIT_SUCCESS;
     }
 

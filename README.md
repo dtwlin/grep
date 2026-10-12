@@ -99,7 +99,7 @@ cd grep
 make -j"$(nproc)"
 make check                               # optional: GNU grep's test suite + the parallel tests
 sudo make install                        # installs /usr/local/bin/grep, ahead of /usr/bin/grep on most PATHs
-hash -r && grep --version
+hash -r && grep --version                # look for: Supercharged grep (up to 32 threads, AVX2)
 ```
 
 `-march=native` enables the AVX2 kernels on CPUs that have them; leave it out for a portable binary that uses the plain C fallbacks. Changed your mind? `sudo make uninstall` brings back your system grep.
