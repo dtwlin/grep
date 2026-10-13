@@ -1,7 +1,7 @@
 <h1 align="center">⚡ Supercharged grep</h1>
 
 <p align="center">
-  <i>"Time is valuable — I don't want to wait one millisecond longer."</i>
+  <i>"Your time is valuable — don't wait a millisecond longer than you have to."</i>
 </p>
 
 <p align="center">
