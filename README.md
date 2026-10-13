@@ -156,26 +156,63 @@ Everything below lives behind GNU grep's unchanged command-line interface.
 
 Requirements: a C11 compiler with `<stdatomic.h>` and POSIX threads (any recent GCC or Clang), the GNU autotools, and optionally PCRE2 for `-P`.
 
+### 🐧 Linux (x86-64)
+
+1. Install the build dependencies (Debian/Ubuntu shown; adjust for your distribution):
+
 ```bash
-# Debian/Ubuntu build prerequisites (adjust for your distro)
 sudo apt install build-essential git autoconf automake autopoint gettext gperf \
   texinfo pkg-config wget xz-utils libpcre2-dev
+```
 
-# macOS (experimental; the Xcode Command Line Tools provide clang, git, and make)
-brew install autoconf automake gettext gperf texinfo pkg-config wget xz pcre2
-export PATH="$(brew --prefix texinfo)/bin:$(brew --prefix gettext)/bin:$PATH"   # keg-only tools; ./bootstrap needs texi2pdf >= 6.1
+2. Clone, build, and install:
 
+```bash
 git clone --recurse-submodules https://github.com/dtwlin/grep.git
 cd grep
 ./bootstrap --skip-po
-./configure CFLAGS='-O3 -march=native'   # Apple Silicon: CFLAGS='-O3'. Add --prefix="$HOME/.local" to install without sudo
-make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
-make check                               # optional, ~2 min: GNU grep's test suite + the parallel tests
-sudo make install                        # installs /usr/local/bin/grep, ahead of /usr/bin/grep on most PATHs
-hash -r && grep --version                # the last line should start with "Supercharged grep"
+./configure CFLAGS='-O3 -march=native'
+make -j"$(nproc)"
+make check                # optional (~2 min): GNU grep test suite + parallel tests
+sudo make install         # installs /usr/local/bin/grep, ahead of /usr/bin/grep on most PATHs
+hash -r && grep --version # last line should start with "Supercharged grep"
 ```
 
-`-march=native` enables the AVX2 kernels on x86-64 CPUs that have them (`-mavx2` works too); leave it out for a portable binary that uses the plain C fallbacks. Apple Clang on Apple Silicon may reject `-march=native`, and AVX2 does not apply to ARM anyway. If you installed with `--prefix="$HOME/.local"`, make sure `~/.local/bin` comes before `/usr/bin` in `PATH`. Changed your mind? `sudo make uninstall` from the same build directory brings back your system grep.
+`-march=native` enables the AVX2 kernels on CPUs that support them (`-mavx2` works too). Omit `-march=native` when building a portable binary for older x86-64 machines.
+
+### 🍎 macOS (experimental)
+
+Requires the Xcode Command Line Tools (`xcode-select --install`) and [Homebrew](https://brew.sh).
+
+1. Install the build dependencies and put Homebrew's keg-only tools (`texinfo` and `gettext`) and Autoconf macros on your search paths:
+
+```bash
+brew install autoconf automake gettext gperf texinfo pkg-config wget xz pcre2
+export PATH="$(brew --prefix texinfo)/bin:$(brew --prefix gettext)/bin:$PATH"
+export ACLOCAL_PATH="$(brew --prefix)/share/aclocal"
+```
+
+2. Clone, build, and install:
+
+```bash
+git clone --recurse-submodules https://github.com/dtwlin/grep.git
+cd grep
+./bootstrap --skip-po
+./configure CFLAGS='-O3'
+make -j"$(sysctl -n hw.ncpu)"
+make check                # optional: test suite
+sudo make install         # installs /usr/local/bin/grep
+hash -r && grep --version # last line should start with "Supercharged grep"
+```
+
+Apple Silicon uses the portable 64-bit SWAR (SIMD within a register) kernels with `CFLAGS='-O3'`. On Intel Macs with AVX2, pass `CFLAGS='-O3 -march=native'` to `./configure`.
+
+### 🛠️ Install options
+
+Use these options to customize or remove the installation:
+
+- **Install without `sudo`:** pass `--prefix="$HOME/.local"` to `./configure`, run `make install`, and ensure `~/.local/bin` comes before `/usr/bin` in `PATH`.
+- **Uninstall:** run `sudo make uninstall` (or `make uninstall` for a `~/.local` install) from the build directory to restore your system `grep`.
 
 ## ⚙️ Tuning
 
