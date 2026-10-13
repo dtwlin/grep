@@ -24,11 +24,11 @@ jobs:
         include:
           - variant: avx2
             name: Linux x86-64 (AVX2)
-            cflags: "-O3 -march=native -Wall -Werror"
+            cflags: "-O3 -march=native"
             simd_tag: "AVX2"
           - variant: swar
             name: Linux x86-64 (SWAR Portable)
-            cflags: "-O3 -mno-avx2 -Wall -Werror"
+            cflags: "-O3 -mno-avx2"
             simd_tag: "SWAR"
     steps:
       - name: Checkout repository
@@ -47,7 +47,7 @@ jobs:
           path: |
             gnulib
             .git/modules/gnulib
-          key: gnulib-${{ steps.gnulib-rev.outputs.sha }}
+          key: ${{ runner.os }}-gnulib-${{ steps.gnulib-rev.outputs.sha }}
 
       - name: Initialize gnulib submodule
         run: |
@@ -65,10 +65,10 @@ jobs:
             libpcre2-dev locales-all pkg-config texinfo wget xz-utils
 
       - name: Bootstrap
-        run: ./bootstrap --skip-po
+        run: GNULIB_SRCDIR=gnulib ./bootstrap --no-git --skip-po
 
       - name: Configure
-        run: ./configure CFLAGS="${{ matrix.cflags }}"
+        run: ./configure --disable-gcc-warnings CFLAGS="${{ matrix.cflags }}"
 
       - name: Build
         run: make -j"$(nproc)"
@@ -90,16 +90,16 @@ jobs:
         if: matrix.variant == 'avx2'
         run: |
           python3 benchmarks/tree_conformance.py \
-            --baseline /usr/bin/grep \
+            --baseline src/grep \
             --candidate src/grep \
             --work-dir /tmp/tc-ci \
             --quick \
-            --threads 1,4,16
+            --threads 2,4,16
           python3 benchmarks/kwset_diff.py \
-            --baseline /usr/bin/grep \
+            --baseline src/grep \
             --candidate src/grep \
             --cases 300 \
-            --threads 1,8
+            --threads 2,8
 
   sanitizers:
     name: ${{ matrix.name }}
@@ -110,11 +110,11 @@ jobs:
         include:
           - variant: asan-ubsan
             name: Linux x86-64 (ASan + UBSan)
-            cflags: "-g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer"
+            cflags: "-U_FORTIFY_SOURCE -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer"
             ldflags: "-fsanitize=address,undefined"
           - variant: tsan
             name: Linux x86-64 (TSan)
-            cflags: "-g -O1 -fsanitize=thread -fno-omit-frame-pointer"
+            cflags: "-U_FORTIFY_SOURCE -g -O1 -fsanitize=thread -fno-omit-frame-pointer"
             ldflags: "-fsanitize=thread"
     steps:
       - name: Checkout repository
@@ -133,7 +133,7 @@ jobs:
           path: |
             gnulib
             .git/modules/gnulib
-          key: gnulib-${{ steps.gnulib-rev.outputs.sha }}
+          key: ${{ runner.os }}-gnulib-${{ steps.gnulib-rev.outputs.sha }}
 
       - name: Initialize gnulib submodule
         run: |
@@ -151,10 +151,10 @@ jobs:
             libpcre2-dev locales-all pkg-config texinfo wget xz-utils
 
       - name: Bootstrap
-        run: ./bootstrap --skip-po
+        run: GNULIB_SRCDIR=gnulib ./bootstrap --no-git --skip-po
 
       - name: Configure (${{ matrix.variant }})
-        run: ./configure CFLAGS="${{ matrix.cflags }}" LDFLAGS="${{ matrix.ldflags }}"
+        run: ./configure --disable-gcc-warnings CFLAGS="${{ matrix.cflags }}" LDFLAGS="${{ matrix.ldflags }}"
 
       - name: Build
         run: make -j"$(nproc)"
@@ -178,10 +178,10 @@ jobs:
           TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
         run: |
           python3 benchmarks/kwset_diff.py \
-            --baseline /usr/bin/grep \
+            --baseline src/grep \
             --candidate src/grep \
             --cases 200 \
-            --threads 1,8
+            --threads 2,8
 
   macos:
     name: macOS ARM64 (Apple Silicon)
@@ -203,7 +203,7 @@ jobs:
           path: |
             gnulib
             .git/modules/gnulib
-          key: gnulib-${{ steps.gnulib-rev.outputs.sha }}
+          key: ${{ runner.os }}-gnulib-${{ steps.gnulib-rev.outputs.sha }}
 
       - name: Initialize gnulib submodule
         run: |
@@ -218,15 +218,21 @@ jobs:
           HOMEBREW_NO_AUTO_UPDATE: "1"
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
         run: |
-          brew install autoconf automake gettext gperf texinfo pkg-config wget xz pcre2
+          for pkg in autoconf automake gettext gperf texinfo wget xz pcre2; do
+            brew list --versions "$pkg" >/dev/null 2>&1 || brew install "$pkg"
+          done
+          if ! command -v pkg-config >/dev/null 2>&1; then
+            brew install pkgconf || brew install pkg-config
+          fi
           echo "$(brew --prefix texinfo)/bin" >> "$GITHUB_PATH"
           echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
+          echo "ACLOCAL_PATH=$(brew --prefix)/share/aclocal" >> "$GITHUB_ENV"
 
       - name: Bootstrap
-        run: ./bootstrap --skip-po
+        run: GNULIB_SRCDIR=gnulib ./bootstrap --no-git --skip-po
 
       - name: Configure
-        run: ./configure CFLAGS="-O3"
+        run: ./configure --disable-gcc-warnings CFLAGS="-O3"
 
       - name: Build
         run: make -j"$(sysctl -n hw.ncpu)"

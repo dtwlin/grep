@@ -43,7 +43,7 @@ jobs:
           path: |
             gnulib
             .git/modules/gnulib
-          key: gnulib-${{ steps.gnulib-rev.outputs.sha }}
+          key: ${{ runner.os }}-gnulib-${{ steps.gnulib-rev.outputs.sha }}
 
       - name: Initialize gnulib submodule
         run: |
@@ -67,14 +67,20 @@ jobs:
           HOMEBREW_NO_AUTO_UPDATE: "1"
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
         run: |
-          brew install autoconf automake gettext gperf texinfo pkg-config wget xz pcre2
+          for pkg in autoconf automake gettext gperf texinfo wget xz pcre2; do
+            brew list --versions "$pkg" >/dev/null 2>&1 || brew install "$pkg"
+          done
+          if ! command -v pkg-config >/dev/null 2>&1; then
+            brew install pkgconf || brew install pkg-config
+          fi
           echo "$(brew --prefix texinfo)/bin" >> "$GITHUB_PATH"
           echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
+          echo "ACLOCAL_PATH=$(brew --prefix)/share/aclocal" >> "$GITHUB_ENV"
 
       - name: Bootstrap, configure & build
         run: |
-          ./bootstrap --skip-po
-          ./configure CFLAGS="${{ matrix.cflags }}" --prefix="/usr/local"
+          GNULIB_SRCDIR=gnulib ./bootstrap --no-git --skip-po
+          ./configure --disable-gcc-warnings CFLAGS="${{ matrix.cflags }}" --prefix="/usr/local"
           ncpus=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
           make -j"$ncpus"
           make check -C tests -j"$ncpus" \
