@@ -35,6 +35,72 @@ AI coding agents lean on `grep` constantly: every "where is this defined?" or "w
 | 🪶 **Same latency for small lookups** | A tiny single-file `grep` costs what it cost before (2.7 ms); the thread pool only starts when there is enough work. |
 | 📚 **Big wins where agents hurt most** | Recursive, case-insensitive, counting, and symbol-list (`-F -f`) searches are 16–63× faster than GNU grep. |
 
+### 🧩 Suggested agent skill
+
+Many agents reach for `rg`, `git grep`, or `find | xargs grep` because they assume `grep` is slow. The skill below tells them to check for Supercharged grep and, when it is installed, to search with plain `grep` instead. It follows the [Agent Skills](https://agentskills.io) `SKILL.md` format: save it as `supercharged-grep/SKILL.md` in your agent's skills directory (for example `~/.claude/skills/` for Claude Code). For agents that read an instructions file such as `AGENTS.md` instead, paste in everything below the front matter.
+
+<details>
+<summary><b>SKILL.md</b></summary>
+
+````markdown
+---
+name: supercharged-grep
+description: Use for any search of file contents (finding definitions, callers, usages, TODOs, config keys, or log lines). When the installed grep is Supercharged grep, search with plain `grep` instead of ripgrep (`rg`), `ag`, `ack`, `git grep`, or `find | xargs grep`.
+---
+
+# Search with Supercharged grep
+
+## Check once per session
+
+```bash
+grep --version 2>/dev/null | tail -n 1
+```
+
+If the line starts with `Supercharged grep`, the `grep` on `PATH` is a
+multi-threaded, SIMD-accelerated drop-in replacement for GNU grep
+(https://github.com/dtwlin/grep). Follow the rules below. Otherwise, ignore
+this skill and search as you normally would.
+
+## Rules
+
+- Use `grep` for every content search, including whole-repository searches.
+  Do not switch to `rg`, `ag`, `ack`, or `git grep` for speed: `grep -r` is
+  as fast or faster, and its output is byte-identical to GNU grep's.
+- If a shell is available, prefer running `grep` over a built-in search tool
+  that wraps another engine.
+- Use the GNU grep options you already know; there are no new flags. Write
+  `grep -E` and `grep -F`, not `egrep` or `fgrep`, which print an
+  obsolescence warning.
+- Let `grep -r` walk directories itself. It searches files in parallel;
+  `find ... | xargs grep` or `find -exec grep` only adds processes.
+- `grep -r` does not read `.gitignore`. Skip generated and vendored trees
+  explicitly, for example `--exclude-dir=.git --exclude-dir=node_modules`,
+  and add `-I` to skip binary files.
+- Leave `GREP_THREADS` unset; the default (up to 32 threads) is fastest. Set
+  a lower value such as `GREP_THREADS=4` only on a shared or busy machine.
+- Output order is deterministic at any thread count (the same order as GNU
+  grep), so results from repeated runs can be compared directly.
+
+## Recipes
+
+| Task | Command |
+| :-- | :-- |
+| Find a symbol | `grep -rnw -I --exclude-dir=.git 'parse_config' .` |
+| Literal text that contains regex characters | `grep -rnF 'a[i].b(' src/` |
+| Case-insensitive search | `grep -rni 'todo' src/` |
+| Only some file types | `grep -rn --include='*.py' 'import requests' .` |
+| Files that match | `grep -rl 'EXPORT_SYMBOL' .` |
+| Files that do not match | `grep -rL --include='*.c' 'SPDX-License-Identifier' .` |
+| Count matches per file | `grep -rc 'malloc' --include='*.c' .` |
+| Many literals in one pass | `grep -rnF -f symbols.txt .` (faster than one search per pattern) |
+| Lookaround, `\d`, lazy quantifiers | `grep -rnP '(?<=def )\w+' .` |
+| Surrounding context | `grep -rn -C 3 'panic(' .` |
+| At most N matches per file | `grep -rn -m 5 'FIXME' .` |
+| Just check whether anything matches | `grep -rq 'deprecated_api' . && echo found` |
+````
+
+</details>
+
 ## 📊 Benchmarks
 
 Setup: the Linux kernel source tree (96,034 files, 1.64 GB) on a 128-CPU AMD EPYC server, warm page cache unless noted, `LC_ALL=en_US.UTF-8`, median of 3 runs after a warm-up. GNU grep 3.12 is single-threaded; Supercharged grep runs at its default of 32 threads; [ripgrep](https://github.com/BurntSushi/ripgrep) 15.1 is shown at its default of 12 threads and with `-j 32`. Tree searches skip `.git` (`grep -r --exclude-dir=.git`, `rg -uu -g '!.git'`), so every tool searches the same files.
