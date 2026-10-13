@@ -394,6 +394,10 @@ def remove_tree(root):
 class Runner:
     def __init__(self, args):
         self.args = args
+        self.base_threads = (
+            1 if os.path.realpath(args.baseline) == os.path.realpath(args.candidate)
+            else None
+        )
         self.env = dict(os.environ)
         if args.locale:
             self.env["LC_ALL"] = args.locale
@@ -485,7 +489,7 @@ class Runner:
             return r
 
         known_fail = any(label.startswith(k) for k in self.args.known_fail)
-        b_out, b_err, b_rc = go(self.base, None)
+        b_out, b_err, b_rc = go(self.base, self.base_threads)
         for t in self.args.threads:
             c_out, c_err, c_rc = go(self.cand, t)
             self.checks += 1

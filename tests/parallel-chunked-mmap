@@ -73,8 +73,7 @@ for t in 2 4 8 16; do
 done
 
 # 7. File >= 2 MiB without a trailing newline
-# Strip final newline from in_2m and append match at EOF without newline
-head -c -1 in_2m > in_nonl || framework_failure_
+cp in_2m in_nonl || framework_failure_
 printf "line 40001: MATCH_EOF_NONL final_record" >> in_nonl || framework_failure_
 
 for opt in "-n" "-b" "-c" "-o"; do

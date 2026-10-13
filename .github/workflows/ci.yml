@@ -1,0 +1,254 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  linux:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: avx2
+            name: Linux x86-64 (AVX2)
+            cflags: "-O3 -march=native -Wall -Werror"
+            simd_tag: "AVX2"
+          - variant: swar
+            name: Linux x86-64 (SWAR Portable)
+            cflags: "-O3 -mno-avx2 -Wall -Werror"
+            simd_tag: "SWAR"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get gnulib submodule revision
+        id: gnulib-rev
+        run: |
+          echo "sha=$(git ls-tree HEAD gnulib | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache gnulib submodule
+        uses: actions/cache@v4
+        with:
+          path: |
+            gnulib
+            .git/modules/gnulib
+          key: gnulib-${{ steps.gnulib-rev.outputs.sha }}
+
+      - name: Initialize gnulib submodule
+        run: |
+          git config submodule.gnulib.url https://github.com/coreutils/gnulib.git
+          git submodule update --init --depth 1 gnulib || {
+            git config submodule.gnulib.url https://git.savannah.gnu.org/git/gnulib
+            git submodule update --init --depth 1 gnulib
+          }
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake autopoint build-essential gettext gperf \
+            libpcre2-dev locales-all pkg-config texinfo wget xz-utils
+
+      - name: Bootstrap
+        run: ./bootstrap --skip-po
+
+      - name: Configure
+        run: ./configure CFLAGS="${{ matrix.cflags }}"
+
+      - name: Build
+        run: make -j"$(nproc)"
+
+      - name: Verify binary & version string
+        run: |
+          ./src/grep --version
+          ./src/grep --version | ./src/grep -F "Supercharged grep"
+          ./src/grep --version | ./src/grep -F "${{ matrix.simd_tag }})"
+
+      - name: Run test suite
+        run: |
+          make check -C tests -j"$(nproc)" || {
+            cat tests/test-suite.log
+            exit 1
+          }
+
+      - name: Run tree traversal & multi-pattern differential conformance
+        if: matrix.variant == 'avx2'
+        run: |
+          python3 benchmarks/tree_conformance.py \
+            --baseline /usr/bin/grep \
+            --candidate src/grep \
+            --work-dir /tmp/tc-ci \
+            --quick \
+            --threads 1,4,16
+          python3 benchmarks/kwset_diff.py \
+            --baseline /usr/bin/grep \
+            --candidate src/grep \
+            --cases 300 \
+            --threads 1,8
+
+  sanitizers:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: asan-ubsan
+            name: Linux x86-64 (ASan + UBSan)
+            cflags: "-g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer"
+            ldflags: "-fsanitize=address,undefined"
+          - variant: tsan
+            name: Linux x86-64 (TSan)
+            cflags: "-g -O1 -fsanitize=thread -fno-omit-frame-pointer"
+            ldflags: "-fsanitize=thread"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get gnulib submodule revision
+        id: gnulib-rev
+        run: |
+          echo "sha=$(git ls-tree HEAD gnulib | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache gnulib submodule
+        uses: actions/cache@v4
+        with:
+          path: |
+            gnulib
+            .git/modules/gnulib
+          key: gnulib-${{ steps.gnulib-rev.outputs.sha }}
+
+      - name: Initialize gnulib submodule
+        run: |
+          git config submodule.gnulib.url https://github.com/coreutils/gnulib.git
+          git submodule update --init --depth 1 gnulib || {
+            git config submodule.gnulib.url https://git.savannah.gnu.org/git/gnulib
+            git submodule update --init --depth 1 gnulib
+          }
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake autopoint build-essential gettext gperf \
+            libpcre2-dev locales-all pkg-config texinfo wget xz-utils
+
+      - name: Bootstrap
+        run: ./bootstrap --skip-po
+
+      - name: Configure (${{ matrix.variant }})
+        run: ./configure CFLAGS="${{ matrix.cflags }}" LDFLAGS="${{ matrix.ldflags }}"
+
+      - name: Build
+        run: make -j"$(nproc)"
+
+      - name: Run parallel test suite under sanitizer
+        env:
+          ASAN_OPTIONS: "detect_leaks=1:abort_on_error=1"
+          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+          TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
+        run: |
+          make check -C tests -j"$(nproc)" \
+            TESTS="parallel-tree-walk parallel-chunked-mmap parallel-stream-stdin parallel-kwset-ac parallel-pcre-must parallel-env-limits" || {
+            cat tests/test-suite.log
+            exit 1
+          }
+
+      - name: Run differential fuzzing under sanitizer
+        env:
+          ASAN_OPTIONS: "detect_leaks=1:abort_on_error=1"
+          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+          TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
+        run: |
+          python3 benchmarks/kwset_diff.py \
+            --baseline /usr/bin/grep \
+            --candidate src/grep \
+            --cases 200 \
+            --threads 1,8
+
+  macos:
+    name: macOS ARM64 (Apple Silicon)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get gnulib submodule revision
+        id: gnulib-rev
+        run: |
+          echo "sha=$(git ls-tree HEAD gnulib | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache gnulib submodule
+        uses: actions/cache@v4
+        with:
+          path: |
+            gnulib
+            .git/modules/gnulib
+          key: gnulib-${{ steps.gnulib-rev.outputs.sha }}
+
+      - name: Initialize gnulib submodule
+        run: |
+          git config submodule.gnulib.url https://github.com/coreutils/gnulib.git
+          git submodule update --init --depth 1 gnulib || {
+            git config submodule.gnulib.url https://git.savannah.gnu.org/git/gnulib
+            git submodule update --init --depth 1 gnulib
+          }
+
+      - name: Install Homebrew dependencies
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          brew install autoconf automake gettext gperf texinfo pkg-config wget xz pcre2
+          echo "$(brew --prefix texinfo)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
+
+      - name: Bootstrap
+        run: ./bootstrap --skip-po
+
+      - name: Configure
+        run: ./configure CFLAGS="-O3"
+
+      - name: Build
+        run: make -j"$(sysctl -n hw.ncpu)"
+
+      - name: Verify binary & version string
+        run: |
+          ./src/grep --version
+          ./src/grep --version | ./src/grep -F "Supercharged grep"
+          ./src/grep --version | ./src/grep -F "SWAR)"
+
+      - name: Run parallel test suite
+        run: |
+          make check -C tests -j"$(sysctl -n hw.ncpu)" \
+            TESTS="parallel-tree-walk parallel-chunked-mmap parallel-stream-stdin parallel-kwset-ac parallel-pcre-must parallel-env-limits" || {
+            cat tests/test-suite.log
+            exit 1
+          }
+
+      - name: Run multi-pattern differential conformance
+        run: |
+          python3 benchmarks/kwset_diff.py \
+            --baseline src/grep \
+            --candidate src/grep \
+            --cases 200 \
+            --threads 2,8

@@ -6,6 +6,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/dtwlin/grep/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/dtwlin/grep/actions/workflows/ci.yml/badge.svg"></a>
   <a href="COPYING"><img alt="License: GPLv3" src="https://img.shields.io/badge/license-GPLv3-blue.svg"></a>
   <img alt="Drop-in replacement" src="https://img.shields.io/badge/GNU%20grep-drop--in%20replacement-brightgreen.svg">
   <img alt="Output" src="https://img.shields.io/badge/output-byte--identical-success.svg">

@@ -328,7 +328,11 @@ def run(binary, args, env, threads, merge):
 
 
 def check_case(case, baseline, candidate, threads):
-    want = run(baseline, case.args, case.env, None, case.merge)
+    base_threads = (
+        1 if os.path.realpath(baseline) == os.path.realpath(candidate)
+        else None
+    )
+    want = run(baseline, case.args, case.env, base_threads, case.merge)
     failures = []
     for t in threads:
         got = run(candidate, case.args, case.env, t, case.merge)
