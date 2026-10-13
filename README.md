@@ -1,8 +1,12 @@
 <h1 align="center">⚡ Supercharged grep</h1>
 
 <p align="center">
+  <i>"Time is valuable — I don't want to wait one millisecond longer."</i>
+</p>
+
+<p align="center">
   <b>GNU grep, multi-threaded and SIMD-accelerated.</b><br>
-  Same flags. Same output, byte for byte. On average <b>18× faster</b> than GNU grep and <b>2–3× faster</b> than <a href="https://github.com/BurntSushi/ripgrep">ripgrep</a> on a 128-CPU server — still <b>9–11× faster</b> than GNU grep on 8 cores.
+  Same flags. Same output, byte for byte. On average <b>18× faster</b> than GNU grep and <b>2–3× faster</b> than <a href="https://github.com/BurntSushi/ripgrep">ripgrep</a>.
 </p>
 
 <p align="center">
@@ -103,7 +107,7 @@ this skill and search as you normally would.
 
 ## 📊 Benchmarks
 
-Setup: the Linux kernel source tree (96,034 files, 1.64 GB) on a 128-CPU AMD EPYC server, warm page cache unless noted, `LC_ALL=en_US.UTF-8`, median of 3 runs after a warm-up. GNU grep 3.12 is single-threaded; Supercharged grep runs at its default of 32 threads; [ripgrep](https://github.com/BurntSushi/ripgrep) 15.1 is shown at its default of 12 threads and with `-j 32`. Tree searches skip `.git` (`grep -r --exclude-dir=.git`, `rg -uu -g '!.git'`), so every tool searches the same files.
+Setup: the Linux kernel source tree (96,034 files, 1.64 GB) on an AMD EPYC server, warm page cache unless noted, `LC_ALL=en_US.UTF-8`, median of 3 runs after a warm-up. GNU grep 3.12 is single-threaded; Supercharged grep runs at its default of 32 threads; [ripgrep](https://github.com/BurntSushi/ripgrep) 15.1 is shown at its default of 12 threads and with `-j 32`. Tree searches skip `.git` (`grep -r --exclude-dir=.git`, `rg -uu -g '!.git'`), so every tool searches the same files.
 
 | Workload | GNU grep | ripgrep | ripgrep<br>`-j 32` | ⚡ Supercharged grep | vs GNU grep | vs ripgrep¹ |
 | :-- | --: | --: | --: | --: | --: | --: |
