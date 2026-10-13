@@ -66,4 +66,18 @@ for t in 2 4 8 16; do
   compare exp_o "out_o_$t" || fail=1
 done
 
+# 7. Bracketed parens inside optional PCRE groups must not fool must-literal parser
+printf 'bar\n' > in_bracket || framework_failure_
+grep -P '([)]foo)?bar' in_bracket > out_b1 || fail=1
+compare in_bracket out_b1 || fail=1
+grep -P '([(]foo)?bar' in_bracket > out_b2 || fail=1
+compare in_bracket out_b2 || fail=1
+
+# 8. Backreference pre-filter with POSIX character classes and anchors
+printf 'abab\n' > in_bref || framework_failure_
+grep -E '([[:alpha:]][[:alpha:]])\1' in_bref > out_br1 || fail=1
+compare in_bref out_br1 || fail=1
+grep -E '(^ab)\1' in_bref > out_br2 || fail=1
+compare in_bref out_br2 || fail=1
+
 Exit $fail

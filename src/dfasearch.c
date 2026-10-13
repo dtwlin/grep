@@ -660,6 +660,38 @@ possible_backrefs_in_pattern (char const *keys, idx_t len, bool bs_safe)
   return false;
 }
 
+static char const * _GL_ATTRIBUTE_PURE
+skip_bracket_expr (char const *s, char const *lim)
+{
+  /* Skip '['.  */
+  s++;
+  if (s < lim && *s == '^')
+    s++;
+  if (s < lim && *s == ']')
+    s++;
+  while (s < lim && *s != ']')
+    {
+      if (s + 1 < lim && *s == '['
+          && (s[1] == ':' || s[1] == '.' || s[1] == '='))
+        {
+          char ctype = s[1];
+          s += 2;
+          while (s + 1 < lim && !(s[0] == ctype && s[1] == ']'))
+            s++;
+          if (s + 1 < lim)
+            {
+              s += 2;
+              continue;
+            }
+          return lim;
+        }
+      s++;
+    }
+  if (s < lim)
+    s++;
+  return s;
+}
+
 static void
 analyze_backref_filter (char const *p, idx_t len, reg_syntax_t syntax_bits,
                         struct backref_filter *bf)
@@ -667,6 +699,9 @@ analyze_backref_filter (char const *p, idx_t len, reg_syntax_t syntax_bits,
   bf->enabled = false;
   bf->min_len = 0;
   bf->sep_len = 0;
+
+  if (localeinfo.multibyte && !localeinfo.using_utf8)
+    return;
 
   bool no_bk_parens = (syntax_bits & RE_NO_BK_PARENS) != 0;
   char const *lim = p + len;
@@ -677,6 +712,11 @@ analyze_backref_filter (char const *p, idx_t len, reg_syntax_t syntax_bits,
 
   for (char const *s = p; s < lim; s++)
     {
+      if (*s == '[')
+        {
+          s = skip_bracket_expr (s, lim) - 1;
+          continue;
+        }
       if (*s == '\\')
         {
           s++;
@@ -726,6 +766,11 @@ analyze_backref_filter (char const *p, idx_t len, reg_syntax_t syntax_bits,
 
   for (char const *s = g1_start; s < g1_end; s++)
     {
+      if (*s == '[')
+        {
+          s = skip_bracket_expr (s, g1_end) - 1;
+          continue;
+        }
       if (*s == '\\')
         {
           s++;
@@ -746,29 +791,34 @@ analyze_backref_filter (char const *p, idx_t len, reg_syntax_t syntax_bits,
       idx_t atom_base = 1;
       if (*s == '[')
         {
-          s++;
-          if (s < g1_end && *s == '^')
-            s++;
-          if (s < g1_end && *s == ']')
-            s++;
-          while (s < g1_end && *s != ']')
-            s++;
-          if (s < g1_end)
-            s++;
+          s = skip_bracket_expr (s, g1_end);
         }
       else if (*s == '\\')
         {
           s++;
           if (s < g1_end)
             {
-              if (*s == 'b' || *s == 'B')
+              if (*s == 'b' || *s == 'B' || *s == '<' || *s == '>'
+                  || *s == '\'' || *s == '`')
                 atom_base = 0;
               s++;
             }
         }
+      else if (*s == '^' || *s == '$')
+        {
+          atom_base = 0;
+          s++;
+        }
       else
         {
+          char const *atom_start = s;
           s++;
+          if (localeinfo.using_utf8 && (unsigned char) atom_start[0] >= 0x80)
+            {
+              while (s < g1_end && ((unsigned char) *s & 0xC0) == 0x80)
+                s++;
+            }
+          atom_base = (*atom_start == '.') ? 1 : (s - atom_start);
         }
 
       idx_t qmin = 1;
@@ -1197,7 +1247,7 @@ GEAcompile (char *pattern, idx_t size, reg_syntax_t syntax_bits,
       dfacomp (nullptr, 0, dc->dfa, 1);
       dc->dfa_compiled = true;
 
-      if (dc->kwset && !dfa_kwset_cache)
+      if (!dfa_kwset_cache)
         {
           sk = xmalloc (sizeof *sk);
           sk->kwset = dc->kwset;
@@ -1586,7 +1636,8 @@ EGfree (void *vdc)
       struct shared_dfa_kwset *sk = dc->shared_kwset;
       if (atomic_fetch_sub (&sk->refs, 1) == 1)
         {
-          kwsfree (sk->kwset);
+          if (sk->kwset)
+            kwsfree (sk->kwset);
           free (sk->pattern);
           free (sk);
         }

@@ -158,6 +158,38 @@ is_lit_char (char c)
           c == '=' || c == '@' || c == '%' || c == '#' || c == '~');
 }
 
+static idx_t _GL_ATTRIBUTE_PURE
+skip_pcre_char_class (char const *pat, idx_t p, idx_t size)
+{
+  p++;
+  if (p < size && pat[p] == '^')
+    p++;
+  if (p < size && pat[p] == ']')
+    p++;
+  while (p < size && pat[p] != ']')
+    {
+      if (pat[p] == '\\' && p + 1 < size)
+        p += 2;
+      else if (p + 1 < size && pat[p] == '['
+               && (pat[p + 1] == ':' || pat[p + 1] == '.' || pat[p + 1] == '='))
+        {
+          char ctype = pat[p + 1];
+          p += 2;
+          while (p + 1 < size && !(pat[p] == ctype && pat[p + 1] == ']'))
+            p++;
+          if (p + 1 < size)
+            p += 2;
+          else
+            return size;
+        }
+      else
+        p++;
+    }
+  if (p < size && pat[p] == ']')
+    p++;
+  return p;
+}
+
 /* Extract the longest contiguous literal ASCII substring (>= 2 chars)
    that is unconditionally required by the PCRE pattern. */
 static char *
@@ -194,8 +226,20 @@ find_must_literal (char const *pat, idx_t size, idx_t *out_len)
             {
               if (pat[p] == '\\' && p + 1 < size)
                 p += 2;
+              else if (pat[p] == '[')
+                p = skip_pcre_char_class (pat, p, size);
               else if (pat[p] == '(')
                 {
+                  if (p + 1 < size && pat[p + 1] == '?')
+                    {
+                      bool ok = false;
+                      if (p + 2 < size && (pat[p + 2] == ':' || pat[p + 2] == '='))
+                        ok = true;
+                      else if (p + 3 < size && pat[p + 2] == '<' && pat[p + 3] == '=')
+                        ok = true;
+                      if (!ok)
+                        return nullptr;
+                    }
                   depth++;
                   p++;
                 }
@@ -226,18 +270,7 @@ find_must_literal (char const *pat, idx_t size, idx_t *out_len)
 
       if (pat[p] == '[')
         {
-          p++;
-          if (p < size && pat[p] == ']')
-            p++;
-          while (p < size && pat[p] != ']')
-            {
-              if (pat[p] == '\\' && p + 1 < size)
-                p += 2;
-              else
-                p++;
-            }
-          if (p < size && pat[p] == ']')
-            p++;
+          p = skip_pcre_char_class (pat, p, size);
           while (p < size)
             {
               if (pat[p] == '*' || pat[p] == '?' || pat[p] == '+')

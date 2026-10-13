@@ -1415,12 +1415,34 @@ acexec_trans (kwset_t kwset, char const *text, idx_t len,
                   else
                     {
                       uint32_t mask = ~(uint32_t) _mm256_movemask_epi8 (_mm256_cmpeq_epi8 (match, _mm256_setzero_si256 ()));
-                      tp += __builtin_ctz (mask);
-                      c = tr (trans, *tp++);
-                      trie = kwset->next[c];
-                      if (!trie)
-                        continue;
-                      goto have_first_trie;
+                      char const *base_tp = tp;
+                      while (mask)
+                        {
+                          int bit_idx = __builtin_ctz (mask);
+                          char const *cand = base_tp + bit_idx;
+                          c = tr (trans, cand[0]);
+                          trie = kwset->next[c];
+                          if (trie)
+                            {
+                              if (trie->accepting)
+                                {
+                                  tp = cand + 1;
+                                  goto match;
+                                }
+                              unsigned char c1 = tr (trans, cand[1]);
+                              struct tree const *tree = trie->links;
+                              while (tree && c1 != tree->label)
+                                tree = c1 < tree->label ? tree->llink : tree->rlink;
+                              if (tree)
+                                {
+                                  trie = tree->trie;
+                                  tp = cand + 2;
+                                  goto have_first_trie;
+                                }
+                            }
+                          mask &= mask - 1;
+                        }
+                      tp = base_tp + 32;
                     }
                 }
             }

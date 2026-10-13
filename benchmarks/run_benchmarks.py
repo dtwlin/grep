@@ -264,6 +264,16 @@ def run_edge_case_conformance():
     checks.append(("RLIMIT_NOFILE 32 tree search default", ["-r", "-l", "FATAL", f"{TREE_DIR}/dir_000"], None, limit_nofile_32))
     checks.append(("RLIMIT_NOFILE 32 tree search t=16", ["-r", "-l", "FATAL", f"{TREE_DIR}/dir_000"], {"GREP_THREADS": "16"}, limit_nofile_32))
 
+    # 17. Regex pre-filter parser edge cases (POSIX classes, anchors, UTF-8 quantifiers, PCRE bracket parens)
+    regress_prefilter = os.path.join(BENCH_DIR, "regress_prefilter.txt")
+    with open(regress_prefilter, "wb") as f:
+        f.write(b"abab\nbar\n[(]foo\n")
+    checks.append(("Backref POSIX class ([[:alpha:]])\\1", ["-E", r"([[:alpha:]][[:alpha:]])\1", regress_prefilter], None, None))
+    checks.append(("Backref anchor (^ab)\\1", ["-E", r"(^ab)\1", regress_prefilter], None, None))
+    checks.append(("Backref UTF-8 quantifier", ["-E", "(é?ab)\\1", regress_prefilter], {"LC_ALL": "en_US.UTF-8"}, None))
+    checks.append(("PCRE bracketed paren in opt group", ["-P", r"([)]foo)?bar", regress_prefilter], None, None))
+    checks.append(("PCRE bracketed open paren", ["-P", r"([(]foo)?bar", regress_prefilter], None, None))
+
     passed = 0
     total = len(checks)
     for name, args, env_vars, preexec in checks:

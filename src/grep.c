@@ -1048,76 +1048,62 @@ initialize_unibyte_mask (void)
   unibyte_mask = uword_max / UCHAR_MAX * mask;
 }
 
-/* Skip the easy bytes in a buffer that is guaranteed to have a sentinel
-   that is not easy, and return a pointer to the first non-easy byte.
-   The easy bytes all have UNIBYTE_MASK off.  */
+/* Skip the easy bytes in [B, LIM), and return a pointer to the first
+   non-easy byte or LIM.  The easy bytes all have UNIBYTE_MASK off.  */
 static char const * _GL_ATTRIBUTE_PURE
-skip_easy_bytes (char const *buf)
+skip_easy_bytes_lim (char const *b, char const *lim)
 {
-  /* Search a byte at a time until the pointer is aligned, then a
-     uword at a time until a match is found, then a byte at a time to
-     identify the exact byte.  The uword search may go slightly past
-     the buffer end, but that's benign.  */
-  char const *p;
-  uword const *s;
-  for (p = buf; (uintptr_t) p % uword_size != 0; p++)
-    if (to_uchar (*p) & unibyte_mask)
-      return p;
-  for (s = CAST_ALIGNED (uword const *, p); ! (*s & unibyte_mask); s++)
-    continue;
-  for (p = (char const *) s; ! (to_uchar (*p) & unibyte_mask); p++)
-    continue;
-  return p;
+  /* Search a byte at a time until the pointer is aligned.  */
+  for (; (uintptr_t) b % uword_size != 0 && b < lim; b++)
+    if (to_uchar (*b) & unibyte_mask)
+      return b;
+
+  /* Search a word at a time while full words remain in [b, lim).  */
+  for (; lim - b >= uword_size; b += uword_size)
+    {
+      uword const *s = CAST_ALIGNED (uword const *, b);
+      if (*s & unibyte_mask)
+        break;
+    }
+
+  /* Finish byte by byte up to lim.  */
+  for (; b < lim; b++)
+    if (to_uchar (*b) & unibyte_mask)
+      return b;
+
+  return lim;
 }
 
-/* Return true if BUF, of size SIZE, has an encoding error.
-   BUF must be followed by at least uword_size bytes,
-   the first of which may be modified.  */
+/* Return true if BUF, of size SIZE, has an encoding error.  */
 static bool
 buf_has_encoding_errors (char *buf, idx_t size)
 {
   if (! unibyte_mask)
     return false;
 
-  /* Fast path: if the line contains only ASCII / easy bytes, it cannot have encoding errors.
-     Scan without modifying buf to avoid CoW page dirtying. */
-  char const *p = buf;
   char const *lim = buf + size;
-  while (p < lim && ! (to_uchar (*p) & unibyte_mask))
-    p++;
+  char const *p = skip_easy_bytes_lim (buf, lim);
   if (p == lim)
     return false;
 
   mbstate_t mbs; mbszero (&mbs);
   ptrdiff_t clen;
 
-  char saved = buf[size];
-  if (saved != -1)
-    buf[size] = -1;
-  for (p = buf; (p = skip_easy_bytes (p)) < buf + size; p += clen)
+  for (; p < lim; p = skip_easy_bytes_lim (p + clen, lim))
     {
-      clen = imbrlen (p, buf + size - p, &mbs);
+      clen = imbrlen (p, lim - p, &mbs);
       if (clen < 0)
-        {
-          if (saved != -1)
-            buf[size] = saved;
-          return true;
-        }
+        return true;
     }
 
-  if (saved != -1)
-    buf[size] = saved;
   return false;
 }
 
 
-/* Return true if BUF, of size SIZE, has a null byte.
-   BUF must be followed by at least one byte,
-   which may be arbitrarily written to or read from.  */
+/* Return true if BUF, of size SIZE, has a null byte.  */
 static bool
-buf_has_nulls (char *buf, idx_t size)
+buf_has_nulls (char const *buf, idx_t size)
 {
-  buf[size] = 0;
   return memchr (buf, '\0', size) != nullptr;
 }
 
@@ -1430,10 +1416,12 @@ fillbuf (idx_t save, struct stat *st)
   char *readbuf;
 
   /* After BUFLIM, we need room for a good-sized read plus a
-     trailing uword.  */
+     trailing uword.  Wrap within a hot L2-sized window unless a
+     single long line forces a larger save.  */
   idx_t min_after_buflim = good_readsize + uword_size;
+  idx_t hot_limit = 2 * good_readsize + pagesize + uword_size;
 
-  if (min_after_buflim <= buffer + bufalloc - buflim)
+  if (min_after_buflim <= buffer + MIN (bufalloc, hot_limit) - buflim)
     readbuf = buflim;
   else
     {
@@ -2192,11 +2180,16 @@ grep (int fd, struct stat *st, bool *ineof)
           break;
         }
 
-      bool skip_zap = (nlines_first_null == 0 && out_quiet && done_on_match
-                       && !out_invert && list_files == LISTFILES_NONE
-                       && raw_matcher_index == F_MATCHER_INDEX
-                       && !match_lines && eol != '\0'
-                       && (!localeinfo.multibyte || localeinfo.using_utf8));
+      bool can_fast_mmap = (out_quiet && done_on_match && !out_invert
+                            && !count_matches
+                            && (nlines_first_null == 0
+                                || (nlines_first_null < 0
+                                    && binary_files != WITHOUT_MATCH_BINARY_FILES))
+                            && raw_matcher_index == F_MATCHER_INDEX
+                            && !match_lines && !match_words && eol != '\0'
+                            && (!localeinfo.multibyte || localeinfo.using_utf8));
+      bool skip_zap = (nlines_first_null == 0 && can_fast_mmap
+                       && list_files == LISTFILES_NONE);
       if (!skip_zap)
         zap_nuls (beg, buflim, nul_zapper);
 
@@ -2218,7 +2211,7 @@ grep (int fd, struct stat *st, bool *ineof)
             goto finish_grep;
         }
 
-      if (skip_zap && firsttime && !eof_known)
+      if (can_fast_mmap && firsttime && !eof_known)
         {
           if (st->st_size < 0)
             fstat (fd, st);
@@ -2226,6 +2219,7 @@ grep (int fd, struct stat *st, bool *ineof)
             {
               if (walk_cur_task)
                 walk_split_rest ();
+              size_t scan_start = (size_t) bufoffset - (size_t) residue;
               char const *map = mmap (nullptr, st->st_size, PROT_READ, MAP_PRIVATE, fd, 0);
               if (map != MAP_FAILED)
                 {
@@ -2236,14 +2230,14 @@ grep (int fd, struct stat *st, bool *ineof)
 #endif
                   if (walk_cur_task && st->st_size >= 16 * 1024 * 1024 && pool_target > 1)
                     {
-                      if (walk_bin_scan (map, st->st_size, bufoffset))
+                      if (walk_bin_scan (map, st->st_size, scan_start))
                         nlines = 1;
                     }
-                  else
+                  else if (scan_start < (size_t) st->st_size)
                     {
                       idx_t msize = 0;
-                      ptrdiff_t off = execute (compiled_pattern, map + bufoffset,
-                                               st->st_size - bufoffset, &msize, nullptr);
+                      ptrdiff_t off = execute (compiled_pattern, map + scan_start,
+                                               st->st_size - scan_start, &msize, nullptr);
                       if (off >= 0)
                         nlines = 1;
                     }
@@ -3790,9 +3784,15 @@ stream_commit_binary (struct rob_slot *slot)
   slot->stream_chunk_data = nullptr;
 }
 
+static bool rob_committing = false;
+
 static void
 rob_try_commit_locked (void)
 {
+  if (rob_committing)
+    return;
+  rob_committing = true;
+
   bool saved_buffering = buffering_enabled;
   buffering_enabled = false;
   bool committed_any = false;
@@ -3850,12 +3850,18 @@ rob_try_commit_locked (void)
               done_on_match = initial_done_on_match;
               encoding_error_output = false;
 
-              intmax_t mcnt = grepbuf (slot->stream_first_lbeg, buflim);
+              char *first_lbeg = slot->stream_first_lbeg;
+              char *slice_lim = buflim;
+              pthread_mutex_unlock (&pool_mutex);
+              intmax_t mcnt = grepbuf (first_lbeg, slice_lim);
+              bool had_enc_err = (binary_files == BINARY_BINARY_FILES
+                                  && !out_quiet && encoding_error_output);
+              pthread_mutex_lock (&pool_mutex);
+              slot = &rob[commit_seq % ROB_CAP];
               slot->status = (mcnt == 0);
               if (mcnt > 0)
                 slot->had_prtext = true;
-              slot->enc_error |= (binary_files == BINARY_BINARY_FILES
-                                  && !out_quiet && encoding_error_output);
+              slot->enc_error |= had_enc_err;
 
               filename = saved_filename;
               bufbeg = saved_bufbeg;
@@ -4011,10 +4017,11 @@ rob_try_commit_locked (void)
         }
     }
 
+  rob_committing = false;
   if (committed_any)
     {
       if (rob_space_waiters > 0)
-        pthread_cond_signal (&rob_space_cv);
+        pthread_cond_broadcast (&rob_space_cv);
       if (rob_done_waiters > 0)
         pthread_cond_broadcast (&rob_done_cv);
     }
@@ -4828,7 +4835,16 @@ producer_enqueue_errseen (void)
   pthread_mutex_unlock (&pool_mutex);
 }
 
-static _Atomic uint64_t retained_mmap_bytes = 0;
+struct retained_mmap_entry
+{
+  void *addr;
+  size_t size;
+};
+
+enum { MAX_RETAINED_MMAPS = 8 };
+static struct retained_mmap_entry retained_mmaps[MAX_RETAINED_MMAPS];
+static size_t retained_mmaps_count = 0;
+static uint64_t retained_mmap_bytes = 0;
 
 static void
 cleanup_chunk_file_state (void *arg)
@@ -4837,22 +4853,31 @@ cleanup_chunk_file_state (void *arg)
   if (!state)
     return;
 
-  bool skip_munmap = false;
-  if (state->mmap_size >= (16 << 20))
-    {
-      uint64_t prev = atomic_fetch_add_explicit (&retained_mmap_bytes,
-                                                 state->base_size ? state->base_size : state->mmap_size,
-                                                 memory_order_relaxed);
-      if (prev + (state->base_size ? state->base_size : state->mmap_size) <= (4ULL << 30))
-        skip_munmap = true;
-    }
+  void *map_addr = (state->base_addr && state->base_addr != MAP_FAILED)
+                   ? state->base_addr : state->mmap_data;
+  size_t map_size = (state->base_addr && state->base_addr != MAP_FAILED)
+                    ? state->base_size : state->mmap_size;
 
-  if (!skip_munmap)
+  if (map_addr && map_addr != MAP_FAILED)
     {
-      if (state->base_addr && state->base_addr != MAP_FAILED)
-        munmap (state->base_addr, state->base_size);
-      else if (state->mmap_data && state->mmap_data != MAP_FAILED)
-        munmap (state->mmap_data, state->mmap_size);
+      if (state->mmap_size >= (16 << 20) && map_size <= (2ULL << 30))
+        {
+          while (retained_mmaps_count > 0
+                 && (retained_mmaps_count >= MAX_RETAINED_MMAPS
+                     || retained_mmap_bytes + map_size > (2ULL << 30)))
+            {
+              retained_mmaps_count--;
+              munmap (retained_mmaps[retained_mmaps_count].addr,
+                      retained_mmaps[retained_mmaps_count].size);
+              retained_mmap_bytes -= retained_mmaps[retained_mmaps_count].size;
+            }
+          retained_mmaps[retained_mmaps_count].addr = map_addr;
+          retained_mmaps[retained_mmaps_count].size = map_size;
+          retained_mmaps_count++;
+          retained_mmap_bytes += map_size;
+        }
+      else
+        munmap (map_addr, map_size);
     }
 
   if (state->close_fd && state->file_desc >= 0)
@@ -5261,7 +5286,11 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
     }
 
   size_t file_size = (size_t) st.st_size;
-  size_t total_alloc = file_size + 2 * pagesize;
+  size_t ps = (size_t) pagesize;
+  size_t aligned_file_size = (file_size % ps == 0
+                              ? file_size
+                              : file_size + (ps - file_size % ps));
+  size_t total_alloc = aligned_file_size + 2 * ps;
   char *base = mmap (NULL, total_alloc, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (base == MAP_FAILED)
@@ -5292,7 +5321,8 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
     }
 
   data[-1] = eolbyte;
-  data[file_size] = eolbyte;
+  if (data[file_size] != eolbyte)
+    data[file_size] = eolbyte;
 
   if (eolbyte && binary_files != TEXT_BINARY_FILES
       && (memchr (data, '\0', MIN (file_size, 64 * 1024)) != nullptr
@@ -5311,7 +5341,8 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
 
   size_t effective_size = file_size
     + (file_size > 0 && data[file_size - 1] != eolbyte);
-  data[effective_size] = eolbyte;
+  if (data[effective_size] != eolbyte)
+    data[effective_size] = eolbyte;
 
   size_t num_chunks = pool_nthreads * 2;
   if (num_chunks < 2)
@@ -5329,8 +5360,11 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
   for (size_t k = 1; k < num_chunks; ++k)
     {
       size_t target = k * (effective_size / num_chunks);
-      if (target < bounds[k - 1])
-        target = bounds[k - 1];
+      if (target <= bounds[k - 1])
+        {
+          bounds[k] = bounds[k - 1];
+          continue;
+        }
       if (target < effective_size)
         {
           char *nl = memchr (data + target, eolbyte, effective_size - target);
@@ -7312,12 +7346,13 @@ static void
 walk_help_bin_job (struct walk_bin_job *job)
 {
   size_t slice = job->slice_size;
+  size_t overlap = MAX (65536, (size_t) raw_keycc + 1);
   while (!atomic_load_explicit (&job->found, memory_order_relaxed))
     {
       size_t off = atomic_fetch_add (&job->next_offset, slice);
       if (off >= job->size)
         break;
-      size_t len = MIN (slice + 65536, job->size - off);
+      size_t len = MIN (slice + overlap, job->size - off);
       idx_t msize = 0;
       ptrdiff_t res = execute (compiled_pattern, job->data + off, len, &msize, nullptr);
       if (res >= 0)
@@ -7349,10 +7384,9 @@ walk_bin_scan (char const *map, size_t size, size_t scan_offset)
 
   pthread_mutex_lock (&walk.mu);
   walk.bin_job = nullptr;
-  pthread_mutex_unlock (&walk.mu);
-
   while (atomic_load (&job.active_workers) > 1)
-    sched_yield ();
+    pthread_cond_wait (&walk.cv, &walk.mu);
+  pthread_mutex_unlock (&walk.mu);
 
   return atomic_load (&job.found);
 }
@@ -7379,8 +7413,9 @@ walk_participate (unsigned int gen)
               atomic_fetch_add (&job->active_workers, 1);
               pthread_mutex_unlock (&walk.mu);
               walk_help_bin_job (job);
-              atomic_fetch_sub (&job->active_workers, 1);
               pthread_mutex_lock (&walk.mu);
+              if (atomic_fetch_sub (&job->active_workers, 1) == 2)
+                pthread_cond_broadcast (&walk.cv);
               continue;
             }
           if (walk.done)
