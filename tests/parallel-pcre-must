@@ -1,7 +1,7 @@
 #! /bin/sh
 # Test PCRE2 must-literal pre-filter and parallel search.
 #
-# Copyright (C) 2026 Free Software Foundation, Inc.
+# Copyright (C) 2026 David Lin <dtwlin@gmail.com>
 #
 # Copying and distribution of this file, with or without modification,
 # are permitted in any medium without royalty provided the copyright

@@ -1,5 +1,6 @@
 /* kwsearch.c - searching subroutines using kwset for grep.
    Copyright 1992, 1998, 2000, 2007, 2009-2026 Free Software Foundation, Inc.
+   Copyright (C) 2026 David Lin <dtwlin@gmail.com>
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by

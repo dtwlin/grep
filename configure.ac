@@ -2,6 +2,7 @@ dnl
 dnl autoconf input file for GNU grep
 dnl
 dnl Copyright (C) 1997-2006, 2009-2026 Free Software Foundation, Inc.
+dnl Copyright (C) 2026 David Lin <dtwlin@gmail.com>
 dnl
 dnl This file is part of GNU grep.
 dnl

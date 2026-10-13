@@ -1,5 +1,6 @@
 ## Process this file with automake to create Makefile.in
 # Copyright 1997-1998, 2005-2026 Free Software Foundation, Inc.
+# Copyright (C) 2026 David Lin <dtwlin@gmail.com>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
