@@ -38,7 +38,7 @@ AI coding agents lean on `grep` all the time: every "where is this defined?" or 
 
 Linux kernel source tree (96,034 files, 1.64 GB) on a 128-CPU AMD EPYC server; warm page cache unless noted, `LC_ALL=en_US.UTF-8`, median of 3 runs after a warm-up. GNU grep 3.12 is single-threaded and Supercharged grep runs at its default (32 threads); [ripgrep](https://github.com/BurntSushi/ripgrep) 15.1 is shown at its default (12 threads) and with `-j 32`. Tree searches skip `.git` (`grep -r --exclude-dir=.git`, `rg -uu -g '!.git'`), so every tool searches the same files.
 
-| Workload | GNU grep | ripgrep | ripgrep<br>`-j 32` | ⚡ Supercharged grep | vs GNU | vs ripgrep¹ |
+| Workload | GNU grep | ripgrep | ripgrep<br>`-j 32` | ⚡ Supercharged grep | vs GNU grep | vs ripgrep¹ |
 | :-- | --: | --: | --: | --: | --: | --: |
 | Dense literal: `grep -rn 'static int'` | 4.53 s | 509 ms | 548 ms | **284 ms** | 16× | 1.8× |
 | Case-insensitive: `grep -ri copyright` | 5.10 s | 779 ms | 1.01 s | **208 ms** | 25× | 3.8× |
