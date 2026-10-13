@@ -1420,8 +1420,11 @@ fillbuf (idx_t save, struct stat *st)
      single long line forces a larger save.  */
   idx_t min_after_buflim = good_readsize + uword_size;
   idx_t hot_limit = 2 * good_readsize + pagesize + uword_size;
+  idx_t limit = (ALIGN_TO (buffer + 1 + save, pagesize) < buflim
+                 ? MIN (bufalloc, hot_limit)
+                 : bufalloc);
 
-  if (min_after_buflim <= buffer + MIN (bufalloc, hot_limit) - buflim)
+  if (min_after_buflim <= buffer + limit - buflim)
     readbuf = buflim;
   else
     {
