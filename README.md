@@ -243,3 +243,8 @@ Changing `GREP_THREADS` only affects speed — the output and line order are alw
 Supercharged grep is a modified version of [GNU grep](https://www.gnu.org/software/grep/), forked from upstream commit [`e187ca5`](https://git.savannah.gnu.org/cgit/grep.git/commit/?id=e187ca53198c7aafb28da64da86d1bd59244c3cc) (shortly after 3.12) and changed in 2026; the git history records every change. It keeps GNU grep's license, [GPLv3 or later](COPYING), and upstream's documentation (`README`, `NEWS`, `doc/`) still applies because the user-facing behaviour is unchanged.
 
 Found a case where the output differs from GNU grep? Re-run the command with `GREP_THREADS=1`, then open a [GitHub issue](https://github.com/dtwlin/grep/issues) — or email <dtwlin@gmail.com>, the address `grep --help` prints — with the command, the output of `grep --version`, and the input if you can share it. Please do not report problems with this fork to the GNU grep maintainers. Benchmarks compare against [ripgrep](https://github.com/BurntSushi/ripgrep) 15.1.0, an excellent tool that inspired several techniques used here.
+
+## 🤝 Acknowledgement
+
+Supercharged grep was created by Argon using [Antigravity](https://antigravity.google/).
+
