@@ -1,0 +1,38 @@
+#! /bin/sh
+# 5-minute continuous multithreaded stress test across diverse randomized inputs.
+#
+# Copyright (C) 2026 David Lin <dtwlin@gmail.com>
+#
+# Copying and distribution of this file, with or without modification,
+# are permitted in any medium without royalty provided the copyright
+# notice and this notice are preserved.
+
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+
+fail=0
+
+# Default to 300 seconds (5 minutes) when requested via RUN_EXPENSIVE_TESTS=yes,
+# explicit STRESS_DURATION, or when invoked directly/interactively.
+# For regular non-expensive testsuite runs, run a 5-second smoke stress pass.
+if test "$RUN_EXPENSIVE_TESTS" = yes || test -n "$STRESS_DURATION"; then
+  duration=${STRESS_DURATION:-300}
+elif test -t 0 && test -t 1; then
+  duration=300
+else
+  duration=${STRESS_DURATION:-5}
+fi
+
+cand_bin=$(command -v grep)
+base_bin="$srcdir/../benchmarks/grep-baseline"
+if test ! -x "$base_bin"; then
+  base_bin="$cand_bin"
+fi
+stress_script="$srcdir/../benchmarks/stress_test.py"
+
+# Run the Python stress harness
+python3 "$stress_script" \
+  --baseline "$base_bin" \
+  --candidate "$cand_bin" \
+  --duration "$duration" || fail=1
+
+Exit $fail

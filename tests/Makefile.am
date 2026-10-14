@@ -153,6 +153,7 @@ TESTS =						\
   parallel-pcre-must				\
   parallel-stage1-optim				\
   parallel-stream-stdin				\
+  parallel-stress-test				\
   parallel-tree-walk				\
   pcre						\
   pcre-abort					\
