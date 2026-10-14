@@ -145,6 +145,7 @@ TESTS =						\
   null-byte					\
   options					\
   parallel-chunked-mmap				\
+  parallel-coverage-edge-cases			\
   parallel-env-limits				\
   parallel-kwset-ac				\
   parallel-pcre-must				\

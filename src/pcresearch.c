@@ -160,6 +160,68 @@ is_lit_char (char c)
 }
 
 static idx_t _GL_ATTRIBUTE_PURE
+skip_pcre_escape (char const *pat, idx_t p, idx_t size)
+{
+  p++;
+  if (p >= size)
+    return p;
+  char esc = pat[p++];
+  if (esc == 'x')
+    {
+      if (p < size && pat[p] == '{')
+        {
+          p++;
+          while (p < size && pat[p] != '}')
+            p++;
+          if (p < size && pat[p] == '}')
+            p++;
+        }
+      else
+        {
+          for (int i = 0; i < 2 && p < size && isxdigit ((unsigned char) pat[p]); i++)
+            p++;
+        }
+    }
+  else if (esc == 'o' && p < size && pat[p] == '{')
+    {
+      p++;
+      while (p < size && pat[p] != '}')
+        p++;
+      if (p < size && pat[p] == '}')
+        p++;
+    }
+  else if (esc == '0' || (esc >= '1' && esc <= '7'))
+    {
+      for (int i = 0; i < 2 && p < size && pat[p] >= '0' && pat[p] <= '7'; i++)
+        p++;
+    }
+  else if ((esc == 'p' || esc == 'P' || esc == 'N') && p < size && pat[p] == '{')
+    {
+      p++;
+      while (p < size && pat[p] != '}')
+        p++;
+      if (p < size && pat[p] == '}')
+        p++;
+    }
+  else if ((esc == 'g' || esc == 'k') && p < size)
+    {
+      char closer = 0;
+      if (pat[p] == '{') closer = '}';
+      else if (pat[p] == '<') closer = '>';
+      else if (pat[p] == '\'') closer = '\'';
+      if (closer)
+        {
+          p++;
+          while (p < size && pat[p] != closer)
+            p++;
+          if (p < size && pat[p] == closer)
+            p++;
+        }
+    }
+  return p;
+}
+
+static idx_t _GL_ATTRIBUTE_PURE
 skip_pcre_char_class (char const *pat, idx_t p, idx_t size)
 {
   p++;
@@ -169,8 +231,8 @@ skip_pcre_char_class (char const *pat, idx_t p, idx_t size)
     p++;
   while (p < size && pat[p] != ']')
     {
-      if (pat[p] == '\\' && p + 1 < size)
-        p += 2;
+      if (pat[p] == '\\')
+        p = skip_pcre_escape (pat, p, size);
       else if (p + 1 < size && pat[p] == '['
                && (pat[p + 1] == ':' || pat[p + 1] == '.' || pat[p + 1] == '='))
         {
@@ -225,8 +287,8 @@ find_must_literal (char const *pat, idx_t size, idx_t *out_len)
           p++;
           while (p < size && depth > 0)
             {
-              if (pat[p] == '\\' && p + 1 < size)
-                p += 2;
+              if (pat[p] == '\\')
+                p = skip_pcre_escape (pat, p, size);
               else if (pat[p] == '[')
                 p = skip_pcre_char_class (pat, p, size);
               else if (pat[p] == '(')
@@ -291,7 +353,7 @@ find_must_literal (char const *pat, idx_t size, idx_t *out_len)
 
       if (pat[p] == '\\')
         {
-          p += (p + 1 < size) ? 2 : 1;
+          p = skip_pcre_escape (pat, p, size);
           continue;
         }
 

@@ -1,0 +1,269 @@
+#! /bin/sh
+# Test edge-case coverage across PCRE, DFA/BRE alternations, CLI flags and errors.
+#
+# Copyright (C) 2026 David Lin <dtwlin@gmail.com>
+#
+# Copying and distribution of this file, with or without modification,
+# are permitted in any medium without royalty provided the copyright
+# notice and this notice are preserved.
+
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+
+fail=0
+
+# Create standard test data
+cat <<'EOF' > in_data || framework_failure_
+line 001: alpha bravo charlie
+line 002: foo bar baz qux
+line 003: user_adm_1001 role=admin auth=ok host=srv1.example.com
+line 004: user_reg_1002 role=regular auth=ok host=srv2.example.com
+line 005: heartbeat seq=0001 status=200 tag=ready
+line 006: heartbeat seq=0002 status=500 tag=error_500_handler
+line 007: abcd 1234_1234 repeat_tok
+line 008: nested_group_token_here
+line 009: café and tea on the menu
+line 010: admin_user without role prefix
+line 011: foobarfoobar test_marker
+EOF
+
+# -------------------------------------------------------------------------
+# 1. PCRE must-literal parser edge cases (if PCRE is available)
+# -------------------------------------------------------------------------
+if (grep -P --version) >/dev/null 2>&1; then
+  # Positive and negative lookaround assertions
+  GREP_THREADS=1 grep -P '(?<=role=)admin' in_data > exp_pcre_1 || fail=1
+  for t in 2 4 8; do
+    GREP_THREADS=$t grep -P '(?<=role=)admin' in_data > "out_pcre_1_$t" || fail=1
+    compare exp_pcre_1 "out_pcre_1_$t" || fail=1
+  done
+
+  GREP_THREADS=1 grep -P 'user_(?=adm)' in_data > exp_pcre_2 || fail=1
+  for t in 2 4 8; do
+    GREP_THREADS=$t grep -P 'user_(?=adm)' in_data > "out_pcre_2_$t" || fail=1
+    compare exp_pcre_2 "out_pcre_2_$t" || fail=1
+  done
+
+  GREP_THREADS=1 grep -P 'role=(?!admin)[a-z]+' in_data > exp_pcre_3 || fail=1
+  for t in 2 4 8; do
+    GREP_THREADS=$t grep -P 'role=(?!admin)[a-z]+' in_data > "out_pcre_3_$t" || fail=1
+    compare exp_pcre_3 "out_pcre_3_$t" || fail=1
+  done
+
+  GREP_THREADS=1 grep -P '(?<!role=)admin' in_data > exp_pcre_4 || fail=1
+  for t in 2 4 8; do
+    GREP_THREADS=$t grep -P '(?<!role=)admin' in_data > "out_pcre_4_$t" || fail=1
+    compare exp_pcre_4 "out_pcre_4_$t" || fail=1
+  done
+
+  # Backreferences: named (\k<name>) and numbered (\g{1})
+  GREP_THREADS=1 grep -P '(?P<tok>[0-9]{4})_\k<tok>' in_data > exp_pcre_5 || fail=1
+  for t in 2 4 8; do
+    GREP_THREADS=$t grep -P '(?P<tok>[0-9]{4})_\k<tok>' in_data > "out_pcre_5_$t" || fail=1
+    compare exp_pcre_5 "out_pcre_5_$t" || fail=1
+  done
+
+  GREP_THREADS=1 grep -P '([0-9]{4})_\g{1}' in_data > exp_pcre_6 || fail=1
+  for t in 2 4 8; do
+    GREP_THREADS=$t grep -P '([0-9]{4})_\g{1}' in_data > "out_pcre_6_$t" || fail=1
+    compare exp_pcre_6 "out_pcre_6_$t" || fail=1
+  done
+
+  # POSIX bracket classes inside PCRE
+  GREP_THREADS=1 grep -P '[[:alpha:]]+_[[:alpha:]]+_[0-9]+' in_data > exp_pcre_7 || fail=1
+  for t in 2 4 8; do
+    GREP_THREADS=$t grep -P '[[:alpha:]]+_[[:alpha:]]+_[0-9]+' in_data > "out_pcre_7_$t" || fail=1
+    compare exp_pcre_7 "out_pcre_7_$t" || fail=1
+  done
+
+  # Hex escape code points and literal quotes \Q...\E
+  GREP_THREADS=1 grep -P '\x61\x6c\x70\x68\x61' in_data > exp_pcre_8 || fail=1
+  for t in 2 4 8; do
+    GREP_THREADS=$t grep -P '\x61\x6c\x70\x68\x61' in_data > "out_pcre_8_$t" || fail=1
+    compare exp_pcre_8 "out_pcre_8_$t" || fail=1
+  done
+
+  GREP_THREADS=1 grep -P '\Qalpha\E' in_data > exp_pcre_9 || fail=1
+  for t in 2 4 8; do
+    GREP_THREADS=$t grep -P '\Qalpha\E' in_data > "out_pcre_9_$t" || fail=1
+    compare exp_pcre_9 "out_pcre_9_$t" || fail=1
+  done
+
+  # Nested groups and group repetitions
+  GREP_THREADS=1 grep -P '((?:user|heart)_[a-z]+){1,2}' in_data > exp_pcre_10 || fail=1
+  for t in 2 4 8; do
+    GREP_THREADS=$t grep -P '((?:user|heart)_[a-z]+){1,2}' in_data > "out_pcre_10_$t" || fail=1
+    compare exp_pcre_10 "out_pcre_10_$t" || fail=1
+  done
+
+  # Error conditions: multi-line pattern in -P must be rejected with exit code 2
+  printf 'pattern1\npattern2\n' | grep -P -f - in_data >/dev/null 2>&1
+  test $? -eq 2 || fail=1
+
+  # Invalid regex syntax in -P must exit with trouble
+  grep -P '(?+' in_data >/dev/null 2>&1
+  test $? -eq 2 || fail=1
+fi
+
+# -------------------------------------------------------------------------
+# 2. DFA and BRE must-literal alternations
+# -------------------------------------------------------------------------
+# ERE alternations with character classes and quantifiers
+GREP_THREADS=1 grep -E '(a[[:alpha:]]+|b[[:digit:]]+)' in_data > exp_ere_1 || fail=1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -E '(a[[:alpha:]]+|b[[:digit:]]+)' in_data > "out_ere_1_$t" || fail=1
+  compare exp_ere_1 "out_ere_1_$t" || fail=1
+done
+
+GREP_THREADS=1 grep -E '(foo{0}bar|baz)' in_data > exp_ere_2 || fail=1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -E '(foo{0}bar|baz)' in_data > "out_ere_2_$t" || fail=1
+  compare exp_ere_2 "out_ere_2_$t" || fail=1
+done
+
+GREP_THREADS=1 grep -E '(foo{1,3}bar|test)' in_data > exp_ere_3 || fail=1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -E '(foo{1,3}bar|test)' in_data > "out_ere_3_$t" || fail=1
+  compare exp_ere_3 "out_ere_3_$t" || fail=1
+done
+
+# BRE alternations with groups and quantifiers
+GREP_THREADS=1 grep -G '\(foo\)\?bar\|baz' in_data > exp_bre_1 || fail=1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -G '\(foo\)\?bar\|baz' in_data > "out_bre_1_$t" || fail=1
+  compare exp_bre_1 "out_bre_1_$t" || fail=1
+done
+
+GREP_THREADS=1 grep -G '\(abc\)\|\(def\)' in_data > exp_bre_2 || fail=1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -G '\(abc\)\|\(def\)' in_data > "out_bre_2_$t" || fail=1
+  compare exp_bre_2 "out_bre_2_$t" || fail=1
+done
+
+# Multibyte characters in alternation
+GREP_THREADS=1 grep -E 'café|tea' in_data > exp_mb || fail=1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -E 'café|tea' in_data > "out_mb_$t" || fail=1
+  compare exp_mb "out_mb_$t" || fail=1
+done
+
+# -------------------------------------------------------------------------
+# 3. CLI options: -T, -Z, -z, --color, --binary-files
+# -------------------------------------------------------------------------
+# Initial tab formatting
+GREP_THREADS=1 grep -T -H -n 'heartbeat' in_data > exp_tab_hn || fail=1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -T -H -n 'heartbeat' in_data > "out_tab_hn_$t" || fail=1
+  compare exp_tab_hn "out_tab_hn_$t" || fail=1
+done
+
+GREP_THREADS=1 grep -T -b 'heartbeat' in_data > exp_tab_b || fail=1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -T -b 'heartbeat' in_data > "out_tab_b_$t" || fail=1
+  compare exp_tab_b "out_tab_b_$t" || fail=1
+done
+
+# Null separators -Z with -c and -n
+GREP_THREADS=1 grep -Z -c 'heartbeat' in_data > exp_zc || fail=1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -Z -c 'heartbeat' in_data > "out_zc_$t" || fail=1
+  compare exp_zc "out_zc_$t" || fail=1
+done
+
+GREP_THREADS=1 grep -Z -n 'heartbeat' in_data > exp_zn || fail=1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -Z -n 'heartbeat' in_data > "out_zn_$t" || fail=1
+  compare exp_zn "out_zn_$t" || fail=1
+done
+
+# Null data -z
+printf 'rec1\0rec2\0rec3_heartbeat\0rec4\0' > in_nulls || framework_failure_
+GREP_THREADS=1 grep -z 'heartbeat' in_nulls > exp_z || fail=1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -z 'heartbeat' in_nulls > "out_z_$t" || fail=1
+  compare exp_z "out_z_$t" || fail=1
+done
+
+# Binary file modes
+cat in_data > in_mixed || framework_failure_
+printf '\0\0\0binary_marker\n' >> in_mixed || framework_failure_
+
+GREP_THREADS=1 grep --binary-files=without-match 'binary_marker' in_mixed > exp_bin_wm 2>&1
+rc_exp=$?
+for t in 2 4 8; do
+  GREP_THREADS=$t grep --binary-files=without-match 'binary_marker' in_mixed > "out_bin_wm_$t" 2>&1
+  rc_cur=$?
+  test $rc_exp -eq $rc_cur || fail=1
+  compare exp_bin_wm "out_bin_wm_$t" || fail=1
+done
+
+GREP_THREADS=1 grep -a 'binary_marker' in_mixed > exp_bin_text || fail=1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -a 'binary_marker' in_mixed > "out_bin_text_$t" || fail=1
+  compare exp_bin_text "out_bin_text_$t" || fail=1
+done
+
+# Color highlighting output
+GREP_THREADS=1 grep --color=always -F 'alpha' in_data > exp_col || fail=1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep --color=always -F 'alpha' in_data > "out_col_$t" || fail=1
+  compare exp_col "out_col_$t" || fail=1
+done
+
+# -------------------------------------------------------------------------
+# 4. Error diagnostics and boundary handling
+# -------------------------------------------------------------------------
+# Invalid context argument
+grep -C -1 'alpha' in_data >/dev/null 2>&1
+test $? -eq 2 || fail=1
+
+grep -C invalid_arg 'alpha' in_data >/dev/null 2>&1
+test $? -eq 2 || fail=1
+
+# Invalid max count argument
+grep -m invalid_count 'alpha' in_data >/dev/null 2>&1
+test $? -eq 2 || fail=1
+
+# Invalid matcher
+grep --matcher=unknown_matcher 'alpha' in_data >/dev/null 2>&1
+test $? -eq 2 || fail=1
+
+# FIFO skip handling
+if mkfifo test_fifo 2>/dev/null; then
+  # -D skip should return cleanly without opening or blocking on the FIFO
+  grep -D skip 'alpha' test_fifo >/dev/null 2>&1
+  test $? -eq 1 || fail=1
+  rm -f test_fifo
+fi
+
+# Directory loop detection
+mkdir -p loop_dir/sub || framework_failure_
+if ln -s .. loop_dir/sub/cycle 2>/dev/null; then
+  echo "content" > loop_dir/target.txt
+  grep -r 'content' loop_dir >/dev/null 2>&1
+  # Should not infinite loop and should find target.txt
+  test $? -eq 0 || fail=1
+fi
+
+# Unreadable directory handling (exit status 2 on permission error)
+mkdir -p no_read_dir || framework_failure_
+echo "secret" > no_read_dir/f.txt
+chmod 000 no_read_dir 2>/dev/null
+if test ! -r no_read_dir; then
+  grep -r 'secret' no_read_dir >/dev/null 2>&1
+  test $? -eq 2 || fail=1
+  chmod 755 no_read_dir
+fi
+
+# Unreadable file handling (exit status 2 on permission error)
+touch no_read_file || framework_failure_
+chmod 000 no_read_file 2>/dev/null
+if test ! -r no_read_file; then
+  grep 'secret' no_read_file >/dev/null 2>&1
+  test $? -eq 2 || fail=1
+  chmod 644 no_read_file
+fi
+
+# Early-exit input draining on pipe (no SIGPIPE or error)
+head -c 5000000 /dev/zero 2>/dev/null | tr '\0' 'a' | grep -q 'a' || fail=1
+
+Exit $fail

@@ -130,7 +130,10 @@ def get_total_size(path):
     return total
 
 def normalize_err(err):
-    return re.sub(rb"^[^:]+:", b"grep:", err)
+    err = re.sub(rb"^(?:[^\s:]*/)?(?:grep|grep-baseline):", b"grep:", err)
+    err = re.sub(rb"Try '(?:[^\s']*/)?(?:grep|grep-baseline) --help'", b"Try 'grep --help'", err)
+    err = re.sub(rb"Usage: \S*(?:grep-baseline|grep)", b"Usage: grep", err)
+    return err
 
 def run_once(binary, args, env_vars=None, pipe_mode=None, preexec_fn=None):
     env = os.environ.copy()
@@ -279,6 +282,40 @@ def run_edge_case_conformance():
     checks.append(("Backref UTF-8 quantifier", ["-E", "(é?ab)\\1", regress_prefilter], {"LC_ALL": "en_US.UTF-8"}, None))
     checks.append(("PCRE bracketed paren in opt group", ["-P", r"([)]foo)?bar", regress_prefilter], None, None))
     checks.append(("PCRE bracketed open paren", ["-P", r"([(]foo)?bar", regress_prefilter], None, None))
+
+    # 18. PCRE lookaheads, lookbehinds, backreferences, and bracket expressions
+    checks.append(("PCRE lookbehind (?<=role=)", ["-P", r"(?<=role=)regular", test_file], None, None))
+    checks.append(("PCRE lookahead role=(?=regular)", ["-P", r"role=(?=regular)", test_file], None, None))
+    checks.append(("PCRE neg lookahead role=(?!admin)", ["-P", r"role=(?!admin)", test_file], None, None))
+    checks.append(("PCRE neg lookbehind (?<!role=)admin", ["-P", r"(?<!role=)admin", test_file], None, None))
+    checks.append((r"PCRE named backref \k<name>", ["-P", r"(?P<tok>[0-9]{3})_\k<tok>", test_file], None, None))
+    checks.append((r"PCRE numbered backref \g{1}", ["-P", r"([0-9]{3})_\g{1}", test_file], None, None))
+    checks.append(("PCRE POSIX class [[:alpha:]]", ["-P", r"[[:alpha:]]+_[[:digit:]]+", test_file], None, None))
+    checks.append((r"PCRE hex escape \x{6c}", ["-P", r"\x{6c}\x{6f}\x{67}", test_file], {"LC_ALL": "en_US.UTF-8"}, None))
+    checks.append((r"PCRE quote \Q...\E", ["-P", r"\Qlog_entry\E", test_file], None, None))
+    checks.append(("PCRE multi-pattern rejection", ["-P", "-e", "foo\nbar", test_file], None, None))
+
+    # 19. ERE & BRE must-literal alternations with classes and quantifiers
+    checks.append(("ERE alternation char classes", ["-E", "(a[[:alpha:]]+|b[[:digit:]]+)", test_file], None, None))
+    checks.append(("ERE alternation zero quantifier", ["-E", "(foo{0}bar|baz)", test_file], None, None))
+    checks.append(("ERE alternation bounded quant", ["-E", "(foo{1,3}bar|test)", test_file], None, None))
+    checks.append(("BRE alternation group quantifier", ["-G", r"\(foo\)\?bar\|baz", test_file], None, None))
+    checks.append(("BRE alternation multi-group", ["-G", r"\(abc\)\|\(def\)", test_file], None, None))
+
+    # 20. CLI options: -T, -Z, --color, --binary-files, -D
+    checks.append(("Initial tab -T -H -n", ["-T", "-H", "-n", "INFO", test_file], None, None))
+    checks.append(("Initial tab -T -b", ["-T", "-b", "INFO", test_file], None, None))
+    checks.append(("Null separator -Z -c", ["-Z", "-c", "INFO", test_file], None, None))
+    checks.append(("Null separator -Z -n", ["-Z", "-n", "INFO", test_file], None, None))
+    checks.append(("Color always literal -F", ["--color=always", "-F", "INFO", test_file], None, None))
+    checks.append(("Binary without-match", ["--binary-files=without-match", "INFO", test_file], None, None))
+    checks.append(("Binary text mode", ["--binary-files=text", "INFO", test_file], None, None))
+    checks.append(("Device skip -D skip", ["-D", "skip", "INFO", test_file], None, None))
+
+    # 21. Error diagnostics: invalid -C, -m
+    checks.append(("Context -C negative", ["-C", "-1", "INFO", test_file], None, None))
+    checks.append(("Context -C invalid", ["-C", "invalid", "INFO", test_file], None, None))
+    checks.append(("Max count -m invalid", ["-m", "invalid", "INFO", test_file], None, None))
 
     passed = 0
     total = len(checks)
