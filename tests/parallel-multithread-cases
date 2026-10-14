@@ -1,0 +1,183 @@
+#! /bin/sh
+# Test multi-threaded edge cases: ROB wrap-around, head-of-line blocking,
+# multiple chunked files, early exit, non-power-of-two threads, and oversubscription.
+#
+# Copyright (C) 2026 David Lin <dtwlin@gmail.com>
+#
+# Copying and distribution of this file, with or without modification,
+# are permitted in any medium without royalty provided the copyright
+# notice and this notice are preserved.
+
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+
+fail=0
+
+# =========================================================================
+# 1. ROB Capacity Wrap-Around (> 1,024 slots)
+# =========================================================================
+# Create 1,500 files to force next_seq and commit_seq to wrap around ROB_CAP (1,024)
+mkdir -p mt_tree || framework_failure_
+
+for d in 1 2 3 4 5; do
+  mkdir -p "mt_tree/d$d" || framework_failure_
+  for f in $(seq 1 300); do
+    idx=$(( (d - 1) * 300 + f ))
+    if [ $idx -eq 750 ]; then
+      printf "file %04d: SPECIAL_TARGET_750\n" "$idx" > "mt_tree/d$d/f$f.txt" || framework_failure_
+    elif [ $((idx % 150)) -eq 0 ]; then
+      printf "file %04d: PERIODIC_TARGET tag=hit\n" "$idx" > "mt_tree/d$d/f$f.txt" || framework_failure_
+    else
+      printf "file %04d: filler payload line data\n" "$idx" > "mt_tree/d$d/f$f.txt" || framework_failure_
+    fi
+  done
+done
+
+# Baseline expected output at 1 thread
+GREP_THREADS=1 grep -r 'PERIODIC_TARGET' mt_tree > exp_periodic || fail=1
+GREP_THREADS=1 grep -r 'SPECIAL_TARGET_750' mt_tree > exp_special || fail=1
+
+# Test across power-of-two, prime, and oversubscribed thread counts
+for t in 2 3 5 7 16 31 32 64; do
+  GREP_THREADS=$t grep -r 'PERIODIC_TARGET' mt_tree > "out_per_$t" || fail=1
+  compare exp_periodic "out_per_$t" || fail=1
+
+  GREP_THREADS=$t grep -r 'SPECIAL_TARGET_750' mt_tree > "out_spec_$t" || fail=1
+  compare exp_special "out_spec_$t" || fail=1
+done
+
+# =========================================================================
+# 2. Head-of-Line Blocking in the Reorder Buffer
+# =========================================================================
+# Slot 0 is an expensive large file (2.5 MiB), followed by 100 fast small files.
+# Workers finish small files immediately out-of-order while slot 0 is still
+# in progress; tests that committer waits and commits in strict monotonic order.
+mkdir -p mt_hol || framework_failure_
+
+awk 'BEGIN {
+  for (i = 1; i <= 35000; i++)
+    printf "slow line %06d: payload filler data block\n", i;
+  printf "slow line 035001: HOL_TARGET_SLOW hit\n";
+}' > mt_hol/00_slow.txt || framework_failure_
+
+for f in $(seq 1 100); do
+  printf "fast line %03d: HOL_TARGET_FAST hit\n" "$f" > "mt_hol/${f}_fast.txt" || framework_failure_
+done
+
+GREP_THREADS=1 grep -r -n 'HOL_TARGET' mt_hol > exp_hol || fail=1
+
+for t in 2 4 8 16 32; do
+  GREP_THREADS=$t grep -r -n 'HOL_TARGET' mt_hol > "out_hol_$t" || fail=1
+  compare exp_hol "out_hol_$t" || fail=1
+done
+
+# =========================================================================
+# 3. Multiple Concurrent Chunked Files (>= 2 MiB operands)
+# =========================================================================
+# Multiple large files passed as command-line arguments to test concurrent
+# intra-file chunk scanning alongside inter-file sequencing.
+awk 'BEGIN {
+  for (i = 1; i <= 35000; i++) {
+    if (i % 7000 == 0)
+      printf "chunked line %06d: MULTI_CHUNK_A hit\n", i;
+    else
+      printf "chunked line %06d: filler payload 0123456789abcdef\n", i;
+  }
+}' > mt_big1.txt || framework_failure_
+
+awk 'BEGIN {
+  for (i = 1; i <= 35000; i++) {
+    if (i % 7000 == 0)
+      printf "chunked line %06d: MULTI_CHUNK_B hit\n", i;
+    else
+      printf "chunked line %06d: filler payload 0123456789abcdef\n", i;
+  }
+}' > mt_big2.txt || framework_failure_
+
+awk 'BEGIN {
+  for (i = 1; i <= 35000; i++) {
+    if (i % 7000 == 0)
+      printf "chunked line %06d: MULTI_CHUNK_C hit\n", i;
+    else
+      printf "chunked line %06d: filler payload 0123456789abcdef\n", i;
+  }
+}' > mt_big3.txt || framework_failure_
+
+GREP_THREADS=1 grep -n -b 'MULTI_CHUNK' mt_big1.txt mt_big2.txt mt_big3.txt > exp_multichunk || fail=1
+
+for t in 2 4 8 16 32; do
+  GREP_THREADS=$t grep -n -b 'MULTI_CHUNK' mt_big1.txt mt_big2.txt mt_big3.txt > "out_mc_$t" || fail=1
+  compare exp_multichunk "out_mc_$t" || fail=1
+done
+
+# =========================================================================
+# 4. Early Exit Under Concurrency (-q, -m 1, Broken Pipe)
+# =========================================================================
+# -q on 1,500-file tree: early exit must cancel workers and drain cleanly
+for t in 1 2 4 8 16 32; do
+  GREP_THREADS=$t grep -r -q 'SPECIAL_TARGET_750' mt_tree
+  test $? -eq 0 || fail=1
+
+  GREP_THREADS=$t grep -r -q 'NONEXISTENT_TARGET' mt_tree
+  test $? -eq 1 || fail=1
+done
+
+# -m 1 on tree: stops traversal immediately after first matching line
+GREP_THREADS=1 grep -r -m 1 'PERIODIC_TARGET' mt_tree > exp_m1_tree || fail=1
+
+for t in 2 4 8 16 32; do
+  GREP_THREADS=$t grep -r -m 1 'PERIODIC_TARGET' mt_tree > "out_m1_tree_$t" || fail=1
+  compare exp_m1_tree "out_m1_tree_$t" || fail=1
+done
+
+# Broken pipe under high thread count: writer should exit cleanly on SIGPIPE
+for iter in $(seq 1 5); do
+  GREP_THREADS=32 grep -r 'filler' mt_tree 2>/dev/null | head -n 3 > "out_pipe_$iter" || true
+  test $(wc -l < "out_pipe_$iter") -eq 3 || fail=1
+done
+
+# =========================================================================
+# 5. Concurrent Context Lines (-C, -A, -B) Across 1,500 Files
+# =========================================================================
+GREP_THREADS=1 grep -r -n -C 1 'PERIODIC_TARGET' mt_tree > exp_ctx_tree || fail=1
+
+for t in 2 4 8 16 32; do
+  GREP_THREADS=$t grep -r -n -C 1 'PERIODIC_TARGET' mt_tree > "out_ctx_tree_$t" || fail=1
+  compare exp_ctx_tree "out_ctx_tree_$t" || fail=1
+done
+
+# =========================================================================
+# 6. Multi-Engine Concurrency (DFA, KWSET, PCRE)
+# =========================================================================
+# DFA complex regex with alternations and repetitions
+GREP_THREADS=1 grep -r -E '(PERIODIC|SPECIAL)_[A-Z]+_[0-9]+' mt_tree > exp_ere_mt || fail=1
+
+for t in 2 4 8 16 32; do
+  GREP_THREADS=$t grep -r -E '(PERIODIC|SPECIAL)_[A-Z]+_[0-9]+' mt_tree > "out_ere_mt_$t" || fail=1
+  compare exp_ere_mt "out_ere_mt_$t" || fail=1
+done
+
+# Multi-pattern KWSET (35 patterns to exercise Dense AC DFA across threads)
+awk 'BEGIN {
+  for (i = 1; i <= 35; i++)
+    printf "mt_kw_%04d\n", i;
+}' > mt_pat_35 || framework_failure_
+
+echo "test line with mt_kw_0001 and mt_kw_0035 hit" > mt_tree/d1/kw_test.txt || framework_failure_
+
+GREP_THREADS=1 grep -r -F -f mt_pat_35 mt_tree > exp_kw_mt || fail=1
+
+for t in 2 4 8 16 32; do
+  GREP_THREADS=$t grep -r -F -f mt_pat_35 mt_tree > "out_kw_mt_$t" || fail=1
+  compare exp_kw_mt "out_kw_mt_$t" || fail=1
+done
+
+# PCRE lookaround assertions across threads (if supported)
+if (grep -P --version) >/dev/null 2>&1; then
+  GREP_THREADS=1 grep -r -P '(?<=SPECIAL_TARGET_)750' mt_tree > exp_pcre_mt || fail=1
+  for t in 2 4 8 16 32; do
+    GREP_THREADS=$t grep -r -P '(?<=SPECIAL_TARGET_)750' mt_tree > "out_pcre_mt_$t" || fail=1
+    compare exp_pcre_mt "out_pcre_mt_$t" || fail=1
+  done
+fi
+
+Exit $fail

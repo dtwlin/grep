@@ -149,6 +149,7 @@ TESTS =						\
   parallel-coverage-edge-cases			\
   parallel-env-limits				\
   parallel-kwset-ac				\
+  parallel-multithread-cases			\
   parallel-pcre-must				\
   parallel-stage1-optim				\
   parallel-stream-stdin				\

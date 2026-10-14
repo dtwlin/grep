@@ -461,6 +461,28 @@ def run_edge_case_conformance():
     checks.append(("Boundary context -B 10 line1", ["-B", "10", "line 1", b_nonl], None, None))
     checks.append(("Boundary context -A 10 eof", ["-A", "10", "target_eof_nonl", b_nonl], None, None))
 
+    # 23. Multithreaded cases: prime threads, oversubscribed threads, multi-chunk concurrent files, ROB head-of-line
+    for t in [3, 5, 7, 31, 128]:
+        checks.append((f"Thread sweep single file (t={t})", ["-F", "ULTRA_RARE_TOKEN_9941", SINGLE_FILE], {"GREP_THREADS": str(t)}, None))
+        checks.append((f"Thread sweep tree search (t={t})", ["-r", "-l", "FATAL", f"{TREE_DIR}/dir_000"], {"GREP_THREADS": str(t)}, None))
+
+    # Multiple concurrent chunked files (> 2 MiB each)
+    mt_chunk1 = os.path.join(BENCH_DIR, "mt_chunk1.txt")
+    mt_chunk2 = os.path.join(BENCH_DIR, "mt_chunk2.txt")
+    with open(mt_chunk1, "wb") as f:
+        f.write((b"x" * 60 + b" MT_CHUNK_1 filler data\n") * 35000)
+    with open(mt_chunk2, "wb") as f:
+        f.write((b"y" * 60 + b" MT_CHUNK_2 filler data\n") * 35000)
+
+    for t in [1, 4, 16, 32]:
+        checks.append((f"Multi-chunk concurrent files (t={t})", ["-n", "-b", "MT_CHUNK", mt_chunk1, mt_chunk2], {"GREP_THREADS": str(t)}, None))
+
+    # Tree search with -m 1, -C 1, and -q across high thread counts
+    for t in [16, 32]:
+        checks.append((f"Max count -m 1 tree search (t={t})", ["-m", "1", "-r", "FATAL", f"{TREE_DIR}/dir_000"], {"GREP_THREADS": str(t)}, None))
+        checks.append((f"Context -C 1 tree search (t={t})", ["-C", "1", "-r", "FATAL", f"{TREE_DIR}/dir_000"], {"GREP_THREADS": str(t)}, None))
+        checks.append((f"Early exit -q tree search (t={t})", ["-q", "-r", "FATAL", f"{TREE_DIR}/dir_000"], {"GREP_THREADS": str(t)}, None))
+
     passed = 0
     total = len(checks)
     for name, args, env_vars, preexec in checks:
