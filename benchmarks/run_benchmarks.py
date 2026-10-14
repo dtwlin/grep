@@ -317,6 +317,150 @@ def run_edge_case_conformance():
     checks.append(("Context -C invalid", ["-C", "invalid", "INFO", test_file], None, None))
     checks.append(("Max count -m invalid", ["-m", "invalid", "INFO", test_file], None, None))
 
+    # 22. Boundary cases: zero-byte, single-byte, slab/buffer thresholds, missing newline, patterns, limits
+    b_empty = os.path.join(BENCH_DIR, "bound_empty.txt")
+    open(b_empty, "wb").close()
+
+    b_single_char = os.path.join(BENCH_DIR, "bound_single_char.txt")
+    with open(b_single_char, "wb") as f:
+        f.write(b"a")
+
+    b_single_nl = os.path.join(BENCH_DIR, "bound_single_nl.txt")
+    with open(b_single_nl, "wb") as f:
+        f.write(b"\n")
+
+    b_nonl = os.path.join(BENCH_DIR, "bound_nonl.txt")
+    with open(b_nonl, "wb") as f:
+        f.write(b"line 1: start\nline 2: target_mid\nline 3: target_eof_nonl")
+
+    b_giant = os.path.join(BENCH_DIR, "bound_giant.txt")
+    with open(b_giant, "wb") as f:
+        f.write(b"A" * 100000 + b"_GIANT_TARGET_" + b"B" * 100000 + b"\n")
+
+    b_slab_64k_m1 = os.path.join(BENCH_DIR, "bound_slab_64k_m1.txt")
+    with open(b_slab_64k_m1, "wb") as f:
+        f.write(b"x" * (65535 - 7) + b"target\n")
+
+    b_slab_64k = os.path.join(BENCH_DIR, "bound_slab_64k.txt")
+    with open(b_slab_64k, "wb") as f:
+        f.write(b"x" * (65536 - 7) + b"target\n")
+
+    b_slab_64k_p1 = os.path.join(BENCH_DIR, "bound_slab_64k_p1.txt")
+    with open(b_slab_64k_p1, "wb") as f:
+        f.write(b"x" * (65537 - 7) + b"target\n")
+
+    b_read_96k_m1 = os.path.join(BENCH_DIR, "bound_read_96k_m1.txt")
+    with open(b_read_96k_m1, "wb") as f:
+        f.write(b"x" * (98304 - 1 - 7) + b"target\n")
+
+    b_read_96k = os.path.join(BENCH_DIR, "bound_read_96k.txt")
+    with open(b_read_96k, "wb") as f:
+        f.write(b"x" * (98304 - 7) + b"target\n")
+
+    b_read_96k_p1 = os.path.join(BENCH_DIR, "bound_read_96k_p1.txt")
+    with open(b_read_96k_p1, "wb") as f:
+        f.write(b"x" * (98304 + 1 - 7) + b"target\n")
+
+    b_bin_first = os.path.join(BENCH_DIR, "bound_bin_first.txt")
+    with open(b_bin_first, "wb") as f:
+        f.write(b"\x00target_bin\n")
+
+    b_bin_last = os.path.join(BENCH_DIR, "bound_bin_last.txt")
+    with open(b_bin_last, "wb") as f:
+        f.write(b"target_bin\x00")
+
+    b_bin_mid = os.path.join(BENCH_DIR, "bound_bin_mid.txt")
+    with open(b_bin_mid, "wb") as f:
+        f.write(b"hello\x00target_bin\n")
+
+    b_pat_0 = os.path.join(BENCH_DIR, "bound_pat_0.txt")
+    open(b_pat_0, "wb").close()
+
+    b_pat_32 = os.path.join(BENCH_DIR, "bound_pat_32.txt")
+    with open(b_pat_32, "w") as f:
+        for i in range(32):
+            f.write(f"kw_{i:04d}\n")
+
+    b_pat_33 = os.path.join(BENCH_DIR, "bound_pat_33.txt")
+    with open(b_pat_33, "w") as f:
+        for i in range(33):
+            f.write(f"kw_{i:04d}\n")
+
+    b_pat_64 = os.path.join(BENCH_DIR, "bound_pat_64.txt")
+    with open(b_pat_64, "w") as f:
+        for i in range(64):
+            f.write(f"kw_{i:04d}\n")
+
+    b_pat_65 = os.path.join(BENCH_DIR, "bound_pat_65.txt")
+    with open(b_pat_65, "w") as f:
+        for i in range(65):
+            f.write(f"kw_{i:04d}\n")
+
+    checks.append(("Boundary empty plain", ["target", b_empty], None, None))
+    checks.append(("Boundary empty -c", ["-c", "target", b_empty], None, None))
+    checks.append(("Boundary empty -c -v", ["-c", "-v", "target", b_empty], None, None))
+    checks.append(("Boundary empty -l", ["-l", "target", b_empty], None, None))
+    checks.append(("Boundary empty -L", ["-L", "target", b_empty], None, None))
+    checks.append(("Boundary empty pat empty", ["", b_empty], None, None))
+    checks.append(("Boundary empty -m 0", ["-m", "0", "target", b_empty], None, None))
+
+    checks.append(("Boundary single char match", ["a", b_single_char], None, None))
+    checks.append(("Boundary single char nomatch", ["b", b_single_char], None, None))
+    checks.append(("Boundary single char -c", ["-c", "a", b_single_char], None, None))
+    checks.append(("Boundary single char -v", ["-v", "a", b_single_char], None, None))
+    checks.append(("Boundary single char -n", ["-n", "a", b_single_char], None, None))
+    checks.append(("Boundary single char -b", ["-b", "a", b_single_char], None, None))
+
+    checks.append(("Boundary single nl empty pat", ["", b_single_nl], None, None))
+    checks.append(("Boundary single nl -c", ["-c", "", b_single_nl], None, None))
+    checks.append(("Boundary single nl anchor", ["^$", b_single_nl], None, None))
+    checks.append(("Boundary single nl -v anchor", ["-v", "^$", b_single_nl], None, None))
+
+    checks.append(("Boundary nonl match mid", ["target_mid", b_nonl], None, None))
+    checks.append(("Boundary nonl match eof", ["target_eof_nonl", b_nonl], None, None))
+    checks.append(("Boundary nonl -c eof", ["-c", "target_eof_nonl", b_nonl], None, None))
+    checks.append(("Boundary nonl -n eof", ["-n", "target_eof_nonl", b_nonl], None, None))
+    checks.append(("Boundary nonl -b eof", ["-b", "target_eof_nonl", b_nonl], None, None))
+    checks.append(("Boundary nonl -C 1 eof", ["-C", "1", "target_eof_nonl", b_nonl], None, None))
+    checks.append(("Boundary nonl -v mid", ["-v", "line 1", b_nonl], None, None))
+
+    checks.append(("Boundary giant line -o", ["-o", "_GIANT_TARGET_", b_giant], None, None))
+    checks.append(("Boundary giant line -c", ["-c", "_GIANT_TARGET_", b_giant], None, None))
+
+    checks.append(("Boundary slab 64k - 1", ["target", b_slab_64k_m1], None, None))
+    checks.append(("Boundary slab 64k", ["target", b_slab_64k], None, None))
+    checks.append(("Boundary slab 64k + 1", ["target", b_slab_64k_p1], None, None))
+    checks.append(("Boundary readbuf 96k - 1", ["target", b_read_96k_m1], None, None))
+    checks.append(("Boundary readbuf 96k", ["target", b_read_96k], None, None))
+    checks.append(("Boundary readbuf 96k + 1", ["target", b_read_96k_p1], None, None))
+
+    checks.append(("Boundary bin first byte default", ["target_bin", b_bin_first], None, None))
+    checks.append(("Boundary bin first byte -a", ["-a", "target_bin", b_bin_first], None, None))
+    checks.append(("Boundary bin first byte -I", ["-I", "target_bin", b_bin_first], None, None))
+    checks.append(("Boundary bin last byte -a", ["-a", "target_bin", b_bin_last], None, None))
+    checks.append(("Boundary bin mid byte -a", ["-a", "target_bin", b_bin_mid], None, None))
+    checks.append(("Boundary bin mid byte -z", ["-z", "target_bin", b_bin_mid], None, None))
+
+    checks.append(("Boundary pat 0 file", ["-F", "-f", b_pat_0, b_nonl], None, None))
+    checks.append(("Boundary pat 32 file", ["-F", "-f", b_pat_32, b_nonl], None, None))
+    checks.append(("Boundary pat 33 file", ["-F", "-f", b_pat_33, b_nonl], None, None))
+    checks.append(("Boundary pat 64 file", ["-F", "-f", b_pat_64, b_nonl], None, None))
+    checks.append(("Boundary pat 65 file", ["-F", "-f", b_pat_65, b_nonl], None, None))
+
+    checks.append(("Boundary regex exact empty", ["-x", "", b_single_nl], None, None))
+    checks.append(("Boundary regex empty group star", ["-E", "()*target", b_slab_64k], None, None))
+    checks.append(("Boundary regex empty alt start", ["-E", "|target", b_slab_64k], None, None))
+    checks.append(("Boundary regex empty alt end", ["-E", "target|", b_slab_64k], None, None))
+    checks.append(("Boundary regex empty alt mid", ["-E", "a||b", b_nonl], None, None))
+    checks.append(("Boundary regex word empty", ["-w", "", b_nonl], None, None))
+
+    checks.append(("Boundary max count -m 0", ["-m", "0", "target", b_nonl], None, None))
+    checks.append(("Boundary max count -m 1 -c", ["-m", "1", "-c", "line", b_nonl], None, None))
+    checks.append(("Boundary max count -m 1 -o", ["-m", "1", "-o", "target", b_nonl], None, None))
+    checks.append(("Boundary context -C 0", ["-C", "0", "target_mid", b_nonl], None, None))
+    checks.append(("Boundary context -B 10 line1", ["-B", "10", "line 1", b_nonl], None, None))
+    checks.append(("Boundary context -A 10 eof", ["-A", "10", "target_eof_nonl", b_nonl], None, None))
+
     passed = 0
     total = len(checks)
     for name, args, env_vars, preexec in checks:

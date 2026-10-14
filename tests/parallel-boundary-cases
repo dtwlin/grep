@@ -1,0 +1,556 @@
+#! /bin/sh
+# Test boundary-case coverage across file sizes, buffers, newlines, patterns, and CLI limits.
+#
+# Copyright (C) 2026 David Lin <dtwlin@gmail.com>
+#
+# Copying and distribution of this file, with or without modification,
+# are permitted in any medium without royalty provided the copyright
+# notice and this notice are preserved.
+
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+
+fail=0
+
+# =========================================================================
+# 1. Zero-byte and single-byte file boundaries
+# =========================================================================
+: > in_empty || framework_failure_
+printf 'a' > in_single_char || framework_failure_
+printf '\n' > in_single_nl || framework_failure_
+printf '\n\n\n' > in_consec_nl || framework_failure_
+
+# Empty file behaviors
+GREP_THREADS=1 grep 'target' in_empty > out_exp 2>&1
+test $? -eq 1 || fail=1
+test ! -s out_exp || fail=1
+
+for t in 2 4 8; do
+  GREP_THREADS=$t grep 'target' in_empty > "out_$t" 2>&1
+  test $? -eq 1 || fail=1
+  compare out_exp "out_$t" || fail=1
+done
+
+# -v on empty file
+GREP_THREADS=1 grep -v 'target' in_empty > out_exp 2>&1
+test $? -eq 1 || fail=1
+test ! -s out_exp || fail=1
+
+# -c on empty file (outputs 0)
+GREP_THREADS=1 grep -c 'target' in_empty > exp_c 2>&1
+test $? -eq 1 || fail=1
+echo '0' > exp_0
+compare exp_0 exp_c || fail=1
+
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -c 'target' in_empty > "out_c_$t" 2>&1
+  test $? -eq 1 || fail=1
+  compare exp_c "out_c_$t" || fail=1
+done
+
+# -c -v on empty file (outputs 0)
+GREP_THREADS=1 grep -c -v 'target' in_empty > exp_cv 2>&1
+test $? -eq 1 || fail=1
+compare exp_0 exp_cv || fail=1
+
+# -l on empty file (no output, rc=1)
+GREP_THREADS=1 grep -l 'target' in_empty > out_exp 2>&1
+test $? -eq 1 || fail=1
+test ! -s out_exp || fail=1
+
+# -L on empty file (outputs filename, rc=1 because no lines matched)
+GREP_THREADS=1 grep -L 'target' in_empty > exp_L 2>&1
+test $? -eq 1 || fail=1
+echo 'in_empty' > exp_L_name
+compare exp_L_name exp_L || fail=1
+
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -L 'target' in_empty > "out_L_$t" 2>&1
+  test $? -eq 1 || fail=1
+  compare exp_L "out_L_$t" || fail=1
+done
+
+# Empty pattern on empty file (no lines to match, rc=1, no output)
+GREP_THREADS=1 grep '' in_empty > out_exp 2>&1
+test $? -eq 1 || fail=1
+test ! -s out_exp || fail=1
+
+# -m 0 on empty file
+GREP_THREADS=1 grep -m 0 'target' in_empty > out_exp 2>&1
+test $? -eq 1 || fail=1
+test ! -s out_exp || fail=1
+
+# Single character file without newline
+GREP_THREADS=1 grep 'a' in_single_char > exp_sc 2>&1
+test $? -eq 0 || fail=1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep 'a' in_single_char > "out_sc_$t" 2>&1
+  test $? -eq 0 || fail=1
+  compare exp_sc "out_sc_$t" || fail=1
+done
+
+GREP_THREADS=1 grep -n 'a' in_single_char > exp_scn 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -n 'a' in_single_char > "out_scn_$t" 2>&1
+  compare exp_scn "out_scn_$t" || fail=1
+done
+
+GREP_THREADS=1 grep -b 'a' in_single_char > exp_scb 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -b 'a' in_single_char > "out_scb_$t" 2>&1
+  compare exp_scb "out_scb_$t" || fail=1
+done
+
+# Single newline file
+GREP_THREADS=1 grep '' in_single_nl > exp_snl 2>&1
+test $? -eq 0 || fail=1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep '' in_single_nl > "out_snl_$t" 2>&1
+  test $? -eq 0 || fail=1
+  compare exp_snl "out_snl_$t" || fail=1
+done
+
+GREP_THREADS=1 grep '^$' in_single_nl > exp_snla 2>&1
+test $? -eq 0 || fail=1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep '^$' in_single_nl > "out_snla_$t" 2>&1
+  test $? -eq 0 || fail=1
+  compare exp_snla "out_snla_$t" || fail=1
+done
+
+# =========================================================================
+# 2. Missing trailing newline at EOF
+# =========================================================================
+printf 'line 1: start\nline 2: target_middle\nline 3: target_eof_nonl' > in_nonl || framework_failure_
+
+GREP_THREADS=1 grep 'target_eof_nonl' in_nonl > exp_nonl 2>&1
+test $? -eq 0 || fail=1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep 'target_eof_nonl' in_nonl > "out_nonl_$t" 2>&1
+  test $? -eq 0 || fail=1
+  compare exp_nonl "out_nonl_$t" || fail=1
+done
+
+GREP_THREADS=1 grep -n 'target_eof_nonl' in_nonl > exp_nonln 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -n 'target_eof_nonl' in_nonl > "out_nonln_$t" 2>&1
+  compare exp_nonln "out_nonln_$t" || fail=1
+done
+
+GREP_THREADS=1 grep -b 'target_eof_nonl' in_nonl > exp_nonlb 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -b 'target_eof_nonl' in_nonl > "out_nonlb_$t" 2>&1
+  compare exp_nonlb "out_nonlb_$t" || fail=1
+done
+
+GREP_THREADS=1 grep -C 1 'target_eof_nonl' in_nonl > exp_nonlc 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -C 1 'target_eof_nonl' in_nonl > "out_nonlc_$t" 2>&1
+  compare exp_nonlc "out_nonlc_$t" || fail=1
+done
+
+GREP_THREADS=1 grep -v 'line 1' in_nonl > exp_nonlv 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -v 'line 1' in_nonl > "out_nonlv_$t" 2>&1
+  compare exp_nonlv "out_nonlv_$t" || fail=1
+done
+
+# =========================================================================
+# 3. Buffer, slab, and chunk size boundaries
+# =========================================================================
+# 64 KiB slab boundary (65535, 65536, 65537)
+awk 'BEGIN {
+  s = sprintf("%*s", 65528, ""); gsub(/ /, "x", s);
+  printf "%starget\n", s;
+}' > in_64k_minus_1 || framework_failure_
+
+awk 'BEGIN {
+  s = sprintf("%*s", 65529, ""); gsub(/ /, "x", s);
+  printf "%starget\n", s;
+}' > in_64k || framework_failure_
+
+awk 'BEGIN {
+  s = sprintf("%*s", 65530, ""); gsub(/ /, "x", s);
+  printf "%starget\n", s;
+}' > in_64k_plus_1 || framework_failure_
+
+# 96 KiB read buffer boundary (98303, 98304, 98305)
+awk 'BEGIN {
+  s = sprintf("%*s", 98296, ""); gsub(/ /, "x", s);
+  printf "%starget\n", s;
+}' > in_96k_minus_1 || framework_failure_
+
+awk 'BEGIN {
+  s = sprintf("%*s", 98297, ""); gsub(/ /, "x", s);
+  printf "%starget\n", s;
+}' > in_96k || framework_failure_
+
+awk 'BEGIN {
+  s = sprintf("%*s", 98298, ""); gsub(/ /, "x", s);
+  printf "%starget\n", s;
+}' > in_96k_plus_1 || framework_failure_
+
+for f in in_64k_minus_1 in_64k in_64k_plus_1 in_96k_minus_1 in_96k in_96k_plus_1; do
+  GREP_THREADS=1 grep -c 'target' "$f" > "exp_c_$f" 2>&1
+  for t in 2 4 8; do
+    GREP_THREADS=$t grep -c 'target' "$f" > "out_c_${f}_$t" 2>&1
+    compare "exp_c_$f" "out_c_${f}_$t" || fail=1
+  done
+done
+
+# Giant line (200 KiB without newline)
+awk 'BEGIN {
+  s1 = sprintf("%*s", 100000, ""); gsub(/ /, "A", s1);
+  s2 = sprintf("%*s", 100000, ""); gsub(/ /, "B", s2);
+  printf "%s_GIANT_TARGET_%s\n", s1, s2;
+}' > in_giant || framework_failure_
+
+GREP_THREADS=1 grep -o '_GIANT_TARGET_' in_giant > exp_giant_o 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -o '_GIANT_TARGET_' in_giant > "out_giant_o_$t" 2>&1
+  compare exp_giant_o "out_giant_o_$t" || fail=1
+done
+
+# 2 MiB parallel chunk boundary and match spanning across chunk boundary
+awk 'BEGIN {
+  s = sprintf("%*s", 2097152 - 3, ""); gsub(/ /, "x", s);
+  printf "%starget_crossing_chunk_boundary\n", s;
+  for (i = 1; i <= 500; i++)
+    printf "tail line %04d filler payload\n", i;
+}' > in_2m_crossing || framework_failure_
+
+GREP_THREADS=1 grep -n -b 'target_crossing_chunk_boundary' in_2m_crossing > exp_cross_nb 2>&1
+for t in 2 4 8 16; do
+  GREP_THREADS=$t grep -n -b 'target_crossing_chunk_boundary' in_2m_crossing > "out_cross_nb_$t" 2>&1
+  compare exp_cross_nb "out_cross_nb_$t" || fail=1
+done
+
+# =========================================================================
+# 4. Binary null byte placements & null-data (-z)
+# =========================================================================
+printf '\0target_bin_first\n' > in_bin_first || framework_failure_
+printf 'target_bin_last\0' > in_bin_last || framework_failure_
+printf 'hello\0target_bin_mid\n' > in_bin_mid || framework_failure_
+
+# Default binary-files handling
+GREP_THREADS=1 grep 'target_bin_first' in_bin_first > exp_bf 2>&1
+rc_bf=$?
+for t in 2 4 8; do
+  GREP_THREADS=$t grep 'target_bin_first' in_bin_first > "out_bf_$t" 2>&1
+  test $? -eq $rc_bf || fail=1
+  compare exp_bf "out_bf_$t" || fail=1
+done
+
+# -a (text mode)
+GREP_THREADS=1 grep -a 'target_bin_first' in_bin_first > exp_bfa 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -a 'target_bin_first' in_bin_first > "out_bfa_$t" 2>&1
+  compare exp_bfa "out_bfa_$t" || fail=1
+done
+
+# -I (without-match)
+GREP_THREADS=1 grep -I 'target_bin_first' in_bin_first > exp_bfi 2>&1
+test $? -eq 1 || fail=1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -I 'target_bin_first' in_bin_first > "out_bfi_$t" 2>&1
+  test $? -eq 1 || fail=1
+  compare exp_bfi "out_bfi_$t" || fail=1
+done
+
+# Null-data (-z)
+printf 'rec1\0rec2_target\0rec3\0' > in_z || framework_failure_
+GREP_THREADS=1 grep -z 'rec2_target' in_z > exp_z 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -z 'rec2_target' in_z > "out_z_$t" 2>&1
+  compare exp_z "out_z_$t" || fail=1
+done
+
+GREP_THREADS=1 grep -z -n 'rec2_target' in_z > exp_zn 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -z -n 'rec2_target' in_z > "out_zn_$t" 2>&1
+  compare exp_zn "out_zn_$t" || fail=1
+done
+
+# =========================================================================
+# 5. Multi-keyword pattern boundaries (-F: 0, 1, 32, 33, 64, 65)
+# =========================================================================
+: > pat_0
+awk 'BEGIN { for (i = 1; i <= 32; i++) printf "kw_%04d\n", i; }' > pat_32 || framework_failure_
+awk 'BEGIN { for (i = 1; i <= 33; i++) printf "kw_%04d\n", i; }' > pat_33 || framework_failure_
+awk 'BEGIN { for (i = 1; i <= 64; i++) printf "kw_%04d\n", i; }' > pat_64 || framework_failure_
+awk 'BEGIN { for (i = 1; i <= 65; i++) printf "kw_%04d\n", i; }' > pat_65 || framework_failure_
+
+cat <<'EOF' > in_kw_data
+line 1: kw_0001 start
+line 2: kw_0032 thirty_two
+line 3: kw_0033 thirty_three
+line 4: kw_0064 sixty_four
+line 5: kw_0065 sixty_five
+line 6: regular text no keyword
+EOF
+
+# 0 patterns (from empty file) must exit 1 with no matches
+GREP_THREADS=1 grep -F -f pat_0 in_kw_data > exp_kw0 2>&1
+test $? -eq 1 || fail=1
+test ! -s exp_kw0 || fail=1
+
+# 32 patterns (Teddy upper limit)
+GREP_THREADS=1 grep -F -f pat_32 in_kw_data > exp_kw32 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -F -f pat_32 in_kw_data > "out_kw32_$t" 2>&1
+  compare exp_kw32 "out_kw32_$t" || fail=1
+done
+
+# 33 patterns (Dense AC DFA transition)
+GREP_THREADS=1 grep -F -f pat_33 in_kw_data > exp_kw33 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -F -f pat_33 in_kw_data > "out_kw33_$t" 2>&1
+  compare exp_kw33 "out_kw33_$t" || fail=1
+done
+
+# 64 patterns
+GREP_THREADS=1 grep -F -f pat_64 in_kw_data > exp_kw64 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -F -f pat_64 in_kw_data > "out_kw64_$t" 2>&1
+  compare exp_kw64 "out_kw64_$t" || fail=1
+done
+
+# 65 patterns
+GREP_THREADS=1 grep -F -f pat_65 in_kw_data > exp_kw65 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -F -f pat_65 in_kw_data > "out_kw65_$t" 2>&1
+  compare exp_kw65 "out_kw65_$t" || fail=1
+done
+
+# Duplicate and prefix keywords
+GREP_THREADS=1 grep -e 'kw_0001' -e 'kw_0001' -e 'kw_0001' in_kw_data > exp_dup 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -e 'kw_0001' -e 'kw_0001' -e 'kw_0001' in_kw_data > "out_dup_$t" 2>&1
+  compare exp_dup "out_dup_$t" || fail=1
+done
+
+GREP_THREADS=1 grep -e 'kw_' -e 'kw_00' -e 'kw_003' in_kw_data > exp_pref 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -e 'kw_' -e 'kw_00' -e 'kw_003' in_kw_data > "out_pref_$t" 2>&1
+  compare exp_pref "out_pref_$t" || fail=1
+done
+
+# =========================================================================
+# 6. Regex engine boundary expressions
+# =========================================================================
+# Empty regex matching
+GREP_THREADS=1 grep -E '' in_kw_data > exp_re_emp 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -E '' in_kw_data > "out_re_emp_$t" 2>&1
+  compare exp_re_emp "out_re_emp_$t" || fail=1
+done
+
+# Anchors
+GREP_THREADS=1 grep '^' in_kw_data > exp_anch_caret 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep '^' in_kw_data > "out_anch_caret_$t" 2>&1
+  compare exp_anch_caret "out_anch_caret_$t" || fail=1
+done
+
+GREP_THREADS=1 grep '$' in_kw_data > exp_anch_dollar 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep '$' in_kw_data > "out_anch_dollar_$t" 2>&1
+  compare exp_anch_dollar "out_anch_dollar_$t" || fail=1
+done
+
+# Word boundary with empty pattern matches lines with word boundaries
+GREP_THREADS=1 grep -w '' in_kw_data > exp_w_emp 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -w '' in_kw_data > "out_w_emp_$t" 2>&1
+  compare exp_w_emp "out_w_emp_$t" || fail=1
+done
+
+# Exact line match (-x)
+GREP_THREADS=1 grep -x 'line 1: kw_0001 start' in_kw_data > exp_x 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -x 'line 1: kw_0001 start' in_kw_data > "out_x_$t" 2>&1
+  compare exp_x "out_x_$t" || fail=1
+done
+
+# Zero repetitions & empty groups
+GREP_THREADS=1 grep -E 'x{0}kw_0001' in_kw_data > exp_zrep 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -E 'x{0}kw_0001' in_kw_data > "out_zrep_$t" 2>&1
+  compare exp_zrep "out_zrep_$t" || fail=1
+done
+
+GREP_THREADS=1 grep -E '()*kw_0001' in_kw_data > exp_egrp 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -E '()*kw_0001' in_kw_data > "out_egrp_$t" 2>&1
+  compare exp_egrp "out_egrp_$t" || fail=1
+done
+
+# Empty alternations
+GREP_THREADS=1 grep -E '|kw_0001' in_kw_data > exp_ealt1 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -E '|kw_0001' in_kw_data > "out_ealt1_$t" 2>&1
+  compare exp_ealt1 "out_ealt1_$t" || fail=1
+done
+
+GREP_THREADS=1 grep -E 'kw_0001|' in_kw_data > exp_ealt2 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -E 'kw_0001|' in_kw_data > "out_ealt2_$t" 2>&1
+  compare exp_ealt2 "out_ealt2_$t" || fail=1
+done
+
+# =========================================================================
+# 7. Context lines (-A, -B, -C) boundaries
+# =========================================================================
+# -C 0, -A 0, -B 0
+GREP_THREADS=1 grep -C 0 'kw_0001' in_kw_data > exp_c0 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -C 0 'kw_0001' in_kw_data > "out_c0_$t" 2>&1
+  compare exp_c0 "out_c0_$t" || fail=1
+done
+
+# Leading context at line 1 (-B 10)
+GREP_THREADS=1 grep -B 10 'kw_0001' in_kw_data > exp_b10 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -B 10 'kw_0001' in_kw_data > "out_b10_$t" 2>&1
+  compare exp_b10 "out_b10_$t" || fail=1
+done
+
+# Trailing context at EOF (-A 10)
+GREP_THREADS=1 grep -A 10 'regular text' in_kw_data > exp_a10 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -A 10 'regular text' in_kw_data > "out_a10_$t" 2>&1
+  compare exp_a10 "out_a10_$t" || fail=1
+done
+
+# Adjacent matches (lines 2 and 3 with -C 1: merged context without --)
+GREP_THREADS=1 grep -C 1 -E 'kw_0032|kw_0033' in_kw_data > exp_cadj 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -C 1 -E 'kw_0032|kw_0033' in_kw_data > "out_cadj_$t" 2>&1
+  compare exp_cadj "out_cadj_$t" || fail=1
+done
+
+# Disjoint matches (lines 1 and 4 with -C 1: separated by --)
+GREP_THREADS=1 grep -C 1 -E 'kw_0001|kw_0064' in_kw_data > exp_cdis 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -C 1 -E 'kw_0001|kw_0064' in_kw_data > "out_cdis_$t" 2>&1
+  compare exp_cdis "out_cdis_$t" || fail=1
+done
+
+# Custom group separator and no group separator
+GREP_THREADS=1 grep -C 1 --group-separator='====' -E 'kw_0001|kw_0064' in_kw_data > exp_csep 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -C 1 --group-separator='====' -E 'kw_0001|kw_0064' in_kw_data > "out_csep_$t" 2>&1
+  compare exp_csep "out_csep_$t" || fail=1
+done
+
+GREP_THREADS=1 grep -C 1 --no-group-separator -E 'kw_0001|kw_0064' in_kw_data > exp_cnosep 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -C 1 --no-group-separator -E 'kw_0001|kw_0064' in_kw_data > "out_cnosep_$t" 2>&1
+  compare exp_cnosep "out_cnosep_$t" || fail=1
+done
+
+# =========================================================================
+# 8. Max count (-m) boundaries
+# =========================================================================
+# -m 0 exits 1 with no output
+GREP_THREADS=1 grep -m 0 'kw_0001' in_kw_data > out_m0 2>&1
+test $? -eq 1 || fail=1
+test ! -s out_m0 || fail=1
+
+# -m 1 with count -c
+GREP_THREADS=1 grep -m 1 -c 'line' in_kw_data > exp_m1c 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -m 1 -c 'line' in_kw_data > "out_m1c_$t" 2>&1
+  compare exp_m1c "out_m1c_$t" || fail=1
+done
+
+# -m 1 with only-matching -o
+GREP_THREADS=1 grep -m 1 -o 'kw_[0-9]+' in_kw_data > exp_m1o 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -m 1 -o 'kw_[0-9]+' in_kw_data > "out_m1o_$t" 2>&1
+  compare exp_m1o "out_m1o_$t" || fail=1
+done
+
+# -m 1 with invert-match -v
+GREP_THREADS=1 grep -m 1 -v 'kw_0001' in_kw_data > exp_m1v 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -m 1 -v 'kw_0001' in_kw_data > "out_m1v_$t" 2>&1
+  compare exp_m1v "out_m1v_$t" || fail=1
+done
+
+# =========================================================================
+# 9. Multi-file & directory traversal boundaries
+# =========================================================================
+mkdir -p dir_deep/a/b/c/d/e/f/g/h/i/j || framework_failure_
+echo 'deep_target_token' > dir_deep/a/b/c/d/e/f/g/h/i/j/deep.txt || framework_failure_
+echo 'target_in_space' > 'dir_deep/file with space.txt' || framework_failure_
+
+# Multi-file mixed arguments (empty, nonl, regular, binary)
+GREP_THREADS=1 grep 'target' in_empty in_nonl in_kw_data in_bin_mid > exp_multi 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep 'target' in_empty in_nonl in_kw_data in_bin_mid > "out_multi_$t" 2>&1
+  compare exp_multi "out_multi_$t" || fail=1
+done
+
+# Recursive deep search
+GREP_THREADS=1 grep -r 'deep_target_token' dir_deep > exp_deep 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -r 'deep_target_token' dir_deep > "out_deep_$t" 2>&1
+  compare exp_deep "out_deep_$t" || fail=1
+done
+
+# Search file with space in name
+GREP_THREADS=1 grep 'target_in_space' 'dir_deep/file with space.txt' > exp_sp 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep 'target_in_space' 'dir_deep/file with space.txt' > "out_sp_$t" 2>&1
+  compare exp_sp "out_sp_$t" || fail=1
+done
+
+# Wildcard inclusions and exclusions
+GREP_THREADS=1 grep -r --include='*.txt' 'target' dir_deep > exp_inc 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -r --include='*.txt' 'target' dir_deep > "out_inc_$t" 2>&1
+  compare exp_inc "out_inc_$t" || fail=1
+done
+
+GREP_THREADS=1 grep -r --exclude='*.txt' 'target' dir_deep > exp_exc 2>&1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -r --exclude='*.txt' 'target' dir_deep > "out_exc_$t" 2>&1
+  compare exp_exc "out_exc_$t" || fail=1
+done
+
+# =========================================================================
+# 10. STDIN and pipe stream boundaries
+# =========================================================================
+# Empty stdin
+printf '' | GREP_THREADS=1 grep 'target' > exp_sin_emp 2>&1
+test $? -eq 1 || fail=1
+test ! -s exp_sin_emp || fail=1
+
+for t in 2 4 8; do
+  printf '' | GREP_THREADS=$t grep 'target' > "out_sin_emp_$t" 2>&1
+  test $? -eq 1 || fail=1
+  compare exp_sin_emp "out_sin_emp_$t" || fail=1
+done
+
+# STDIN without trailing newline
+printf 'pipe_nonl_target' | GREP_THREADS=1 grep 'pipe_nonl_target' > exp_sin_nonl 2>&1
+for t in 2 4 8; do
+  printf 'pipe_nonl_target' | GREP_THREADS=$t grep 'pipe_nonl_target' > "out_sin_nonl_$t" 2>&1
+  compare exp_sin_nonl "out_sin_nonl_$t" || fail=1
+done
+
+# STDIN null data (-z)
+printf 'rec1\0rec2_pipe_target\0rec3\0' | GREP_THREADS=1 grep -z 'rec2_pipe_target' > exp_sin_z 2>&1
+for t in 2 4 8; do
+  printf 'rec1\0rec2_pipe_target\0rec3\0' | GREP_THREADS=$t grep -z 'rec2_pipe_target' > "out_sin_z_$t" 2>&1
+  compare exp_sin_z "out_sin_z_$t" || fail=1
+done
+
+# STDIN -m 1 count
+printf 'line1\nline2\nline3\n' | GREP_THREADS=1 grep -m 1 -c 'line' > exp_sin_m1c 2>&1
+for t in 2 4 8; do
+  printf 'line1\nline2\nline3\n' | GREP_THREADS=$t grep -m 1 -c 'line' > "out_sin_m1c_$t" 2>&1
+  compare exp_sin_m1c "out_sin_m1c_$t" || fail=1
+done
+
+Exit $fail

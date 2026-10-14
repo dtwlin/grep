@@ -144,6 +144,7 @@ TESTS =						\
   multiple-begin-or-end-line			\
   null-byte					\
   options					\
+  parallel-boundary-cases			\
   parallel-chunked-mmap				\
   parallel-coverage-edge-cases			\
   parallel-env-limits				\
