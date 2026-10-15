@@ -147,6 +147,7 @@ TESTS =						\
   parallel-boundary-cases			\
   parallel-chunked-mmap				\
   parallel-cli-flags				\
+  parallel-coverage-complete			\
   parallel-coverage-edge-cases			\
   parallel-env-limits				\
   parallel-kwset-ac				\

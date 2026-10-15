@@ -477,10 +477,12 @@ static const struct color_cap color_dict[] =
 
 /* Saved errno value from failed output functions on stdout.
    prline polls this to decide whether to die.
-   Setting it to nonzero just before exiting can prevent clean_up_stdout
+   Setting skip_clean_up_stdout before exiting can prevent clean_up_stdout
    from misbehaving on a buggy OS where 'close (STDOUT_FILENO)' fails
    with EACCES.  */
 static int stdout_errno;
+static _Atomic bool skip_clean_up_stdout;
+static _Atomic bool write_error_dying;
 
 struct membuf
 {
@@ -990,8 +992,18 @@ suppressible_error (int errnum)
 static void
 clean_up_stdout (void)
 {
-  if (! stdout_errno)
+  if (! stdout_errno && ! atomic_load (&skip_clean_up_stdout))
     close_stdout ();
+}
+
+static _Noreturn void
+die_write_error (void)
+{
+  atomic_store (&skip_clean_up_stdout, true);
+  if (atomic_exchange (&write_error_dying, true))
+    for (;;)
+      pause ();
+  die (EXIT_TROUBLE, stdout_errno, _("write error"));
 }
 
 /* A cast to TYPE of VAL.  Use this when TYPE is a pointer type, VAL
@@ -1889,8 +1901,8 @@ prline (char *beg, char *lim, char sep)
   if (line_buffered)
     fflush_errno ();
 
-  if (stdout_errno)
-    die (EXIT_TROUBLE, stdout_errno, _("write error"));
+  if (!buffering_enabled && stdout_errno)
+    die_write_error ();
 
   lastout = lim;
 }
@@ -2044,7 +2056,7 @@ grepbuf (char *beg, char const *lim)
                 {
                   if (!buffering_enabled)
                     {
-                      stdout_errno = -1;
+                      atomic_store (&skip_clean_up_stdout, true);
                       exit (EXIT_SUCCESS);
                     }
                   break;
@@ -2161,7 +2173,7 @@ grep (int fd, struct stat *st, bool *ineof)
                   task_had_prtext = true;
                   if (exit_on_match && !buffering_enabled)
                     {
-                      stdout_errno = -1;
+                      atomic_store (&skip_clean_up_stdout, true);
                       exit (EXIT_SUCCESS);
                     }
                 }
@@ -2266,7 +2278,7 @@ grep (int fd, struct stat *st, bool *ineof)
                       task_had_prtext = true;
                       if (exit_on_match && !buffering_enabled)
                         {
-                          stdout_errno = -1;
+                          atomic_store (&skip_clean_up_stdout, true);
                           exit (EXIT_SUCCESS);
                         }
                     }
@@ -3991,7 +4003,7 @@ rob_try_commit_locked (void)
         fflush_errno ();
 
       if (stdout_errno)
-        die (EXIT_TROUBLE, stdout_errno, _("write error"));
+        die_write_error ();
 
       overall_status &= slot->status;
       if (slot->errseen)
@@ -4041,6 +4053,9 @@ rob_try_commit_locked (void)
         {
           if (line_buffered)
             fflush_errno ();
+          if (stdout_errno)
+            die_write_error ();
+          atomic_store (&skip_clean_up_stdout, true);
           exit (EXIT_SUCCESS);
         }
     }
@@ -5278,7 +5293,7 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
               ptrdiff_t off = execute (compiled_pattern, prebuf + 1, lim - (prebuf + 1), &msize, nullptr);
               if (off >= 0)
                 {
-                  stdout_errno = -1;
+                  atomic_store (&skip_clean_up_stdout, true);
                   exit (EXIT_SUCCESS);
                 }
             }
@@ -7277,13 +7292,13 @@ walk_commit_ent (struct walk_ent *e)
   else if (sep)
     print_group_separator ();
   if (stdout_errno)
-    die (EXIT_TROUBLE, stdout_errno, _("write error"));
+    die_write_error ();
   overall_status &= e->status;
   if (e->errseen)
     errseen = true;
   if (exit_on_match && !e->status)
     {
-      stdout_errno = -1;
+      atomic_store (&skip_clean_up_stdout, true);
       exit (EXIT_SUCCESS);
     }
 }

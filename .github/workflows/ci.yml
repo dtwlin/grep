@@ -88,7 +88,7 @@ jobs:
             exit 1
           }
 
-      - name: Run 176-check edge-case conformance, tree traversal & multi-pattern fuzzing
+      - name: Run 200-check edge-case conformance, tree traversal & multi-pattern fuzzing
         if: matrix.variant == 'avx2'
         run: |
           python3 benchmarks/run_benchmarks.py --conformance-only
@@ -169,7 +169,7 @@ jobs:
           TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
         run: |
           make check -C tests -j"$(nproc)" \
-            TESTS="parallel-tree-walk parallel-chunked-mmap parallel-stream-stdin parallel-kwset-ac parallel-pcre-must parallel-env-limits parallel-coverage-edge-cases parallel-boundary-cases parallel-multithread-cases parallel-stress-test parallel-cli-flags" || {
+            TESTS="parallel-tree-walk parallel-chunked-mmap parallel-stream-stdin parallel-kwset-ac parallel-pcre-must parallel-env-limits parallel-coverage-edge-cases parallel-boundary-cases parallel-multithread-cases parallel-stress-test parallel-cli-flags parallel-coverage-complete" || {
             cat tests/test-suite.log
             exit 1
           }
@@ -264,7 +264,7 @@ jobs:
       - name: Run parallel test suite
         run: |
           make check -C tests -j"$(sysctl -n hw.ncpu)" \
-            TESTS="parallel-tree-walk parallel-chunked-mmap parallel-stream-stdin parallel-kwset-ac parallel-pcre-must parallel-env-limits parallel-coverage-edge-cases parallel-boundary-cases parallel-multithread-cases parallel-stress-test" || {
+            TESTS="parallel-tree-walk parallel-chunked-mmap parallel-stream-stdin parallel-kwset-ac parallel-pcre-must parallel-env-limits parallel-coverage-edge-cases parallel-boundary-cases parallel-multithread-cases parallel-stress-test parallel-cli-flags parallel-coverage-complete" || {
             cat tests/test-suite.log
             exit 1
           }

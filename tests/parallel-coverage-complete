@@ -1,0 +1,492 @@
+#! /bin/sh
+# Comprehensive coverage test for all search engines, pre-filters, CLI options,
+# exact-stdout deferral, stream slicer, and chunked mmap parallel paths.
+#
+# Copyright (C) 2026 David Lin <dtwlin@gmail.com>
+#
+# Copying and distribution of this file, with or without modification,
+# are permitted in any medium without royalty provided the copyright
+# notice and this notice are preserved.
+
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+
+fail=0
+
+# Helper: compare GREP_THREADS=1 against GREP_THREADS=2,4 for stdout, stderr, and exit code.
+check_threads ()
+{
+  tag=$1
+  shift
+  GREP_THREADS=1 "$@" > "exp_$tag" 2> "experr_$tag"
+  rc_exp=$?
+  for t in 2 4; do
+    GREP_THREADS=$t "$@" > "out_${tag}_$t" 2> "outerr_${tag}_$t"
+    rc_got=$?
+    test "$rc_got" -eq "$rc_exp" || { fail=1; echo "rc mismatch: $tag t=$t ($rc_got vs $rc_exp)" >&2; }
+    compare "exp_$tag" "out_${tag}_$t" || fail=1
+    compare "experr_$tag" "outerr_${tag}_$t" || fail=1
+  done
+}
+
+# Detect UTF-8 and non-UTF-8 multibyte locales if installed
+u8_loc=""
+if test "${LOCALE_FR_UTF8:-none}" != "none"; then
+  u8_loc="$LOCALE_FR_UTF8"
+elif locale -a 2>/dev/null | grep -E '^en_US\.(utf8|UTF-8)$' >/dev/null 2>&1; then
+  u8_loc="en_US.UTF-8"
+elif locale -a 2>/dev/null | grep -E '^C\.(utf8|UTF-8)$' >/dev/null 2>&1; then
+  u8_loc="C.UTF-8"
+fi
+
+gb_loc=""
+for cand in zh_CN.gb18030 zh_CN.GB18030 zh_CN.gbk zh_CN.GBK; do
+  if locale -a 2>/dev/null | grep -F -x "$cand" >/dev/null 2>&1; then
+    gb_loc="$cand"
+    break
+  fi
+done
+
+# -------------------------------------------------------------------------
+# 1. searchutils.c & kwsearch.c: Multibyte, Word-Boundary & UTF-8 Quirk Paths
+# -------------------------------------------------------------------------
+# 1a. Non-UTF-8 multibyte (GB18030): invalid multibyte before match (mb_goback clen < 0)
+# and trail-byte false match (\x81\x41 where 0x41 is 'A').
+if test -n "$gb_loc"; then
+  printf '\377ABC\n' > gb_invalid.txt || framework_failure_
+  LC_ALL="$gb_loc" grep -a -F ABC gb_invalid.txt > out_gb_inv || fail=1
+  compare gb_invalid.txt out_gb_inv || fail=1
+
+  # \201A is a single 2-byte GB18030 char; only the second 'A' is a real 'A'.
+  printf '\201AA\n\201AB\n' > gb_trail.txt || framework_failure_
+  printf '\201AA\n' > exp_gb_trail || framework_failure_
+  LC_ALL="$gb_loc" grep -F A gb_trail.txt > out_gb_trail || fail=1
+  compare exp_gb_trail out_gb_trail || fail=1
+
+  # EGexecute exact_kwset_match in non-UTF-8 multibyte locale on line 2 (mb_start < beg)
+  printf 'line1_no_match\nABC_on_line2\n' > gb_eg.txt || framework_failure_
+  printf 'ABC_on_line2\n' > exp_gb_eg || framework_failure_
+  LC_ALL="$gb_loc" grep -E '^ABC' gb_eg.txt > out_gb_eg || fail=1
+  compare exp_gb_eg out_gb_eg || fail=1
+
+  if (grep -P --version) >/dev/null 2>&1; then
+    returns_ 2 env LC_ALL="$gb_loc" grep -P abc gb_eg.txt >/dev/null 2>&1 || fail=1
+  fi
+fi
+
+# 1b. UTF-8 wordchars_count hitting a valid multibyte non-word char (em-dash \342\200\224),
+# Fexecute_core shorter keyword fallback (-F -w -e foo -e foo-bar on foo-barbaz),
+# and Fexecute_with_utf8_quirk / find_utf8_icase_quirk (both <32B, >64B, >1024B lines).
+if test -n "$u8_loc"; then
+  printf 'foob\342\200\224foo\n' > u8_word.txt || framework_failure_
+  LC_ALL="$u8_loc" grep -F -w foo u8_word.txt > out_u8_word || fail=1
+  compare u8_word.txt out_u8_word || fail=1
+
+  printf 'foo-barbaz\n' > u8_shorter.txt || framework_failure_
+  LC_ALL="$u8_loc" grep -F -w -e foo -e foo-bar u8_shorter.txt > out_u8_shorter || fail=1
+  compare u8_shorter.txt out_u8_shorter || fail=1
+
+  printf 'foo\n' > exp_u8_shorter_o || framework_failure_
+  LC_ALL="$u8_loc" grep -F -w -o -e foo -e foo-bar u8_shorter.txt > out_u8_shorter_o || fail=1
+  compare exp_u8_shorter_o out_u8_shorter_o || fail=1
+
+  # Multi-line buffer: line 1 has dotless-i (no match), line 2 has ASCII match before line 3 quirk
+  printf 'no_match_\304\261_line1\nplain_ascii_isi_match_line2\ntrailing_\304\261_line3\n' > u8_quirk_ml.txt || framework_failure_
+  printf 'plain_ascii_isi_match_line2\n' > exp_u8_quirk_ml || framework_failure_
+  LC_ALL="$u8_loc" grep -F -i isi u8_quirk_ml.txt > out_u8_quirk_ml || fail=1
+  compare exp_u8_quirk_ml out_u8_quirk_ml || fail=1
+
+  # Multi-line buffer: line 1 has quirk (no match), line 2 has no quirk and no match (returns -1)
+  printf 'no_match_\304\261_line1\nplain_ascii_nomatch_line2\n' > u8_quirk_none.txt || framework_failure_
+  returns_ 1 env LC_ALL="$u8_loc" grep -F -i isi u8_quirk_none.txt >/dev/null || fail=1
+
+  # AVX2 (>32B) and heap-allocated (>1024B) lines containing both dotless-i (\304\261) and long-s (\305\277)
+  awk 'BEGIN {
+    pad = ""
+    for (i = 0; i < 60; i++) pad = pad "xxxxxxxxxxxxxxxxxxxx"
+    printf "%s_no_match_\304\261_\305\277_%s\n", pad, pad
+    printf "%s_match_i\305\277\304\261_target_%s\n", pad, pad
+  }' > u8_quirk_long.txt || framework_failure_
+  LC_ALL="$u8_loc" grep -F -i isi u8_quirk_long.txt > out_u8_quirk_long || fail=1
+  test "$(wc -l < out_u8_quirk_long)" -eq 1 || fail=1
+
+  # Multiple -o matches on a single line containing a quirk byte (start_ptr > line_beg)
+  printf 'xx_\304\261s\304\261_mid_i\305\277i_end\n' > u8_quirk_multi_o.txt || framework_failure_
+  printf '\304\261s\304\261\ni\305\277i\n' > exp_u8_quirk_multi_o || framework_failure_
+  LC_ALL="$u8_loc" grep -F -i -o isi u8_quirk_multi_o.txt > out_u8_quirk_multi_o || fail=1
+  compare exp_u8_quirk_multi_o out_u8_quirk_multi_o || fail=1
+fi
+
+# -------------------------------------------------------------------------
+# 2. pcresearch.c: Execution Limits & find_must_literal Parser Coverage
+# -------------------------------------------------------------------------
+if (grep -P --version) >/dev/null 2>&1; then
+  # PCRE2_ERROR_MATCHLIMIT, PCRE2_ERROR_RECURSELOOP, PCRE2_ERROR_HEAPLIMIT
+  printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab\n' > pcre_lim.txt || framework_failure_
+  returns_ 2 grep -P '(*NO_JIT)(*LIMIT_MATCH=3)((a+)*)+$' pcre_lim.txt >/dev/null 2>&1 || fail=1
+  returns_ 2 grep -P '(*NO_JIT)((?1))' pcre_lim.txt >/dev/null 2>&1 || fail=1
+  returns_ 2 grep -P '(*NO_JIT)(*LIMIT_HEAP=1)((a+)*)+$' pcre_lim.txt >/dev/null 2>&1 || fail=1
+
+  # Octal escapes \o{...}, \101, backref \1, leading-] character classes, nested groups/verbs/quantifiers
+  printf 'Abcde\n]bcde\nxbcde\nabbcde\nabcde\nabbbcde\n' > pcre_must.txt || framework_failure_
+  grep -P '\o{101}bcde' pcre_must.txt >/dev/null || fail=1
+  grep -P '\101bcde' pcre_must.txt >/dev/null || fail=1
+  grep -P '(a)\1bcde' pcre_must.txt >/dev/null && fail=1
+  grep -P '[]a]bcde' pcre_must.txt >/dev/null || fail=1
+  grep -P '[^]a]bcde' pcre_must.txt >/dev/null || fail=1
+  grep -P '((a(*ACCEPT)))bcde' pcre_must.txt >/dev/null || fail=1
+  grep -P '((?:ab))bcde' pcre_must.txt >/dev/null || fail=1
+  grep -P '((?<=ab))bcde' pcre_must.txt >/dev/null || fail=1
+  grep -P '((?!xy))bcde' pcre_must.txt >/dev/null || fail=1
+  grep -P '(ab){1,2}bcde' pcre_must.txt >/dev/null || fail=1
+  grep -P 'ab{2,3}cde' pcre_must.txt >/dev/null || fail=1
+fi
+
+# -------------------------------------------------------------------------
+# 3. dfasearch.c: kwsmusts_multi & analyze_backref_filter / backref_line_can_match
+# -------------------------------------------------------------------------
+cat <<'EOF' > dfa_in.txt || framework_failure_
+alpha
+beta123
+lit19
+re2099
+foo5xyz
+]quvnt
+xquvnt
+foocxyz
+foo.xyz
+quv..mnt
+foo*xyz
+quv**mnt
+foowordxyz
+quv+mnt
+fooxyz
+quv99mnt
+q9
+]]]]]]
+abcabc
+abc--abd--abc--abc
+abc\
+aabba
+foo-barbaz
+EOF
+
+# Mixed exact + regex alternation with disjoint character sets (branch 0 exact, branch 1 non-exact)
+check_threads dfa_mix_exact grep -E 'fooxyz|quv[0-9]+' dfa_in.txt
+
+# 17 alternation branches (16 '|' separators, hitting nbranches == branch_cap at final branch) and 20 branches
+check_threads dfa_17_branches grep -E \
+  'aa|bb|cc|dd|ee|ff|gg|hh|ii|jj|kk|ll|mm|nn|oo|pp|qq[0-9]+' \
+  dfa_in.txt
+check_threads dfa_20_branches grep -E \
+  'aa|bb|cc|dd|ee|ff|gg|hh|ii|jj|kk|ll|mm|nn|oo|pp|qq|rr|ss|tt[0-9]+' \
+  dfa_in.txt
+
+# Disjoint-character branches exercising every branch parser construct in kwsmusts_multi
+check_threads dfa_brackets grep -E 'foo[[:digit:]]+xyz|[]m]quvnt' dfa_in.txt
+check_threads dfa_neg_brk grep -E 'foo[[:digit:]]+xyz|[^]m]quvnt' dfa_in.txt
+check_threads dfa_ere_grp grep -E 'foo(c|d\.e)xyz|quv[0-9]+' dfa_in.txt
+check_threads dfa_bre_grp grep 'foo\(c\|d\)xyz\|quv[0-9]\+' dfa_in.txt
+check_threads dfa_ere_esc grep -E 'foo\.xyz|quv\.+mnt' dfa_in.txt
+check_threads dfa_bre_esc grep 'foo\*xyz\|quv\**mnt' dfa_in.txt
+check_threads dfa_word_esc grep -E 'foo\w+xyz|quv\bmnt' dfa_in.txt
+check_threads dfa_bre_qesc grep 'foo\+xyz\|quv\?mnt' dfa_in.txt
+check_threads dfa_bre_meta grep '^fooxyz\|quv.*mnt' dfa_in.txt
+check_threads dfa_short_fb grep -E 'fooxyz|q[0-9]+' dfa_in.txt
+
+# possible_backrefs_in_pattern trailing '\\', regex_compile error with -e and -f,
+# safe_dfaexec >4KiB line with begline, EGexecute match > best_match and shorter_len > 0
+check_threads dfa_trail_bs grep 'abc\\' dfa_in.txt
+returns_ 2 grep -E -e '[z-a]' dfa_in.txt >/dev/null 2>&1 || fail=1
+printf '[z-a]\n' > bad_pat.txt || framework_failure_
+returns_ 2 grep -E -f bad_pat.txt dfa_in.txt >/dev/null 2>&1 || fail=1
+
+awk 'BEGIN {
+  printf "foo"
+  for (i = 0; i < 500; i++) printf "0123456789"
+  printf "bar\n"
+}' > long_begline.txt || framework_failure_
+check_threads dfa_long_begline grep -E '^foo.*bar' long_begline.txt
+
+check_threads dfa_multi_bref_o grep -E -o -e '(a)\1' -e '(b)\1' dfa_in.txt
+check_threads dfa_shorter_w_o grep -E -w -o 'foo(-bar)?' dfa_in.txt
+
+# Backref filter variations (ERE & BRE) and multi-char separator scanning
+check_threads bref_charclass grep -E '([]a]{3})\1' dfa_in.txt
+check_threads bref_bre_alt grep '\(abc\)\1\|alpha' dfa_in.txt
+check_threads bref_ere_nest grep -E '((abc))\1' dfa_in.txt
+check_threads bref_bre_nest grep '\(\(abc\)\)\1' dfa_in.txt
+check_threads bref_word_bdy grep -E '(\<abc\>)\1' dfa_in.txt
+check_threads bref_buf_bdy grep -E '(\`abc\'\'')\1' dfa_in.txt
+check_threads bref_quant_star grep -E '(ab*c)\1' dfa_in.txt
+check_threads bref_quant_plus grep -E '(ab+c)\1' dfa_in.txt
+check_threads bref_quant_qmark grep -E '(ab?c)\1' dfa_in.txt
+check_threads bref_quant_range grep -E '(a{2,12})\1' dfa_in.txt
+check_threads bref_quant_big grep -E '(a{3000})\1' dfa_in.txt
+check_threads bref_bre_qstar grep '\(ab*c\)\1' dfa_in.txt
+check_threads bref_bre_qplus grep '\(ab\+c\)\1' dfa_in.txt
+check_threads bref_bre_qqmark grep '\(ab\?c\)\1' dfa_in.txt
+check_threads bref_bre_qrange grep '\(a\{2,12\}\)\1' dfa_in.txt
+check_threads bref_bre_qbig grep '\(a\{3000\}\)\1' dfa_in.txt
+check_threads bref_bre_qbad grep '\(a\{10,x\}\)\1' dfa_in.txt
+check_threads bref_bre_after1 grep '\(abc\)\1*' dfa_in.txt
+check_threads bref_multisep grep -E '(abc)--\1' dfa_in.txt
+
+# -------------------------------------------------------------------------
+# 4. grep.c: CLI Option Errors, fgrep_to_grep_pattern & try_fgrep_pattern
+# -------------------------------------------------------------------------
+returns_ 2 grep -E -F alpha dfa_in.txt >/dev/null 2>&1 || fail=1
+returns_ 2 grep -X unknown_matcher alpha dfa_in.txt >/dev/null 2>&1 || fail=1
+returns_ 2 grep -999999999999999999999999999999 alpha dfa_in.txt >/dev/null 2>&1 || fail=1
+returns_ 2 grep -D unknown_dev_action alpha dfa_in.txt >/dev/null 2>&1 || fail=1
+returns_ 2 grep --binary-files=unknown_mode alpha dfa_in.txt >/dev/null 2>&1 || fail=1
+returns_ 2 grep -f no_such_pattern_file.txt dfa_in.txt >/dev/null 2>&1 || fail=1
+
+grep -00001 alpha dfa_in.txt >/dev/null || fail=1
+grep --binary-files=without-match alpha dfa_in.txt >/dev/null || fail=1
+grep --binary-files=binary alpha dfa_in.txt >/dev/null || fail=1
+grep --binary-files=text alpha dfa_in.txt >/dev/null || fail=1
+for col in never no none auto tty if-tty always yes force; do
+  grep "--color=$col" alpha dfa_in.txt >/dev/null || fail=1
+done
+grep --color alpha dfa_in.txt >/dev/null || fail=1
+grep --color=invalid_color_mode alpha dfa_in.txt >/dev/null || fail=1
+
+# fgrep_to_grep_pattern escaping $, *, ., [, \, ^ in LC_ALL=C -F -w when a partial word match precedes a match
+printf 'xa$b*c.d[e\\f^gy a$b*c.d[e\\f^g\n' > fgrep_esc.txt || framework_failure_
+LC_ALL=C grep -F -w 'a$b*c.d[e\f^g' fgrep_esc.txt > out_fgrep_esc || fail=1
+compare fgrep_esc.txt out_fgrep_esc || fail=1
+
+# try_fgrep_pattern in BRE with literal (, +, ?, { and empty alternation branches
+printf 'a(b+c?d{e\n' > bre_lit.txt || framework_failure_
+grep 'a(b+c?d{e' bre_lit.txt > out_bre_lit || fail=1
+compare bre_lit.txt out_bre_lit || fail=1
+grep '\|alpha' dfa_in.txt >/dev/null || fail=1
+grep 'alpha\|' dfa_in.txt >/dev/null || fail=1
+
+# -------------------------------------------------------------------------
+# 5. grep.c: exact_stdout Deferred Self-File Search & Large Write Tracking
+# -------------------------------------------------------------------------
+# Create a file with a single > 70 KiB matching line (exceeding BIG_WRITE_MIN = 64 KiB)
+awk 'BEGIN {
+  printf "EXACT_STDOUT_TOKEN_"
+  for (i = 1; i <= 7200; i++)
+    printf "0123456789"
+  printf "\n"
+}' > big_match.txt || framework_failure_
+
+# 5a. ROB deferred self-file
+for t in 1 2 4; do
+  printf 'EXACT_STDOUT_TOKEN initial line\n' > self_rob.txt || framework_failure_
+  GREP_THREADS=$t grep -m 1 EXACT_STDOUT_TOKEN self_rob.txt big_match.txt >> self_rob.txt || fail=1
+  cp self_rob.txt "self_rob_$t.txt" || framework_failure_
+done
+compare self_rob_1.txt self_rob_2.txt || fail=1
+compare self_rob_1.txt self_rob_4.txt || fail=1
+
+# 5b. Walk deferred self-file (-r over a directory containing 01_big.txt with a >64 KiB single line + 02_out.txt)
+for t in 1 2 4; do
+  rm -rf defer_dir && mkdir -p defer_dir || framework_failure_
+  cp big_match.txt defer_dir/01_big.txt || framework_failure_
+  printf 'EXACT_STDOUT_TOKEN in deferred output\n' > defer_dir/02_out.txt || framework_failure_
+  GREP_THREADS=$t grep -r -m 1 EXACT_STDOUT_TOKEN defer_dir >> defer_dir/02_out.txt || fail=1
+  cp defer_dir/02_out.txt "walk_defer_$t.txt" || framework_failure_
+done
+compare walk_defer_1.txt walk_defer_2.txt || fail=1
+compare walk_defer_1.txt walk_defer_4.txt || fail=1
+
+# -------------------------------------------------------------------------
+# 6. grep.c: Parallel Stream Slicer (-n -v, -n offset, >64K residue, >4M no-EOL)
+# -------------------------------------------------------------------------
+# Build a > 4.5 MiB file to span >= 2 4-MiB stream chunks
+awk 'BEGIN {
+  for (i = 1; i <= 62000; i++) {
+    if (i == 10 || i == 58000)
+      printf "line %05d: STREAM_MATCH_TOK payload for stream slicer chunking %d\n", i, i
+    else
+      printf "line %05d: ordinary stream filler line for parallel pipe test %d\n", i, i
+  }
+}' > stream_4m.txt || framework_failure_
+
+for t in 1 2 4; do
+  cat stream_4m.txt | GREP_THREADS=$t grep -n STREAM_MATCH_TOK > "out_stm_n_$t" || fail=1
+  cat stream_4m.txt | GREP_THREADS=$t grep -n -v ordinary > "out_stm_nv_$t" || fail=1
+done
+compare out_stm_n_1 out_stm_n_2 || fail=1
+compare out_stm_n_1 out_stm_n_4 || fail=1
+compare out_stm_nv_1 out_stm_nv_2 || fail=1
+compare out_stm_nv_1 out_stm_nv_4 || fail=1
+
+# Stream slicer with a > 100 KiB line crossing the 4 MiB boundary (next_residue > residue_cap)
+awk 'BEGIN {
+  for (i = 1; i <= 52300; i++)
+    printf "line %05d: filler_padding_to_reach_just_under_4mib_boundary_0123456789\n", i
+  printf "HUGE_CROSSING_LINE:"
+  for (j = 1; j <= 12000; j++)
+    printf "0123456789"
+  printf ":STREAM_HUGE_MATCH\n"
+  for (i = 1; i <= 2000; i++)
+    printf "tail %05d: after_huge_line_filler\n", i
+}' > stream_huge_res.txt || framework_failure_
+
+for t in 1 2 4; do
+  cat stream_huge_res.txt | GREP_THREADS=$t grep -c STREAM_HUGE_MATCH > "out_stm_res_$t" || fail=1
+done
+compare out_stm_res_1 out_stm_res_2 || fail=1
+compare out_stm_res_1 out_stm_res_4 || fail=1
+
+# Stream slicer with a > 4.2 MiB unbroken line without any newline (!last_eol)
+awk 'BEGIN {
+  for (i = 1; i <= 430000; i++)
+    printf "0123456789"
+  printf "NO_EOL_4M_MATCH\n"
+}' > stream_no_eol.txt || framework_failure_
+
+for t in 1 2 4; do
+  cat stream_no_eol.txt | GREP_THREADS=$t grep -c NO_EOL_4M_MATCH > "out_stm_noeol_$t" || fail=1
+done
+compare out_stm_noeol_1 out_stm_noeol_2 || fail=1
+compare out_stm_noeol_1 out_stm_noeol_4 || fail=1
+
+# -------------------------------------------------------------------------
+# 7. grep.c: Chunked Mmap (-q 64K pread, self-out, NUL after 64K, >4096 matches)
+# -------------------------------------------------------------------------
+# 7a. -q on >= 2 MiB file with match in first 64 KiB (synchronous pread fast path before pool startup)
+GREP_THREADS=4 grep -q STREAM_MATCH_TOK stream_4m.txt || fail=1
+
+# 7b. >= 2 MiB input file is also the output file (chunked_grep_fd self-output check -> exit 2)
+cp stream_4m.txt self_chunk.txt || framework_failure_
+returns_ 2 env GREP_THREADS=4 grep ordinary self_chunk.txt >> self_chunk.txt 2>/dev/null || fail=1
+rm -f self_chunk.txt || framework_failure_
+
+# 7c. >= 2.5 MiB file where a NUL byte appears at ~500 KiB (after the 64 KiB header probe),
+# triggering TASK_TYPE_MMAP_SCAN has_nul detection and chunk_sequential_to_rob fallback.
+awk 'BEGIN {
+  for (i = 1; i <= 35000; i++) {
+    if (i == 8000)
+      printf "line %05d: LATE_NUL_MATCH with embedded\0nul byte\n", i
+    else if (i == 30000)
+      printf "line %05d: LATE_NUL_MATCH clean line after nul\n", i
+    else
+      printf "line %05d: normal ascii text line for late nul test %d\n", i, i
+  }
+}' > late_nul.bin || framework_failure_
+
+check_threads late_nul_bin grep LATE_NUL_MATCH late_nul.bin
+check_threads late_nul_n grep -n LATE_NUL_MATCH late_nul.bin
+check_threads late_nul_I grep -I LATE_NUL_MATCH late_nul.bin
+check_threads late_nul_q grep -I -q LATE_NUL_MATCH late_nul.bin
+
+# 7d. >= 4.2 MiB file where chunk 0 has > 5,000 matches (triggering Mode 3A match_overflow
+# for -n) while chunk 1 has 0 matches, plus a > 2.2 MiB file with 68,000 matches for -C 1 realloc.
+awk 'BEGIN {
+  for (i = 1; i <= 60000; i++) {
+    if (i <= 6000)
+      printf "line %05d: DENSE_CHUNK0_MATCH item %d\n", i, i
+    else
+      printf "line %05d: sparse filler in second chunk without token %d\n", i, i
+  }
+}' > dense_chunk0.txt || framework_failure_
+
+check_threads dense_mode3a_n grep -n DENSE_CHUNK0_MATCH dense_chunk0.txt
+
+awk 'BEGIN {
+  for (i = 1; i <= 68000; i++)
+    printf "M012345678901234567890123456789_%05d\n", i
+}' > dense_68k.txt || framework_failure_
+GREP_THREADS=4 grep -C 1 M0123456789 dense_68k.txt > out_dense_68k || fail=1
+test "$(wc -l < out_dense_68k)" -eq 68000 || fail=1
+rm -f dense_68k.txt out_dense_68k || framework_failure_
+
+# -------------------------------------------------------------------------
+# 8. grep.c: Directory Walk (trailing slashes, no-operand -r, >=16 MiB binary
+# packfile scan, dangling symlink -R, deep 24-level walk_before, FD pressure)
+# -------------------------------------------------------------------------
+mkdir -p walk_slash_dir/sub || framework_failure_
+printf 'SLASH_DIR_TOKEN here\n' > walk_slash_dir/sub/f.txt || framework_failure_
+check_threads walk_trailing_slash grep -r SLASH_DIR_TOKEN walk_slash_dir///
+(cd walk_slash_dir && GREP_THREADS=1 grep -r SLASH_DIR_TOKEN) > exp_walk_cwd || fail=1
+(cd walk_slash_dir && GREP_THREADS=4 grep -r SLASH_DIR_TOKEN) > out_walk_cwd || fail=1
+compare exp_walk_cwd out_walk_cwd || fail=1
+
+# 8b. >= 16 MiB binary file inside directory walked with -r -F (walk_bin_scan & walk_help_bin_job)
+mkdir -p bin_walk_dir || framework_failure_
+awk 'BEGIN {
+  printf "BIN_HDR\0with_nul\n"
+  s = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n"
+  for (i = 1; i <= 265000; i++) printf "%s", s
+  printf "WALK_BIN_16M_TARGET\n"
+}' > bin_walk_dir/pack.bin || framework_failure_
+check_threads walk_bin_16m grep -r -F WALK_BIN_16M_TARGET walk_slash_dir bin_walk_dir
+rm -rf bin_walk_dir || framework_failure_
+
+# 8c. Dangling symlink inside directory with -R (walk_ent_stat_error)
+ln -s no_such_target_file walk_slash_dir/sub/dangling_sym || framework_failure_
+returns_ 2 env GREP_THREADS=1 grep -R SLASH_DIR_TOKEN walk_slash_dir > exp_dangle 2> experr_dangle || fail=1
+returns_ 2 env GREP_THREADS=4 grep -R SLASH_DIR_TOKEN walk_slash_dir > out_dangle 2> outerr_dangle || fail=1
+compare exp_dangle out_dangle || fail=1
+compare experr_dangle outerr_dangle || fail=1
+rm -f walk_slash_dir/sub/dangling_sym || framework_failure_
+
+# 8d. 24-level deep directory with sibling branches + low ulimit -n (walk_before & walk_reopen_locked)
+deep_path="deep_root"
+for i in $(seq 1 23); do
+  deep_path="$deep_path/d$i"
+done
+mkdir -p "$deep_path/b1" "$deep_path/b2" || framework_failure_
+printf 'DEEP_MATCH_TOK b1\n' > "$deep_path/b1/f1.txt" || framework_failure_
+printf 'DEEP_MATCH_TOK b2\n' > "$deep_path/b2/f2.txt" || framework_failure_
+for i in $(seq 1 20); do
+  mkdir -p "deep_root/wide_$i/sub" || framework_failure_
+  printf 'DEEP_MATCH_TOK w%d\n' "$i" > "deep_root/wide_$i/sub/f.txt" || framework_failure_
+done
+check_threads deep_walk grep -r DEEP_MATCH_TOK deep_root
+if test -z "$ASAN_OPTIONS" && (ulimit -n 28) 2>/dev/null; then
+  (ulimit -n 28 && GREP_THREADS=2 grep -r DEEP_MATCH_TOK deep_root) > out_fd_press || fail=1
+  compare exp_deep_walk out_fd_press || fail=1
+fi
+rm -rf deep_root || framework_failure_
+
+# 8e. > 10,000 entries in a single directory (walk_sort, walk_ino_cmp, walk_inode_sort_useful)
+if command -v python3 >/dev/null 2>&1; then
+  python3 -c '
+import os
+os.makedirs("sort_10k_dir", exist_ok=True)
+base = "sort_10k_dir/f00000.txt"
+with open(base, "w") as f:
+    pass
+for i in range(1, 10005):
+    os.link(base, f"sort_10k_dir/f{i:05d}.txt")
+with open("sort_10k_dir/match_10k.txt", "w") as f:
+    f.write("SORT_10K_MATCH\n")
+' || framework_failure_
+  check_threads walk_sort_r grep -r -F SORT_10K_MATCH sort_10k_dir
+  check_threads walk_sort_R grep -R -F SORT_10K_MATCH sort_10k_dir
+  rm -rf sort_10k_dir || framework_failure_
+
+  # 9. lib/kwset.c: AVL Left-Right rotation (Cx, Ax, Bx), Teddy + scalar trie (<34B & >64B, gc1>=0 & gc1<0)
+  printf 'Bx\n' > kw_avl.txt || framework_failure_
+  grep -F -e Cx -e Ax -e Bx kw_avl.txt > out_kw_avl || fail=1
+  compare kw_avl.txt out_kw_avl || fail=1
+
+  printf 'xx_abcef_yy\n' > kw_short.txt || framework_failure_
+  grep -F -e abcd -e bcde -e bc_nomatch -e cef kw_short.txt >/dev/null || fail=1
+  grep -F -e abcd -e acde -e a_nomatch -e abcef kw_short.txt >/dev/null || fail=1
+
+  python3 -c '
+import random
+rng = random.Random(42)
+alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_-"
+with open("big_ac_pats.txt", "w") as f:
+    for i in range(2500):
+        s = "".join(rng.choice(alphabet) for _ in range(64))
+        f.write(s + "\n")
+    f.write("TARGET_AC_FALLBACK_PAT\n")
+with open("big_ac_in.txt", "w") as f:
+    f.write("prefix_filler_0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-\n")
+    f.write("line_with_TARGET_AC_FALLBACK_PAT_here\n")
+' || framework_failure_
+  check_threads kw_ac_fallback grep -F -f big_ac_pats.txt big_ac_in.txt
+  rm -f big_ac_pats.txt big_ac_in.txt kw_avl.txt out_kw_avl kw_short.txt || framework_failure_
+fi
+
+Exit $fail

@@ -314,20 +314,8 @@ Fexecute_core (void *vcp, char const *buf, idx_t size, idx_t *match_size,
               }
             if (!start_ptr && !localeinfo.multibyte)
               {
-                if (! kwsearch->re)
-                  {
-                    fgrep_to_grep_pattern (&kwsearch->pattern, &kwsearch->size);
-                    kwsearch->re = GEAcompile (kwsearch->pattern,
-                                               kwsearch->size,
-                                               RE_SYNTAX_GREP, !!start_ptr);
-                  }
-                if (beg + len < buf + size)
-                  {
-                    char const *nl = memchr (beg + len, eol, buf + size - (beg + len));
-                    end = nl ? nl + 1 : buf + size;
-                  }
-                else
-                  end = buf + size;
+                char const *nl = memchr (beg + len, eol, buf + size - (beg + len));
+                end = nl ? nl + 1 : buf + size;
 
                 if (0 <= EGexecute (kwsearch->re, beg, end - beg,
                                     match_size, nullptr))
@@ -463,15 +451,7 @@ Fexecute_with_utf8_quirk (struct kwsearch *kwsearch, char const *buf,
       norm[nlen] = (nl ? eol : 0);
       norm[nlen + 1] = 0;
 
-      char const *norm_start = nullptr;
-      if (start_ptr && start_ptr >= line_beg && start_ptr < line_end)
-        {
-          idx_t target_orig = start_ptr - line_beg;
-          idx_t j = 0;
-          while (j < nlen && orig_off[j] < target_orig)
-            j++;
-          norm_start = norm + j;
-        }
+      char const *norm_start = (start_ptr && line_beg == start_ptr) ? norm : nullptr;
 
       idx_t norm_msize = 0;
       ptrdiff_t norm_off = Fexecute_core (kwsearch, norm, nlen, &norm_msize, norm_start);

@@ -550,6 +550,20 @@ def run_edge_case_conformance():
     checks.append(("PCRE (*ACCEPT) must-literal", ["-P", "-c", "MT_CHUNK_1(*ACCEPT)NEVER_LITERAL", test_file], None, None))
     checks.append(("PCRE .{10,20} must-literal", ["-P", "-c", r".{10,20}MT_CHUNK_1", test_file], None, None))
 
+    # 30. Round 3 complete coverage edge cases (kwsmusts_multi, backref, PCRE, Fcompile)
+    checks.append(("DFA mixed exact+regex alt", ["-E", "-c", "MT_CHUNK_1|quv[0-9]+", test_file], None, None))
+    checks.append(("DFA 17-branch alternation", ["-E", "-c", "aa|bb|cc|dd|ee|ff|gg|hh|ii|jj|kk|ll|mm|nn|oo|pp|MT_CHUNK_[0-9]+", test_file], None, None))
+    checks.append(("DFA disjoint bracket alt", ["-E", "-c", "foo[[:digit:]]+xyz|[^]m]MT_CHUNK_1", test_file], None, None))
+    checks.append(("BRE disjoint group+quant alt", ["-c", r"foo\(c\|d\)xyz\|MT_CHUNK_[0-9]\+", test_file], None, None))
+    checks.append(("ERE multi-char sep backref", ["-E", "-c", r"(MT_CHUNK)--\1", test_file], None, None))
+    checks.append(("ERE multi-pattern -o", ["-E", "-o", "-e", "(MT)_CHUNK_1", "-e", "(CHUNK)_1", test_file], None, None))
+    checks.append(("ERE shorter -w -o fallback", ["-E", "-w", "-o", "MT_CHUNK(_1_EXTRA)?", test_file], None, None))
+    checks.append(("BRE literal ( + ? { pattern", ["-c", "a(b+c?d{e", test_file], None, None))
+    checks.append(("Fcompile -F -w regex escape", ["-F", "-w", "-c", r"a$b*c.d[e\f^g", test_file], {"LC_ALL": "C"}, None))
+    checks.append(("PCRE octal+bracket must-lit", ["-P", "-c", r"\o{115}T_CHUNK_[]1]", test_file], None, None))
+    checks.append(("PCRE nested group+lookbehind", ["-P", "-c", "((?:MT_))(?<=MT_)CHUNK_1", test_file], None, None))
+    checks.append(("Color never + binary without-match", ["--color=never", "--binary-files=without-match", "-n", "MT_CHUNK_1", test_file], None, None))
+
     passed = 0
     total = len(checks)
     for name, args, env_vars, preexec in checks:

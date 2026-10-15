@@ -358,14 +358,6 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
         {
           if (b_bracket)
             {
-              branch_is_pure = false;
-              if (cur_len > best_len)
-                {
-                  memcpy (best_lit, cur_lit, cur_len);
-                  best_len = cur_len;
-                }
-              cur_len = 0;
-
               if (*bp == '[' && bp + 1 < blim && (bp[1] == ':' || bp[1] == '=' || bp[1] == '.'))
                 {
                   char delim = bp[1];
@@ -423,13 +415,6 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
                 }
               if (*bp == ')')
                 {
-                  branch_is_pure = false;
-                  if (cur_len > best_len)
-                    {
-                      memcpy (best_lit, cur_lit, cur_len);
-                      best_len = cur_len;
-                    }
-                  cur_len = 0;
                   if (b_paren > 0)
                     b_paren--;
                   bp++;
@@ -455,13 +440,6 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
                 }
               if (*bp == '\\' && bp + 1 < blim && bp[1] == ')')
                 {
-                  branch_is_pure = false;
-                  if (cur_len > best_len)
-                    {
-                      memcpy (best_lit, cur_lit, cur_len);
-                      best_len = cur_len;
-                    }
-                  cur_len = 0;
                   if (b_paren > 0)
                     b_paren--;
                   bp += 2;
@@ -473,13 +451,6 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
 
           if (b_paren > 0)
             {
-              branch_is_pure = false;
-              if (cur_len > best_len)
-                {
-                  memcpy (best_lit, cur_lit, cur_len);
-                  best_len = cur_len;
-                }
-              cur_len = 0;
               if (*bp == '\\' && bp + 1 < blim)
                 bp += 2;
               else
@@ -1145,6 +1116,7 @@ regex_compile (struct dfa_comp *dc, char const *p, idx_t len,
       return true;
     }
 
+  regfree (&pat);
   free (pat.fastmap);
 
   /* Emit a filename:lineno: prefix for patterns taken from files.  */
@@ -1265,7 +1237,11 @@ GEAcompile (char *pattern, idx_t size, reg_syntax_t syntax_bits,
   while (p <= patlim);
 
   if (compilation_failed)
-    exit (EXIT_TROUBLE);
+    {
+      free (buf);
+      EGfree (dc);
+      exit (EXIT_TROUBLE);
+    }
 
   if (patlim < prev)
     buflen--;
