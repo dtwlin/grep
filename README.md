@@ -25,7 +25,7 @@
 - **🧵 Parallel by default.** Up to 32 threads search files, directories, and even a single huge file, yet results come out in exactly the order GNU grep prints them.
 - **🏎️ SIMD search engines.** AVX2 literal scanners, a dense Aho-Corasick automaton for big keyword sets, and literal pre-filters for PCRE2, backreferences, and 1,000-way alternations.
 - **⏱️ No startup tax.** Threads start lazily, so a one-file `grep` takes 2.7 ms — the same as GNU grep (ripgrep: 3.8 ms).
-- **✅ Verified identical.** `stdout`, `stderr`, and exit status are byte-identical to upstream GNU grep across 59 kernel-tree scenarios, 58 edge-case checks, 6,881 directory-traversal comparisons, and randomized multi-pattern fuzzing, at 1 to 128 threads. It passes GNU grep's own test suite and runs clean under AddressSanitizer, UndefinedBehaviorSanitizer, and ThreadSanitizer.
+- **✅ Verified identical.** `stdout`, `stderr`, and exit status are byte-identical to upstream GNU grep across 59 kernel-tree scenarios, 159 edge-case, boundary, and multithreaded checks, continuous stress testing, 6,881 directory-traversal comparisons, and randomized multi-pattern fuzzing, at 1 to 128 threads. It passes GNU grep's own test suite and runs clean under AddressSanitizer, UndefinedBehaviorSanitizer, and ThreadSanitizer.
 
 ## 🤖 Built for AI coding tools
 

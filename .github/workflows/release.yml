@@ -86,7 +86,7 @@ jobs:
           ncpus=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
           make -j"$ncpus"
           make check -C tests -j"$ncpus" \
-            TESTS="parallel-tree-walk parallel-chunked-mmap parallel-stream-stdin parallel-kwset-ac parallel-pcre-must parallel-env-limits"
+            TESTS="parallel-tree-walk parallel-chunked-mmap parallel-stream-stdin parallel-kwset-ac parallel-pcre-must parallel-env-limits parallel-coverage-edge-cases parallel-boundary-cases parallel-multithread-cases parallel-stress-test"
 
       - name: Package release archive
         run: |

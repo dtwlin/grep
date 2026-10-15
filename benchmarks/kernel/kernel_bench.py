@@ -797,6 +797,11 @@ def main():
         "X1": args.bin_X1,
     }
 
+    if "G0" in tools and not os.path.exists(binaries["G0"]):
+        fallback = binaries["G2"] if os.path.exists(binaries["G2"]) else binaries["G1"]
+        print(f"Note: G0 binary not found at {binaries['G0']}; falling back to {fallback}", file=sys.stderr)
+        binaries["G0"] = fallback
+
     # Verify binaries
     for t in tools:
         b = binaries.get(t)

@@ -26,7 +26,7 @@ jobs:
         include:
           - variant: avx2
             name: Linux x86-64 (AVX2)
-            cflags: "-O3 -march=native"
+            cflags: "-O3 -march=native -flto=auto -fno-plt -fomit-frame-pointer -falign-functions=32 -falign-loops=32"
             simd_tag: "AVX2"
           - variant: swar
             name: Linux x86-64 (SWAR Portable)
@@ -168,7 +168,7 @@ jobs:
           TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
         run: |
           make check -C tests -j"$(nproc)" \
-            TESTS="parallel-tree-walk parallel-chunked-mmap parallel-stream-stdin parallel-kwset-ac parallel-pcre-must parallel-env-limits" || {
+            TESTS="parallel-tree-walk parallel-chunked-mmap parallel-stream-stdin parallel-kwset-ac parallel-pcre-must parallel-env-limits parallel-coverage-edge-cases parallel-boundary-cases parallel-multithread-cases parallel-stress-test" || {
             cat tests/test-suite.log
             exit 1
           }
@@ -248,7 +248,7 @@ jobs:
       - name: Run parallel test suite
         run: |
           make check -C tests -j"$(sysctl -n hw.ncpu)" \
-            TESTS="parallel-tree-walk parallel-chunked-mmap parallel-stream-stdin parallel-kwset-ac parallel-pcre-must parallel-env-limits" || {
+            TESTS="parallel-tree-walk parallel-chunked-mmap parallel-stream-stdin parallel-kwset-ac parallel-pcre-must parallel-env-limits parallel-coverage-edge-cases parallel-boundary-cases parallel-multithread-cases parallel-stress-test" || {
             cat tests/test-suite.log
             exit 1
           }

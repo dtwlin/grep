@@ -23,8 +23,14 @@ BENCH_DIR = "/dev/shm/grep_bench"
 SINGLE_FILE = os.path.join(BENCH_DIR, "single_2GB.log")
 TREE_DIR = os.path.join(BENCH_DIR, "tree_10k")
 
-BASELINE_BIN = os.path.abspath("benchmarks/grep-baseline")
 CURRENT_BIN = os.path.abspath(os.environ.get("GREP_BIN", "src/grep"))
+_DEFAULT_BASELINE = os.path.abspath("benchmarks/grep-baseline")
+if os.environ.get("BASELINE_BIN"):
+    BASELINE_BIN = os.path.abspath(os.environ["BASELINE_BIN"])
+elif os.path.exists(_DEFAULT_BASELINE):
+    BASELINE_BIN = _DEFAULT_BASELINE
+else:
+    BASELINE_BIN = CURRENT_BIN
 
 WORKLOADS = [
     {
@@ -486,7 +492,10 @@ def run_edge_case_conformance():
     passed = 0
     total = len(checks)
     for name, args, env_vars, preexec in checks:
-        _, b_rc, b_out, b_err, _ = run_once(BASELINE_BIN, args, env_vars=env_vars, preexec_fn=None)
+        b_env = dict(env_vars) if env_vars else {}
+        if BASELINE_BIN == CURRENT_BIN:
+            b_env["GREP_THREADS"] = "1"
+        _, b_rc, b_out, b_err, _ = run_once(BASELINE_BIN, args, env_vars=b_env, preexec_fn=None)
         _, c_rc, c_out, c_err, c_len = run_once(CURRENT_BIN, args, env_vars=env_vars, preexec_fn=preexec)
 
         if b_rc == c_rc and b_out == c_out and b_err == c_err:
@@ -525,8 +534,9 @@ def benchmark(num_runs=5):
         # Baseline runs
         base_times = []
         base_rc, base_stdout_sha, base_stderr_sha = None, None, None
+        base_env = {"GREP_THREADS": "1"} if BASELINE_BIN == CURRENT_BIN else None
         for _ in range(num_runs):
-            dur, rc, out_sha, err_sha, out_len = run_once(BASELINE_BIN, args, pipe_mode=pipe_mode)
+            dur, rc, out_sha, err_sha, out_len = run_once(BASELINE_BIN, args, env_vars=base_env, pipe_mode=pipe_mode)
             base_times.append(dur)
             base_rc, base_stdout_sha, base_stderr_sha = rc, out_sha, err_sha
         base_med = sorted(base_times)[len(base_times) // 2]

@@ -1,3 +1,4 @@
+<!-- Copyright (C) 2026 David Lin <dtwlin@gmail.com> -->
 # Multi-Threaded GNU Grep: Benchmark & Performance Evaluation
 
 > Comprehensive performance, scalability, and correctness evaluation comparing
@@ -13,7 +14,7 @@
 This document presents the complete benchmark results for the parallel GNU `grep` drop-in replacement.
 All measurements were conducted on a 128-logical-CPU dual-socket AMD EPYC 7B13 server across the full
 Linux kernel codebase (v7.3-rc3, 96,034 tracked files, 1.64 GB working tree) and a 1.39 GB unified source
-concatenation (`linux-all.c`), alongside a 58-test automated edge-case conformance suite and 13 synthetic workloads.
+concatenation (`linux-all.c`), alongside a 159-test automated edge-case, boundary, and multithreaded conformance suite, continuous stress testing, and 13 synthetic workloads.
 
 To ensure complete fairness when comparing against `ripgrep` (`R0`) — which heuristically caps its default directory-walk
 thread pool at `min(cores, 12)` (12 worker threads) while `G1` defaults to `min(cores, 32)` (32 worker threads) —
@@ -632,7 +633,7 @@ on 9 core scenarios, comparing G1 and R0 unpinned across all 128 logical CPUs (2
 ## 8. Synthetic Benchmark Suite & Edge-Case Conformance
 
 In addition to real-world kernel tree benchmarks, the project maintains an automated 13-workload synthetic benchmark
-suite (`benchmarks/run_benchmarks.py`) and a 58-test automated edge-case conformance harness.
+suite (`benchmarks/run_benchmarks.py`), a 159-test automated edge-case, boundary, and multithreaded conformance harness, and a continuous stress test harness (`benchmarks/stress_test.py`).
 
 ### 13-Workload Synthetic Benchmark (5 Iterations per Workload)
 
@@ -652,9 +653,9 @@ suite (`benchmarks/run_benchmarks.py`) and a 58-test automated edge-case conform
 | `BM-12` | Stdin file redirect (`< $FILE`) | 1572 MB | 517.6 ms | 2.97 GB/s | 330.5 ms | 154.7 ms | **53.2 ms** | **9.74×** | **PASS** |
 | `BM-13` | True FIFO pipe (`cat \| grep`) | 1572 MB | 923.5 ms | 1.66 GB/s | 1054.3 ms | 751.3 ms | **698.5 ms** | **1.32×** | **PASS** |
 
-### Automated Edge-Case Conformance (58 / 58 PASS)
-The 58 automated conformance checks verify boundary conditions against stock baseline grep:
-- **Thread Scaling Invariance (Checks 1–14):** Thread sweeps across single-file and tree searches at $t \in \{1, 2, 4, 8, 16, 32, 64\}$ pass byte-for-byte.
+### Automated Edge-Case, Boundary & Multithreaded Conformance (159 / 159 PASS)
+The 159 automated conformance checks verify boundary and concurrency conditions against stock baseline grep:
+- **Thread Scaling Invariance (Checks 1–14, 140–149):** Thread sweeps across single-file and tree searches at power-of-two, prime, and oversubscribed thread counts ($t \in \{1, 2, 3, 4, 5, 7, 8, 16, 31, 32, 64, 128\}$) pass byte-for-byte.
 - **Context & Group Separators (Checks 15–16):** Context overlaps with `-C 1`, `-C 2`, and `--group-separator` match GNU behavior.
 - **Inverted Matching & Line Counting (Checks 17–19, 33):** Inverted searches (`-v`, `-c -v`, `-n -v`) across files up to 2 GB match byte-for-byte.
 - **Color & Only-Matching (Checks 20–21):** `--color=always -o` formatting matches exactly.
@@ -663,12 +664,15 @@ The 58 automated conformance checks verify boundary conditions against stock bas
 - **Binary File Handling (Checks 28–30):** Default binary detection, `-a` (text mode), and `-I` (ignore binary) match.
 - **Virtual Memory Clamping & Slabs (Checks 31–32, 50–51):** `RLIMIT_AS 512MB` and `256MB` slab fallbacks function cleanly without crash or leak.
 - **File Descriptor Constraints (Checks 52–53):** `RLIMIT_NOFILE 32` tree searches execute cleanly without EMFILE.
-- **PCRE2 Advanced Syntax (Checks 34–37):** `-Pi`, inline `(?i)`, bounded `{0,3}`, and grouped quantifiers match.
+- **PCRE2 Advanced Syntax (Checks 34–37, 59–69):** `-Pi`, inline `(?i)`, bounded `{0,3}`, grouped quantifiers, lookaround assertions, named/numbered backreferences, and POSIX classes match.
 - **Tab Alignment (Checks 38–39):** Initial tab `-T` alignment matches on single files and trees.
 - **Dense Match Buffering (Checks 40–41):** 75,000 matches with `-C 1` format without buffer overflow or truncation.
 - **DFA Boundary Heuristic (Checks 42–45):** Negative offset DFA edge cases (`EGexecute` boundary heuristic) resolve safely.
 - **Post-File Batch Splitting (Checks 46–49):** High-density regex matches with batch splits match at $t=1$ and $t=32$.
-- **Regex Pre-Filter Escapes & Multibyte Anchors (Checks 54–58):** Escaped alternation pipes (`\|`), bracket character classes containing `|`, PCRE2 `\Q...\E` literals, and non-UTF-8 multibyte `^`/`$` anchors match byte-for-byte.
+- **Regex Pre-Filter Escapes & Multibyte Anchors (Checks 54–58, 70–79):** Escaped alternation pipes (`\|`), bracket character classes containing `|`, PCRE2 `\Q...\E` literals, BRE/ERE alternations, and non-UTF-8 multibyte `^`/`$` anchors match byte-for-byte.
+- **CLI Option & Error Diagnostics (Checks 80–97):** `GREP_THREADS` parsing, `-f` pattern files, `-e` combinations, `-H`/`-h`, `--label`, `-s`, `-L`, `-q`, and syntax error codes match.
+- **Buffer, Chunk & File Size Boundaries (Checks 98–139):** 0-byte, 1-byte, missing trailing newline, exact 64 KiB `SMALL_FILE_MAX`, exact 96 KiB pipe buffer, exact 2 MiB `CHUNK_SIZE` and $2\times$ `CHUNK_SIZE` (4 MiB) seam splits, lines > 64 KiB, and 1, 2, 32, 33, and 257 multi-pattern keyword thresholds match byte-for-byte.
+- **Multithreaded Concurrency & Stress (Checks 150–159 + `stress_test.py`):** Concurrent multi-chunk files, Reorder Buffer (ROB) wrap-around (> 1,024 slots), head-of-line blocking, and a continuous 5-minute stress test (30,800+ randomized cycles across 1–64 threads) pass with zero discrepancies.
 
 ---
 

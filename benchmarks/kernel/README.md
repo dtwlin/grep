@@ -1,3 +1,4 @@
+<!-- Copyright (C) 2026 David Lin <dtwlin@gmail.com> -->
 # Linux Kernel-Tree 3-Way Benchmark
 
 Reproducible, high-fidelity benchmark harness comparing multi-threaded GNU `grep` against stock upstream GNU `grep`, `ripgrep`, distro GNU `grep`, and `git grep` on the Linux kernel codebase.
