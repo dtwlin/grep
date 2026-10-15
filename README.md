@@ -175,14 +175,14 @@ sudo apt install build-essential git autoconf automake autopoint gettext gperf \
 git clone --recurse-submodules https://github.com/dtwlin/grep.git
 cd grep
 ./bootstrap --skip-po
-./configure CFLAGS='-O3 -march=native'
+./configure CFLAGS='-O3 -march=native -flto=auto -fno-plt -fomit-frame-pointer -falign-functions=32 -falign-loops=32'
 make -j"$(nproc)"
 make check                # optional (~2 min): GNU grep test suite + parallel tests
 sudo make install         # installs /usr/local/bin/grep, ahead of /usr/bin/grep on most PATHs
 hash -r && grep --version # last line should start with "Supercharged grep"
 ```
 
-`-march=native` enables the AVX2 kernels on CPUs that support them (`-mavx2` works too). Omit `-march=native` when building a portable binary for older x86-64 machines.
+`-march=native` enables the AVX2 kernels on CPUs that support them (`-mavx2` works too), `-flto=auto` enables link-time optimization across translation units, and `-falign-functions=32 -falign-loops=32` aligns hot inner loops to 32-byte CPU fetch boundaries. Omit `-march=native` when building a portable binary for older x86-64 machines.
 
 ### 🍎 macOS (experimental)
 
