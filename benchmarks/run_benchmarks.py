@@ -15,11 +15,28 @@ import hashlib
 import os
 import re
 import resource
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
-BENCH_DIR = "/dev/shm/grep_bench"
+
+def _default_bench_dir():
+    if os.environ.get("GREP_BENCH_DIR"):
+        return os.environ["GREP_BENCH_DIR"]
+    if os.path.exists("/dev/shm/grep_bench"):
+        return "/dev/shm/grep_bench"
+    if os.path.exists("/dev/shm"):
+        try:
+            if shutil.disk_usage("/dev/shm").free >= int(2.5 * 1024 ** 3):
+                return "/dev/shm/grep_bench"
+        except OSError:
+            pass
+    return os.path.join(tempfile.gettempdir(), "grep_bench")
+
+
+BENCH_DIR = _default_bench_dir()
 SINGLE_FILE = os.path.join(BENCH_DIR, "single_2GB.log")
 TREE_DIR = os.path.join(BENCH_DIR, "tree_10k")
 
@@ -598,6 +615,12 @@ def benchmark(num_runs=5):
         )
 
 if __name__ == "__main__":
+    if "--conformance-only" in sys.argv:
+        if not os.path.exists(SINGLE_FILE) or not os.path.exists(TREE_DIR):
+            print("Corpus not found! Running benchmarks/gen_corpus.py first...")
+            subprocess.run([sys.executable, "benchmarks/gen_corpus.py"], check=True)
+        run_edge_case_conformance()
+        sys.exit(0)
     runs = 5
     if len(sys.argv) > 1:
         runs = int(sys.argv[1])

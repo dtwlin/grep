@@ -14,9 +14,23 @@ Uses only generic synthetic data (example.com, etc.).
 import os
 import shutil
 import sys
+import tempfile
 import time
 
-BENCH_DIR = "/dev/shm/grep_bench"
+
+def _default_bench_dir():
+    if os.environ.get("GREP_BENCH_DIR"):
+        return os.environ["GREP_BENCH_DIR"]
+    if os.path.exists("/dev/shm"):
+        try:
+            if shutil.disk_usage("/dev/shm").free >= int(2.5 * 1024 ** 3):
+                return "/dev/shm/grep_bench"
+        except OSError:
+            pass
+    return os.path.join(tempfile.gettempdir(), "grep_bench")
+
+
+BENCH_DIR = _default_bench_dir()
 
 def generate_corpus():
     start_time = time.time()
