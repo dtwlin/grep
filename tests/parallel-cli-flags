@@ -1,0 +1,340 @@
+#! /bin/sh
+# Test CLI parameter and flag coverage across all parallel execution paths.
+#
+# Copyright (C) 2026 David Lin <dtwlin@gmail.com>
+#
+# Copying and distribution of this file, with or without modification,
+# are permitted in any medium without royalty provided the copyright
+# notice and this notice are preserved.
+
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+
+fail=0
+
+# Build a >= 2.2 MiB file to trigger intra-file mmap chunking and pipe slicing,
+# plus small files and a directory tree.
+awk 'BEGIN {
+  for (i = 1; i <= 45000; i++) {
+    if (i == 100 || i == 22000 || i == 44900)
+      printf "line %05d: TARGET_TOKEN_ALPHA CaseMix_Beta num=%d\n", i, i
+    else if (i == 101 || i == 22001)
+      printf "line %05d: context_neighbor_%d\n", i, i
+    else
+      printf "line %05d: filler text payload for parallel chunking %d\n", i, i
+  }
+}' > big.txt || framework_failure_
+
+cat <<'EOF' > small1.txt || framework_failure_
+small1 header
+TARGET_TOKEN_ALPHA in small1
+small1 footer
+EOF
+
+cat <<'EOF' > small2.txt || framework_failure_
+small2 only filler
+CaseMix_Beta in small2
+EOF
+
+mkdir -p tree/subA tree/subB tree/skip_me || framework_failure_
+for i in $(seq 1 36); do
+  idx=$(printf '%02d' "$i")
+  if test "$i" -eq 5 || test "$i" -eq 25; then
+    printf 'file_%s: TARGET_TOKEN_ALPHA CaseMix_Beta\n' "$idx" > "s$idx.txt" || framework_failure_
+  else
+    printf 'file_%s: plain filler line\n' "$idx" > "s$idx.txt" || framework_failure_
+  fi
+done
+
+cp small1.txt tree/subA/a.c || framework_failure_
+cp small2.txt tree/subA/b.h || framework_failure_
+printf 'TARGET_TOKEN_ALPHA in txt\n' > tree/subB/c.txt || framework_failure_
+printf 'TARGET_TOKEN_ALPHA in log\n' > tree/subB/d.log || framework_failure_
+printf 'TARGET_TOKEN_ALPHA in skipped\n' > tree/skip_me/e.c || framework_failure_
+
+# Helper: compare GREP_THREADS=1 against GREP_THREADS=2,4,8 for stdout and exit code.
+check_threads ()
+{
+  tag=$1
+  shift
+  GREP_THREADS=1 "$@" > "exp_$tag" 2> "experr_$tag"
+  rc_exp=$?
+  for t in 2 4 8; do
+    GREP_THREADS=$t "$@" > "out_${tag}_$t" 2> "outerr_${tag}_$t"
+    rc_got=$?
+    test "$rc_got" -eq "$rc_exp" || { fail=1; echo "rc mismatch: $tag t=$t ($rc_got vs $rc_exp)" >&2; }
+    compare "exp_$tag" "out_${tag}_$t" || fail=1
+    compare "experr_$tag" "outerr_${tag}_$t" || fail=1
+  done
+}
+
+# -------------------------------------------------------------------------
+# 1. Mixed Operand Ordering & Producer Batch Flush (Bug 1 regressions)
+# -------------------------------------------------------------------------
+check_threads mix_small_big grep TARGET_TOKEN_ALPHA small1.txt big.txt
+check_threads mix_big_small grep TARGET_TOKEN_ALPHA big.txt small1.txt
+check_threads mix_small_big_small grep -n TARGET_TOKEN_ALPHA small1.txt big.txt small2.txt
+
+for t in 1 2 4 8; do
+  printf 'TARGET_TOKEN_ALPHA from pipe\n' \
+    | GREP_THREADS=$t grep TARGET_TOKEN_ALPHA small1.txt - > "out_pipe_ord_$t" || fail=1
+  printf 'TARGET_TOKEN_ALPHA from pipe\n' \
+    | GREP_THREADS=$t grep -c TARGET_TOKEN_ALPHA small1.txt - > "out_pipe_cnt_$t" || fail=1
+  printf 'TARGET_TOKEN_ALPHA from pipe\n' \
+    | GREP_THREADS=$t grep -c TARGET_TOKEN_ALPHA - small1.txt > "out_pipe_first_$t" || fail=1
+  printf 'TARGET_TOKEN_ALPHA from pipe\n' \
+    | GREP_THREADS=$t grep -c TARGET_TOKEN_ALPHA big.txt - > "out_big_pipe_$t" || fail=1
+done
+for t in 2 4 8; do
+  compare out_pipe_ord_1 "out_pipe_ord_$t" || fail=1
+  compare out_pipe_cnt_1 "out_pipe_cnt_$t" || fail=1
+  compare out_pipe_first_1 "out_pipe_first_$t" || fail=1
+  compare out_big_pipe_1 "out_big_pipe_$t" || fail=1
+done
+
+# -q with missing file before >= 2 MiB matching file must still emit stderr for missing file
+for t in 1 2 4 8; do
+  GREP_THREADS=$t grep -q TARGET_TOKEN_ALPHA no_such_file.txt big.txt > "out_q_miss_$t" 2> "err_q_miss_$t"
+  test $? -eq 0 || fail=1
+  test -s "err_q_miss_$t" || fail=1
+done
+for t in 2 4 8; do
+  compare err_q_miss_1 "err_q_miss_$t" || fail=1
+done
+
+# -------------------------------------------------------------------------
+# 2. >= 32 File Operands + Piped Stdin with -c, -l, -L (Bug 2 regressions)
+# -------------------------------------------------------------------------
+sfiles=$(echo s*.txt)
+for t in 1 2 4 8; do
+  printf 'TARGET_TOKEN_ALPHA in stdin\n' \
+    | GREP_THREADS=$t grep -c TARGET_TOKEN_ALPHA $sfiles - > "out_36_c_$t" || fail=1
+  printf 'TARGET_TOKEN_ALPHA in stdin\n' \
+    | GREP_THREADS=$t grep -l TARGET_TOKEN_ALPHA $sfiles - > "out_36_l_$t" || fail=1
+  printf 'no match in stdin\n' \
+    | GREP_THREADS=$t grep -L TARGET_TOKEN_ALPHA $sfiles - > "out_36_L_$t" || fail=1
+done
+for t in 2 4 8; do
+  compare out_36_c_1 "out_36_c_$t" || fail=1
+  compare out_36_l_1 "out_36_l_$t" || fail=1
+  compare out_36_L_1 "out_36_L_$t" || fail=1
+done
+
+# -------------------------------------------------------------------------
+# 3. Command-Line --exclude / --include / --exclude-dir Semantics (Bug 3)
+# -------------------------------------------------------------------------
+# >= 16 operands (walk_run_cmd_files) with a directory or missing file under --exclude='*'
+check_threads excl_dir_17 grep --exclude='*' TARGET_TOKEN_ALPHA tree/subA $sfiles
+check_threads excl_miss_17 grep --exclude='*' TARGET_TOKEN_ALPHA missing_cmd_file.txt $sfiles
+check_threads excl_single_big grep --exclude='*.txt' TARGET_TOKEN_ALPHA big.txt
+check_threads excl_dir_single grep -r --exclude-dir='tree' TARGET_TOKEN_ALPHA tree
+
+if test "$(id -u)" -ne 0; then
+  printf 'TARGET_TOKEN_ALPHA\n' > unreadable_excl.txt || framework_failure_
+  chmod 0 unreadable_excl.txt || framework_failure_
+  check_threads excl_chmod000_2 grep --exclude='*.txt' TARGET_TOKEN_ALPHA unreadable_excl.txt small1.txt
+  check_threads excl_chmod000_18 grep --exclude='*.txt' TARGET_TOKEN_ALPHA unreadable_excl.txt $sfiles
+  chmod 644 unreadable_excl.txt || framework_failure_
+fi
+
+# -------------------------------------------------------------------------
+# 4. Deferred Output File in walk_run_cmd_files (!d->parent) (Bug 4)
+# -------------------------------------------------------------------------
+for t in 1 2 4 8; do
+  cp s36.txt s36_out.txt || framework_failure_
+  GREP_THREADS=$t grep TARGET_TOKEN_ALPHA $sfiles s36_out.txt >> s36_out.txt 2> "err_defer_$t"
+  test $? -eq 2 || fail=1
+  cp s36_out.txt "s36_out_$t.txt" || framework_failure_
+
+  cp s36.txt s36_cnt.txt || framework_failure_
+  GREP_THREADS=$t grep -c TARGET_TOKEN_ALPHA $sfiles s36_cnt.txt >> s36_cnt.txt 2> "err_defer_c_$t" || fail=1
+  cp s36_cnt.txt "s36_cnt_$t.txt" || framework_failure_
+done
+rm -f s36_out.txt s36_cnt.txt || framework_failure_
+for t in 2 4 8; do
+  compare s36_out_1.txt "s36_out_$t.txt" || fail=1
+  compare err_defer_1 "err_defer_$t" || fail=1
+  compare s36_cnt_1.txt "s36_cnt_$t.txt" || fail=1
+  compare err_defer_c_1 "err_defer_c_$t" || fail=1
+done
+
+# -------------------------------------------------------------------------
+# 5. grep -r PATTERN - When a Directory Named "-" Exists in cwd (Bug 5)
+# -------------------------------------------------------------------------
+mkdir -p ./- || framework_failure_
+printf 'TARGET_TOKEN_ALPHA in dash dir\n' > ./-/file.txt || framework_failure_
+for t in 1 2 4 8; do
+  printf 'TARGET_TOKEN_ALPHA from stdin\n' \
+    | GREP_THREADS=$t grep -r TARGET_TOKEN_ALPHA - > "out_dash_r_$t" || fail=1
+done
+for t in 2 4 8; do
+  compare out_dash_r_1 "out_dash_r_$t" || fail=1
+done
+rm -rf ./- || framework_failure_
+
+# -------------------------------------------------------------------------
+# 6. --label=LABEL Across Piped Stdin, Redirected >= 2 MiB File, and -r
+# -------------------------------------------------------------------------
+for t in 1 2 4 8; do
+  cat big.txt | GREP_THREADS=$t grep --label=CUSTOM_PIPE -H -n -b TARGET_TOKEN_ALPHA > "out_lbl_pipe_H_$t" || fail=1
+  cat big.txt | GREP_THREADS=$t grep --label=CUSTOM_PIPE -H -c TARGET_TOKEN_ALPHA > "out_lbl_pipe_c_$t" || fail=1
+  cat big.txt | GREP_THREADS=$t grep --label=CUSTOM_PIPE -l TARGET_TOKEN_ALPHA > "out_lbl_pipe_l_$t" || fail=1
+  cat big.txt | GREP_THREADS=$t grep --label=CUSTOM_PIPE -L NEVER_MATCH_TOKEN > "out_lbl_pipe_L_$t"
+  test $? -eq 1 || fail=1
+  cat big.txt | GREP_THREADS=$t grep --label=CUSTOM_PIPE -Z -l TARGET_TOKEN_ALPHA > "out_lbl_pipe_Z_$t" || fail=1
+
+  GREP_THREADS=$t grep --label=CUSTOM_REDIR -H -n -b TARGET_TOKEN_ALPHA < big.txt > "out_lbl_red_H_$t" || fail=1
+  GREP_THREADS=$t grep --label=CUSTOM_REDIR -H -c TARGET_TOKEN_ALPHA < big.txt > "out_lbl_red_c_$t" || fail=1
+  GREP_THREADS=$t grep --label=CUSTOM_REDIR -l TARGET_TOKEN_ALPHA < big.txt > "out_lbl_red_l_$t" || fail=1
+  GREP_THREADS=$t grep --label=CUSTOM_REDIR -L NEVER_MATCH_TOKEN < big.txt > "out_lbl_red_L_$t"
+  test $? -eq 1 || fail=1
+
+  printf 'TARGET_TOKEN_ALPHA in stdin\n' \
+    | GREP_THREADS=$t grep -r --label=CUSTOM_TREE TARGET_TOKEN_ALPHA tree/subA - > "out_lbl_tree_$t" || fail=1
+  printf 'TARGET_TOKEN_ALPHA\0binary\n' \
+    | GREP_THREADS=$t grep --label=CUSTOM_BIN TARGET_TOKEN_ALPHA > "out_lbl_bin_$t" 2> "err_lbl_bin_$t" || fail=1
+done
+for t in 2 4 8; do
+  compare out_lbl_pipe_H_1 "out_lbl_pipe_H_$t" || fail=1
+  compare out_lbl_pipe_c_1 "out_lbl_pipe_c_$t" || fail=1
+  compare out_lbl_pipe_l_1 "out_lbl_pipe_l_$t" || fail=1
+  compare out_lbl_pipe_L_1 "out_lbl_pipe_L_$t" || fail=1
+  compare out_lbl_pipe_Z_1 "out_lbl_pipe_Z_$t" || fail=1
+  compare out_lbl_red_H_1 "out_lbl_red_H_$t" || fail=1
+  compare out_lbl_red_c_1 "out_lbl_red_c_$t" || fail=1
+  compare out_lbl_red_l_1 "out_lbl_red_l_$t" || fail=1
+  compare out_lbl_red_L_1 "out_lbl_red_L_$t" || fail=1
+  compare out_lbl_tree_1 "out_lbl_tree_$t" || fail=1
+  compare out_lbl_bin_1 "out_lbl_bin_$t" || fail=1
+  compare err_lbl_bin_1 "err_lbl_bin_$t" || fail=1
+done
+
+# -------------------------------------------------------------------------
+# 7. Case-Sensitivity Flags: -y and --no-ignore-case
+# -------------------------------------------------------------------------
+check_threads flag_y_big grep -y casemix_beta big.txt
+check_threads flag_y_F_tree grep -r -F -y casemix_beta tree
+check_threads no_icase_1 grep -i --no-ignore-case casemix_beta big.txt
+check_threads no_icase_2 grep -y --no-ignore-case CaseMix_Beta big.txt
+check_threads no_icase_F grep -r -F -i --no-ignore-case casemix_beta tree
+check_threads no_icase_E grep -r -E -i --no-ignore-case 'casemix_beta|target_token_alpha' tree
+if (grep -P --version) >/dev/null 2>&1; then
+  check_threads no_icase_P grep -P -i --no-ignore-case 'casemix_beta' big.txt
+fi
+
+# -------------------------------------------------------------------------
+# 8. Pattern Input from Stdin (-f -) with Parallel File/Tree Search
+# -------------------------------------------------------------------------
+for t in 1 2 4 8; do
+  printf 'TARGET_TOKEN_ALPHA\nCaseMix_Beta\n' \
+    | GREP_THREADS=$t grep -F -f - big.txt > "out_f_stdin_big_$t" || fail=1
+  printf 'TARGET_TOKEN_ALPHA\nCaseMix_Beta\n' \
+    | GREP_THREADS=$t grep -r -F -f - tree > "out_f_stdin_tree_$t" || fail=1
+done
+for t in 2 4 8; do
+  compare out_f_stdin_big_1 "out_f_stdin_big_$t" || fail=1
+  compare out_f_stdin_tree_1 "out_f_stdin_tree_$t" || fail=1
+done
+
+# -------------------------------------------------------------------------
+# 9. -X <matcher> Variants (awk, gawk, posixawk, grep, egrep, fgrep)
+# -------------------------------------------------------------------------
+for matcher in awk gawk posixawk grep egrep; do
+  check_threads "X_${matcher}_big" grep -X "$matcher" 'TARGET_TOKEN_ALPHA|CaseMix_Beta' big.txt
+  check_threads "X_${matcher}_tree" grep -r -X "$matcher" 'TARGET_TOKEN_ALPHA|CaseMix_Beta' tree
+done
+check_threads X_fgrep_big grep -X fgrep 'TARGET_TOKEN_ALPHA' big.txt
+
+# -------------------------------------------------------------------------
+# 10. Output & Context Formatting: -h, -T, -Z, --line-buffered, -2, -U, -u
+# -------------------------------------------------------------------------
+check_threads flag_h_multi grep -h TARGET_TOKEN_ALPHA small1.txt big.txt
+check_threads flag_h_36 grep -h TARGET_TOKEN_ALPHA $sfiles
+check_threads flag_h_tree grep -r -h TARGET_TOKEN_ALPHA tree
+
+check_threads flag_T_sparse grep -T -H -n -b TARGET_TOKEN_ALPHA big.txt
+check_threads flag_T_ctx grep -T -H -n -b -C 1 TARGET_TOKEN_ALPHA big.txt
+check_threads flag_T_dense grep -T -H -n -b -m 50 filler big.txt
+check_threads flag_T_tree grep -r -T -n -b TARGET_TOKEN_ALPHA tree
+for t in 1 2 4 8; do
+  cat big.txt | GREP_THREADS=$t grep -T -H -n -b TARGET_TOKEN_ALPHA > "out_T_pipe_$t" || fail=1
+done
+for t in 2 4 8; do
+  compare out_T_pipe_1 "out_T_pipe_$t" || fail=1
+done
+
+check_threads flag_Z_H_big grep -Z -H -n -b TARGET_TOKEN_ALPHA big.txt
+check_threads flag_Z_c_big grep -Z -H -c TARGET_TOKEN_ALPHA small1.txt big.txt
+check_threads flag_Z_L_tree grep -r -Z -L TARGET_TOKEN_ALPHA tree
+
+check_threads linebuf_big grep --line-buffered -n TARGET_TOKEN_ALPHA big.txt
+check_threads linebuf_c grep --line-buffered -c TARGET_TOKEN_ALPHA small1.txt big.txt
+check_threads linebuf_l grep -r --line-buffered -l TARGET_TOKEN_ALPHA tree
+for t in 1 2 4 8; do
+  cat big.txt | GREP_THREADS=$t grep --line-buffered -n TARGET_TOKEN_ALPHA > "out_lbuf_pipe_$t" || fail=1
+done
+for t in 2 4 8; do
+  compare out_lbuf_pipe_1 "out_lbuf_pipe_$t" || fail=1
+done
+
+check_threads ctx_num_2_big grep -2 -n TARGET_TOKEN_ALPHA big.txt
+check_threads ctx_num_0_big grep -0 -n TARGET_TOKEN_ALPHA big.txt
+check_threads ctx_num_2_tree grep -r -2 -n TARGET_TOKEN_ALPHA tree
+
+check_threads flag_U_big grep -U -u TARGET_TOKEN_ALPHA big.txt
+check_threads flag_U_tree grep -r -U -u TARGET_TOKEN_ALPHA tree
+
+# -------------------------------------------------------------------------
+# 11. GREP_COLORS (rv, ne, sl, cx, ms, mc, fn, ln, bn, se) and GREP_COLOR
+# -------------------------------------------------------------------------
+custom_colors='ms=01;32:mc=01;34:sl=01;33:cx=01;35:fn=36:ln=32:bn=33:se=31'
+check_threads colors_full_big env GREP_COLORS="$custom_colors" grep --color=always -H -n -b -C 1 TARGET_TOKEN_ALPHA big.txt
+check_threads colors_full_tree env GREP_COLORS="$custom_colors" grep -r --color=always -n -b -C 1 TARGET_TOKEN_ALPHA tree
+check_threads colors_rv_inv env GREP_COLORS='rv:sl=01;31:cx=01;32' grep --color=always -v -n -C 1 filler small1.txt small2.txt
+check_threads colors_ne_big env GREP_COLORS='ne:ms=01;31:fn=35:ln=32' grep --color=always -H -n TARGET_TOKEN_ALPHA big.txt
+check_threads grep_color_legacy env -u GREP_COLORS GREP_COLOR='01;35' grep --color=always -H -n TARGET_TOKEN_ALPHA big.txt
+for t in 1 2 4 8; do
+  cat big.txt | env GREP_COLORS="$custom_colors" GREP_THREADS=$t grep --color=always -H -n -b TARGET_TOKEN_ALPHA > "out_col_pipe_$t" || fail=1
+done
+for t in 2 4 8; do
+  compare out_col_pipe_1 "out_col_pipe_$t" || fail=1
+done
+
+# -------------------------------------------------------------------------
+# 12. File & Directory Selection: -d skip/read, --exclude-from, --include
+# -------------------------------------------------------------------------
+check_threads d_skip_small grep -d skip TARGET_TOKEN_ALPHA tree/subA small1.txt
+check_threads d_skip_17 grep --directories=skip TARGET_TOKEN_ALPHA tree/subA $sfiles
+check_threads d_read_small grep -d read TARGET_TOKEN_ALPHA tree/subA small1.txt
+check_threads d_read_17 grep --directories=read TARGET_TOKEN_ALPHA tree/subA $sfiles
+
+if mkfifo test_fifo_cmd 2>/dev/null; then
+  check_threads D_skip_small grep -D skip TARGET_TOKEN_ALPHA test_fifo_cmd small1.txt
+  check_threads D_skip_17 grep --devices=skip TARGET_TOKEN_ALPHA test_fifo_cmd $sfiles
+  rm -f test_fifo_cmd || framework_failure_
+fi
+
+cat <<'EOF' > excl.list || framework_failure_
+*.log
+*.h
+EOF
+check_threads excl_from_file grep -r --exclude-from=excl.list TARGET_TOKEN_ALPHA tree
+for t in 1 2 4 8; do
+  printf '*.log\n*.h\n' \
+    | GREP_THREADS=$t grep -r --exclude-from=- TARGET_TOKEN_ALPHA tree > "out_excl_stdin_$t" || fail=1
+done
+for t in 2 4 8; do
+  compare out_excl_stdin_1 "out_excl_stdin_$t" || fail=1
+done
+
+# --include: <= 16 simple extensions vs > 16 extensions (fallback) vs wildcard
+check_threads inc_simple grep -r --include='*.c' --include='*.h' TARGET_TOKEN_ALPHA tree
+check_threads inc_18_exts grep -r \
+  --include='*.e1' --include='*.e2' --include='*.e3' --include='*.e4' \
+  --include='*.e5' --include='*.e6' --include='*.e7' --include='*.e8' \
+  --include='*.e9' --include='*.e10' --include='*.e11' --include='*.e12' \
+  --include='*.e13' --include='*.e14' --include='*.e15' --include='*.e16' \
+  --include='*.e17' --include='*.c' TARGET_TOKEN_ALPHA tree
+check_threads inc_wildcard grep -r --include='*[a-c].*' TARGET_TOKEN_ALPHA tree
+check_threads inc_excl_order grep -r --include='*.c' --exclude='a.c' TARGET_TOKEN_ALPHA tree
+
+Exit $fail

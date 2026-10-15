@@ -3798,6 +3798,7 @@ rob_try_commit_locked (void)
   rob_committing = true;
 
   bool saved_buffering = buffering_enabled;
+  char const *saved_outer_filename = filename;
   buffering_enabled = false;
   bool committed_any = false;
 
@@ -3812,8 +3813,7 @@ rob_try_commit_locked (void)
       if (slot->defer_name)
         rob_search_deferred (slot);
 
-      if (slot->filename)
-        filename = slot->filename;
+      filename = slot->filename;
 
       /* Group separator logic across files */
       bool want_sep = need_group_separator (slot->had_prtext, slot->sep);
@@ -3943,6 +3943,7 @@ rob_try_commit_locked (void)
               chunk_accumulated_count = 0;
               chunk_has_any_match = false;
               chunk_enc_error = false;
+              stream_commit_totalnl = 0;
               stream_binary = stream_binary_match = false;
             }
           else
@@ -3999,7 +4000,6 @@ rob_try_commit_locked (void)
         {
           free (slot->filename);
           slot->filename = nullptr;
-          filename = nullptr;
         }
 
       if (slot->stream_chunk_alloc)
@@ -4021,6 +4021,8 @@ rob_try_commit_locked (void)
         }
     }
 
+  filename = saved_outer_filename;
+  buffering_enabled = saved_buffering;
   rob_committing = false;
   if (committed_any)
     {
@@ -4328,6 +4330,7 @@ worker_thread_func (void *arg)
           if (binary)
             xset_binary_mode (STDIN_FILENO, O_BINARY);
           status = grepdesc (STDIN_FILENO, true);
+          filename = nullptr;
         }
       else if (task.type == TASK_TYPE_FILE)
         {
@@ -4339,6 +4342,7 @@ worker_thread_func (void *arg)
             defer_name = task.filename;
           else
             free (task.filename);
+          filename = nullptr;
         }
       else if (task.type == TASK_TYPE_STREAM_CHUNK)
         {
@@ -4523,6 +4527,7 @@ worker_thread_func (void *arg)
               enc_error = (binary_files == BINARY_BINARY_FILES && !out_quiet
                            && encoding_error_output);
             }
+          filename = nullptr;
         }
 
       char *copy_out = nullptr;
@@ -5222,6 +5227,7 @@ static void stream_slicer_stdin (void);
 static void
 chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st_in)
 {
+  producer_flush_batch ();
   if (exit_on_match && !out_invert && !pool_started)
     {
       char prebuf[65536 + 1];
@@ -5654,6 +5660,7 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
 static void
 chunked_grep_file (char const *fname, struct stat const *st_in)
 {
+  producer_flush_batch ();
   int oflag = (O_RDONLY | O_NOCTTY
                | (IGNORE_DUPLICATE_BRANCH_WARNING (binary ? O_BINARY : 0)));
   int fd = openat_safer (AT_FDCWD, fname, oflag);
@@ -5671,6 +5678,7 @@ chunked_grep_file (char const *fname, struct stat const *st_in)
 static void
 stream_slicer_stdin (void)
 {
+  producer_flush_batch ();
   stream_readsize = ALIGN_TO (GOOD_READSIZE_MIN, pagesize);
 #ifdef F_GETPIPE_SZ
   int pipe_size = fcntl (STDIN_FILENO, F_GETPIPE_SZ);
@@ -5683,8 +5691,6 @@ stream_slicer_stdin (void)
      the slicer reads ahead anyway.  */
   fcntl (STDIN_FILENO, F_SETPIPE_SZ, 1024 * 1024);
 #endif
-  stream_commit_totalnl = 0;
-  stream_binary = stream_binary_match = false;
   ensure_pool ();
 
   struct stat st;
@@ -7062,7 +7068,7 @@ walk_split (struct walk_task *t, size_t lo)
   /* T keeps its own reference and descriptor use until it ends, so
      neither count can drop to zero before N takes its own.  */
   atomic_fetch_add (&d->refs, 1);
-  if (!walk.logical)
+  if (!walk.logical && d->parent)
     {
       atomic_fetch_add (&d->fd_users, 1);
       pthread_mutex_lock (&walk.fd_mu);
@@ -7123,17 +7129,20 @@ walk_search_files (struct walk_task *t)
             {
               /* The committer will need the directory.  */
               atomic_fetch_add (&d->refs, 1);
-              atomic_fetch_add (&d->fd_users, 1);
-              if (!walk.logical)
+              if (d->parent)
                 {
-                  pthread_mutex_lock (&walk.fd_mu);
-                  if (!d->in_fd_list)
+                  atomic_fetch_add (&d->fd_users, 1);
+                  if (!walk.logical)
                     {
-                      int cur_fd = atomic_load_explicit (&d->fd, memory_order_relaxed);
-                      if (0 <= cur_fd)
-                        walk_set_fd_locked (d, cur_fd);
+                      pthread_mutex_lock (&walk.fd_mu);
+                      if (!d->in_fd_list)
+                        {
+                          int cur_fd = atomic_load_explicit (&d->fd, memory_order_relaxed);
+                          if (0 <= cur_fd)
+                            walk_set_fd_locked (d, cur_fd);
+                        }
+                      pthread_mutex_unlock (&walk.fd_mu);
                     }
-                  pthread_mutex_unlock (&walk.fd_mu);
                 }
             }
         }
@@ -7206,9 +7215,11 @@ walk_search_deferred (struct walk_dir *d, struct walk_ent *e)
   bool saved_buffering = buffering_enabled;
   buffering_enabled = true;
   e->defer = false;
-  walk_search (d, walk.logical ? AT_FDCWD : walk_dir_fd (d), e, false);
+  walk_search (d, (walk.logical || !d->parent) ? AT_FDCWD : walk_dir_fd (d),
+               e, false);
   buffering_enabled = saved_buffering;
-  walk_fd_release (d);
+  if (d->parent)
+    walk_fd_release (d);
   walk_unref (d);
 }
 
@@ -7591,13 +7602,7 @@ walk_run_cmd_files (char *const *files, size_t nfiles)
     {
       holder->ents[i].name = files[i];
       holder->ents[i].namelen = (unsigned short) MIN (strlen (files[i]), 65535);
-      if (skipped_file (files[i], true, false))
-        {
-          holder->ents[i].kind = WALK_SKIP;
-          atomic_init (&holder->ents[i].done, true);
-        }
-      else
-        holder->ents[i].kind = WALK_FILE;
+      holder->ents[i].kind = WALK_FILE;
       holder->ents[i].status = true;
     }
 
@@ -7690,11 +7695,9 @@ producer_run (char *const *files)
       else
         {
           struct stat st;
-          if (stat (*f, &st) == 0)
+          if (stat (*f, &st) == 0
+              && !skipped_file (*f, true, S_ISDIR (st.st_mode) != 0))
             {
-              if (skipped_file (*f, true, S_ISDIR (st.st_mode) != 0))
-                continue;
-
               if (S_ISDIR (st.st_mode) && directories == RECURSE_DIRECTORIES)
                 {
                   char *const *f_end = f + 1;
@@ -8440,7 +8443,10 @@ main (int argc, char **argv)
   if (out_file < 0)
     {
       struct stat st;
-      if (files[0] && stat (files[0], &st) == 0)
+      if (files[0]
+          && (STREQ (files[0], "-")
+              ? fstat (STDIN_FILENO, &st)
+              : stat (files[0], &st)) == 0)
         out_file = !!S_ISDIR (st.st_mode);
       else
         out_file = 0;
@@ -8476,7 +8482,8 @@ main (int argc, char **argv)
   bool is_single_large_file = false;
   bool is_dir_recurse = false;
   struct stat tmp_st;
-  if (single_operand && !is_single_stdin && stat (*files, &tmp_st) == 0)
+  if (single_operand && !is_single_stdin && stat (*files, &tmp_st) == 0
+      && !skipped_file (*files, true, S_ISDIR (tmp_st.st_mode) != 0))
     {
       is_single_large_file = (S_ISREG (tmp_st.st_mode)
                               && tmp_st.st_size >= 2 * 1024 * 1024

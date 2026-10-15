@@ -506,6 +506,32 @@ def run_edge_case_conformance():
         checks.append((f"Context -C 1 tree search (t={t})", ["-C", "1", "-r", "FATAL", f"{TREE_DIR}/dir_000"], {"GREP_THREADS": str(t)}, None))
         checks.append((f"Early exit -q tree search (t={t})", ["-q", "-r", "FATAL", f"{TREE_DIR}/dir_000"], {"GREP_THREADS": str(t)}, None))
 
+    # 24. CLI flags & mixed-operand conformance (Bug 1-5 & flag coverage)
+    excl_from_path = os.path.join(BENCH_DIR, "regress_exclude.list")
+    with open(excl_from_path, "wb") as f:
+        f.write(b"*_001.log\n*_002.log\n")
+    cmd_files_20 = [os.path.join(TREE_DIR, f"dir_000/file_000_{i:03d}.log") for i in range(20)]
+
+    checks.append(("Mixed small + large chunked file", ["MT_CHUNK", test_file, mt_chunk1], None, None))
+    checks.append(("Mixed large + small file", ["FATAL", mt_chunk1, test_file], None, None))
+    checks.append(("Quiet -q missing + large file", ["-q", "MT_CHUNK", os.path.join(BENCH_DIR, "no_such_file.log"), mt_chunk1], None, None))
+    checks.append(("Exclude * on dir with >=16 files", ["--exclude=*", "FATAL", f"{TREE_DIR}/dir_000"] + cmd_files_20, None, None))
+    checks.append(("Exclude * on missing >=16 files", ["--exclude=*", "FATAL", os.path.join(BENCH_DIR, "no_such_file.log")] + cmd_files_20, None, None))
+    checks.append(("Directories -d skip >=16 files", ["-d", "skip", "FATAL", f"{TREE_DIR}/dir_000"] + cmd_files_20, None, None))
+    checks.append(("Directories -d read >=16 files", ["-d", "read", "FATAL", f"{TREE_DIR}/dir_000"] + cmd_files_20, None, None))
+    checks.append(("Exclude-from file tree search", ["-r", f"--exclude-from={excl_from_path}", "-c", "FATAL", f"{TREE_DIR}/dir_000"], None, None))
+    checks.append(("Case override -i --no-ignore-case", ["-F", "-i", "--no-ignore-case", "mt_chunk_1", mt_chunk1], None, None))
+    checks.append(("Obsolete -y case-insensitive", ["-F", "-y", "mt_chunk_1", mt_chunk1], None, None))
+    checks.append(("Undocumented -X awk matcher", ["-X", "awk", "MT_CHUNK_1|MT_CHUNK_2", mt_chunk1, mt_chunk2], None, None))
+    checks.append(("Undocumented -X gawk matcher", ["-X", "gawk", "MT_CHUNK_1|MT_CHUNK_2", mt_chunk1, mt_chunk2], None, None))
+    checks.append(("Context shorthand -2", ["-2", "-n", "ULTRA_RARE_TOKEN_9941", SINGLE_FILE], None, None))
+    checks.append(("Line-buffered --line-buffered", ["--line-buffered", "-n", "ULTRA_RARE_TOKEN_9941", SINGLE_FILE], None, None))
+    checks.append(("No-filename -h multi-chunk", ["-h", "-n", "MT_CHUNK", mt_chunk1, mt_chunk2], None, None))
+    checks.append(("GREP_COLORS custom palette", ["--color=always", "-H", "-n", "-b", "-C", "1", "ULTRA_RARE_TOKEN_9941", SINGLE_FILE],
+                   {"GREP_COLORS": "ms=01;32:mc=01;34:sl=01;33:cx=01;35:fn=36:ln=32:bn=33:se=31"}, None))
+    checks.append(("GREP_COLORS rv inverted", ["--color=always", "-v", "-m", "20", "INFO", test_file],
+                   {"GREP_COLORS": "rv:sl=01;31:cx=01;32"}, None))
+
     passed = 0
     total = len(checks)
     for name, args, env_vars, preexec in checks:
