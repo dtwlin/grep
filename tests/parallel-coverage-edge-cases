@@ -264,6 +264,6 @@ if test ! -r no_read_file; then
 fi
 
 # Early-exit input draining on pipe (no SIGPIPE or error)
-head -c 5000000 /dev/zero 2>/dev/null | tr '\0' 'a' | grep -q 'a' || fail=1
+awk 'BEGIN { for (i = 0; i < 100000; i++) print "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }' 2>/dev/null | grep -q 'a' || fail=1
 
 Exit $fail

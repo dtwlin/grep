@@ -69,6 +69,7 @@ struct pcre_comp
 
   /* Required literal substring pre-filter (AVX2-accelerated via kwset). */
   kwset_t must_kwset;
+  uint8_t const *tables;
   bool is_clone;
 };
 
@@ -504,8 +505,12 @@ Pcompile (char *pattern, idx_t size, reg_syntax_t ignored, bool exact)
       size = re_size;
     }
 
+  pc->tables = nullptr;
   if (!localeinfo.multibyte)
-    pcre2_set_character_tables (ccontext, pcre2_maketables (gcontext));
+    {
+      pc->tables = pcre2_maketables (gcontext);
+      pcre2_set_character_tables (ccontext, pc->tables);
+    }
 
   pc->cre = pcre2_compile ((PCRE2_SPTR) pattern, size, flags,
                            &ec, &e, ccontext);
@@ -516,6 +521,7 @@ Pcompile (char *pattern, idx_t size, reg_syntax_t ignored, bool exact)
       pcre2_get_error_message (ec, ep, sizeof ep);
       free (re_storage);
       pcre2_compile_context_free (ccontext);
+      free ((void *) pc->tables);
       pcre2_general_context_free (gcontext);
       free (pc);
       die (EXIT_TROUBLE, 0, "%s", ep);
@@ -577,6 +583,7 @@ Pclone (void const *vcp)
     pcre2_jit_stack_assign (pc->mcontext, nullptr, pc->jit_stack);
 
   pc->must_kwset = orig->must_kwset;
+  pc->tables = nullptr;
   pc->is_clone = true;
 
   return pc;
@@ -772,7 +779,11 @@ Pfree (void *vpc)
     pcre2_match_context_free (pc->mcontext);
   if (pc->gcontext)
     pcre2_general_context_free (pc->gcontext);
-  if (!pc->is_clone && pc->must_kwset)
-    kwsfree (pc->must_kwset);
+  if (!pc->is_clone)
+    {
+      if (pc->must_kwset)
+        kwsfree (pc->must_kwset);
+      free ((void *) pc->tables);
+    }
   free (pc);
 }
