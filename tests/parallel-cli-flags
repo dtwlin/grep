@@ -337,4 +337,133 @@ check_threads inc_18_exts grep -r \
 check_threads inc_wildcard grep -r --include='*[a-c].*' TARGET_TOKEN_ALPHA tree
 check_threads inc_excl_order grep -r --include='*.c' --exclude='a.c' TARGET_TOKEN_ALPHA tree
 
+# -------------------------------------------------------------------------
+# 13. Zero-Context Flags (-C 0, -A 0, -B 0, -0) Across Chunk & Pipe Boundaries
+# -------------------------------------------------------------------------
+awk 'BEGIN {
+  for (i = 1; i <= 42000; i++)
+    printf "line %05d: MATCH_EVERY_LINE payload for chunk boundary test %d\n", i, i
+}' > all_match.txt || framework_failure_
+
+for flag in '-C 0' '-A 0' '-B 0' '-0'; do
+  tag=$(echo "zctx_$flag" | tr -d ' -')
+  check_threads "$tag" grep $flag MATCH_EVERY_LINE all_match.txt
+  grep '^--$' "exp_$tag" >/dev/null 2>&1 && fail=1
+done
+
+for t in 1 2 4 8; do
+  cat all_match.txt | GREP_THREADS=$t grep -C 0 MATCH_EVERY_LINE > "out_zctx_pipe_$t" || fail=1
+  grep '^--$' "out_zctx_pipe_$t" >/dev/null 2>&1 && fail=1
+done
+for t in 2 4 8; do
+  compare out_zctx_pipe_1 "out_zctx_pipe_$t" || fail=1
+done
+
+# Non-adjacent matches in big.txt with -C 0 must still emit exactly 2 '--' lines
+check_threads zctx_nonadj grep -C 0 TARGET_TOKEN_ALPHA big.txt
+sep_cnt=$(grep -c '^--$' exp_zctx_nonadj)
+test "$sep_cnt" -eq 2 || fail=1
+
+# -------------------------------------------------------------------------
+# 14. Binary File Fast-Mmap / Defer-Nulls Cross-File Separator and -q Exit
+# -------------------------------------------------------------------------
+awk 'BEGIN {
+  printf "header\0with_nul\n"
+  for (i = 1; i <= 45000; i++) {
+    if (i == 5000)
+      printf "line %05d: TARGET_TOKEN_ALPHA inside large binary\n", i
+    else
+      printf "line %05d: binary filler payload line %d\n", i, i
+  }
+}' > bin_fast.bin || framework_failure_
+
+check_threads bin_fast_sep grep -C 1 TARGET_TOKEN_ALPHA bin_fast.bin small1.txt
+grep '^--$' exp_bin_fast_sep >/dev/null 2>&1 || fail=1
+
+for t in 1 2 4 8; do
+  GREP_THREADS=$t grep -q TARGET_TOKEN_ALPHA bin_fast.bin no_such_after.txt > "out_bf_q_$t" 2> "err_bf_q_$t"
+  test $? -eq 0 || fail=1
+  test ! -s "err_bf_q_$t" || fail=1
+done
+
+awk 'BEGIN {
+  printf "line 00001: TARGET_TOKEN_ALPHA before nul\n"
+  for (i = 1; i <= 4000; i++)
+    printf "line %05d: defer_nulls filler text payload %d\n", i, i
+  printf "trailer\0nul\n"
+}' > bin_defer.bin || framework_failure_
+
+for t in 1 2 4 8; do
+  GREP_THREADS=$t grep -q TARGET_TOKEN_ALPHA bin_defer.bin no_such_after.txt > "out_bd_q_$t" 2> "err_bd_q_$t"
+  test $? -eq 0 || fail=1
+  test ! -s "err_bd_q_$t" || fail=1
+done
+
+# -------------------------------------------------------------------------
+# 15. Multiple '-' Stdin Operands with Seekable Stdin
+# -------------------------------------------------------------------------
+cat <<'EOF' > exp_multi_dash_c || framework_failure_
+(standard input):3
+(standard input):0
+EOF
+cat <<'EOF' > exp_multi_dash_m1 || framework_failure_
+(standard input):line 00100: TARGET_TOKEN_ALPHA CaseMix_Beta num=100
+(standard input):line 22000: TARGET_TOKEN_ALPHA CaseMix_Beta num=22000
+EOF
+for t in 1 2 4 8; do
+  GREP_THREADS=$t grep -c TARGET_TOKEN_ALPHA - - < big.txt > "out_mdash_c_$t"
+  test $? -eq 0 || fail=1
+  compare exp_multi_dash_c "out_mdash_c_$t" || fail=1
+
+  GREP_THREADS=$t grep -m 1 TARGET_TOKEN_ALPHA - - < big.txt > "out_mdash_m1_$t" || fail=1
+  compare exp_multi_dash_m1 "out_mdash_m1_$t" || fail=1
+done
+
+# -------------------------------------------------------------------------
+# 16. Regex Pre-Filter Edge Cases (kwsmusts_multi, backref_filter, PCRE)
+# -------------------------------------------------------------------------
+printf 'fox\n' | grep -e 'fo\+x' -e 'cd' >/dev/null || fail=1
+printf 'fx\n' | grep -e 'fo\?x' -e 'cd' >/dev/null || fail=1
+printf 'fox\n' | grep -e 'fo\{1,2\}x' -e 'cd' >/dev/null || fail=1
+printf 'ab\n' | grep 'ab\|cd' >/dev/null || fail=1
+printf 'fox\n' | grep -E 'fo{1,2}x|cd' >/dev/null || fail=1
+printf 'fox\n' | grep -E '[a-z]{1,2}x|cd' >/dev/null || fail=1
+printf 'fox\n' | grep -E '(fo){1,2}x|cd' >/dev/null || fail=1
+
+printf 'x\n' | grep -E '(a{3}?)\1' >/dev/null || fail=1
+printf 'x\n' | grep '\(a\{3\}\?\)\1' >/dev/null || fail=1
+printf 'abc\n' | grep -E '([a-z]{3})\1{,2}' >/dev/null || fail=1
+printf 'abc\n' | grep '\([a-z]\{3\}\)\1\{,2\}' >/dev/null || fail=1
+printf 'abc\n' | grep -E '([a-z]{3})\1+?' >/dev/null || fail=1
+printf 'abc\n' | grep '\([a-z]\{3\}\)\1\+\?' >/dev/null || fail=1
+printf 'a{10,x}a{10,x}\n' | grep -E '(a{10,x})\1' >/dev/null || fail=1
+printf 'a{10a{10\n' | grep -E '(a{10)\1' >/dev/null || fail=1
+
+if (grep -P --version) >/dev/null 2>&1; then
+  printf 'foo\n' | grep -P 'foo(*ACCEPT)bar_baz' >/dev/null || fail=1
+  printf 'abcdefghijx\n' | grep -P '.{10,20}x' >/dev/null || fail=1
+  printf 'abcdefghijx\n' | grep -P '\w{10,20}x' >/dev/null || fail=1
+  printf 'aax\n' | grep -P '(a)\g-1x' >/dev/null || fail=1
+  printf 'abc\n' | grep -P '\pLbc' >/dev/null || fail=1
+fi
+
+# -------------------------------------------------------------------------
+# 17. UTF-8 -F -i Quirk with -o and --color=always
+# -------------------------------------------------------------------------
+if test "${LOCALE_FR_UTF8:-none}" != "none"; then
+  u8_loc="$LOCALE_FR_UTF8"
+elif locale -a 2>/dev/null | grep -E '^en_US\.(utf8|UTF-8)$' >/dev/null 2>&1; then
+  u8_loc="en_US.UTF-8"
+elif locale -a 2>/dev/null | grep -E '^C\.(utf8|UTF-8)$' >/dev/null 2>&1; then
+  u8_loc="C.UTF-8"
+else
+  u8_loc=""
+fi
+
+if test -n "$u8_loc"; then
+  printf 'is\304\261\n' > exp_u8_quirk || framework_failure_
+  printf 'is\304\261\n' | LC_ALL="$u8_loc" grep -F -i -o -e is -e isi > out_u8_quirk || fail=1
+  compare exp_u8_quirk out_u8_quirk || fail=1
+fi
+
 Exit $fail

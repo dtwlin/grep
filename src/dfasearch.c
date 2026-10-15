@@ -121,6 +121,61 @@ is_quantifier (char const *p, char const *lim, reg_syntax_t syntax_bits)
     }
 }
 
+static char const * _GL_ATTRIBUTE_PURE
+skip_quantifiers (char const *p, char const *lim, reg_syntax_t syntax_bits)
+{
+  while (p < lim)
+    {
+      if (syntax_bits & RE_NO_BK_VBAR) /* ERE */
+        {
+          if (*p == '*' || *p == '+' || *p == '?')
+            {
+              p++;
+              continue;
+            }
+          if (*p == '{')
+            {
+              p++;
+              while (p < lim && *p != '}')
+                p++;
+              if (p < lim)
+                p++;
+              continue;
+            }
+          break;
+        }
+      else /* BRE */
+        {
+          if (*p == '*')
+            {
+              p++;
+              continue;
+            }
+          if (p + 1 < lim && *p == '\\')
+            {
+              if (p[1] == '+' || p[1] == '?')
+                {
+                  p += 2;
+                  continue;
+                }
+              if (p[1] == '{')
+                {
+                  p += 2;
+                  while (p + 1 < lim && !(p[0] == '\\' && p[1] == '}'))
+                    p++;
+                  if (p + 1 < lim)
+                    p += 2;
+                  else
+                    p = lim;
+                  continue;
+                }
+            }
+          break;
+        }
+    }
+  return p;
+}
+
 struct branch_info
 {
   char *best_lit;
@@ -183,6 +238,34 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
           continue;
         }
 
+      /* Top-level branch separators */
+      if (paren_depth == 0)
+        {
+          idx_t sep_len = 0;
+          if (*p == '\n')
+            sep_len = 1;
+          else if ((syntax_bits & RE_NO_BK_VBAR) && *p == '|')
+            sep_len = 1;
+          else if (!(syntax_bits & RE_NO_BK_VBAR) && !(syntax_bits & RE_LIMITED_OPS)
+                   && *p == '\\' && p + 1 < lim && p[1] == '|')
+            sep_len = 2;
+
+          if (sep_len > 0)
+            {
+              idx_t blen = p - b_start;
+              if (blen == 0)
+                goto fail_slices;
+              if (nbranches == branch_cap)
+                slices = xpalloc (slices, &branch_cap, 1, -1, sizeof *slices);
+              slices[nbranches].start = b_start;
+              slices[nbranches].len = blen;
+              nbranches++;
+              p += sep_len;
+              b_start = p;
+              continue;
+            }
+        }
+
       /* Check parens */
       if (syntax_bits & RE_NO_BK_PARENS) /* ERE */
         {
@@ -229,34 +312,6 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
               if (p + 1 >= lim)
                 goto fail_slices;
               p += 2;
-              continue;
-            }
-        }
-
-      /* Top-level branch separators */
-      if (paren_depth == 0)
-        {
-          idx_t sep_len = 0;
-          if (*p == '\n')
-            sep_len = 1;
-          else if ((syntax_bits & RE_NO_BK_VBAR) && *p == '|')
-            sep_len = 1;
-          else if (!(syntax_bits & RE_NO_BK_VBAR) && !(syntax_bits & RE_LIMITED_OPS)
-                   && *p == '\\' && p + 1 < lim && p[1] == '|')
-            sep_len = 2;
-
-          if (sep_len > 0)
-            {
-              idx_t blen = p - b_start;
-              if (blen == 0)
-                goto fail_slices;
-              if (nbranches == branch_cap)
-                slices = xpalloc (slices, &branch_cap, 1, -1, sizeof *slices);
-              slices[nbranches].start = b_start;
-              slices[nbranches].len = blen;
-              nbranches++;
-              p += sep_len;
-              b_start = p;
               continue;
             }
         }
@@ -324,7 +379,7 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
               if (*bp == ']')
                 {
                   b_bracket = false;
-                  bp++;
+                  bp = skip_quantifiers (bp + 1, blim, syntax_bits);
                   continue;
                 }
               bp++;
@@ -378,6 +433,8 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
                   if (b_paren > 0)
                     b_paren--;
                   bp++;
+                  if (b_paren == 0)
+                    bp = skip_quantifiers (bp, blim, syntax_bits);
                   continue;
                 }
             }
@@ -408,6 +465,8 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
                   if (b_paren > 0)
                     b_paren--;
                   bp += 2;
+                  if (b_paren == 0)
+                    bp = skip_quantifiers (bp, blim, syntax_bits);
                   continue;
                 }
             }
@@ -443,7 +502,10 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
                   break;
                 }
               char c = bp[1];
-              if (strchr ("^.[$()|*+?{\\", c) != nullptr)
+              char const *lit_escapes = (syntax_bits & RE_NO_BK_VBAR)
+                                        ? "^.[$()|*+?{}\\"
+                                        : "^.[$*\\";
+              if (strchr (lit_escapes, c) != nullptr)
                 {
                   if (is_quantifier (bp + 2, blim, syntax_bits))
                     {
@@ -454,7 +516,7 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
                           best_len = cur_len;
                         }
                       cur_len = 0;
-                      bp += 2;
+                      bp = skip_quantifiers (bp + 2, blim, syntax_bits);
                     }
                   else
                     {
@@ -464,7 +526,7 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
                 }
               else
                 {
-                  /* Special escape (\b, \w, \s, etc.) */
+                  /* Special escape (\b, \w, \s, or BRE \+, \?, \{, \}, etc.) */
                   branch_is_pure = false;
                   if (cur_len > best_len)
                     {
@@ -472,7 +534,10 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
                       best_len = cur_len;
                     }
                   cur_len = 0;
-                  bp += 2;
+                  if (is_quantifier (bp, blim, syntax_bits))
+                    bp = skip_quantifiers (bp, blim, syntax_bits);
+                  else
+                    bp = skip_quantifiers (bp + 2, blim, syntax_bits);
                 }
               continue;
             }
@@ -500,7 +565,10 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
                   best_len = cur_len;
                 }
               cur_len = 0;
-              bp++;
+              if (is_quantifier (bp, blim, syntax_bits))
+                bp = skip_quantifiers (bp, blim, syntax_bits);
+              else
+                bp = skip_quantifiers (bp + 1, blim, syntax_bits);
               continue;
             }
 
@@ -514,7 +582,7 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
                   best_len = cur_len;
                 }
               cur_len = 0;
-              bp++;
+              bp = skip_quantifiers (bp + 1, blim, syntax_bits);
             }
           else
             {
@@ -823,6 +891,7 @@ analyze_backref_filter (char const *p, idx_t len, reg_syntax_t syntax_bits,
         }
 
       idx_t qmin = 1;
+      bool had_quant = false;
       if (s < g1_end)
         {
           if (no_bk_parens)
@@ -830,38 +899,56 @@ analyze_backref_filter (char const *p, idx_t len, reg_syntax_t syntax_bits,
               if (*s == '*')
                 {
                   qmin = 0;
+                  had_quant = true;
                   s++;
                 }
               else if (*s == '?')
                 {
                   qmin = 0;
+                  had_quant = true;
                   s++;
                 }
               else if (*s == '+')
                 {
                   qmin = 1;
+                  had_quant = true;
                   s++;
                 }
               else if (*s == '{')
                 {
                   s++;
                   qmin = 0;
+                  bool has_content = false;
                   while (s < g1_end && *s >= '0' && *s <= '9')
                     {
+                      has_content = true;
+                      if (qmin > 255)
+                        return;
                       qmin = qmin * 10 + (*s - '0');
                       s++;
                     }
-                  while (s < g1_end && *s != '}')
-                    s++;
-                  if (s < g1_end)
-                    s++;
+                  if (s < g1_end && *s == ',')
+                    {
+                      has_content = true;
+                      s++;
+                      while (s < g1_end && *s >= '0' && *s <= '9')
+                        s++;
+                    }
+                  if (!has_content || s >= g1_end || *s != '}')
+                    return;
+                  had_quant = true;
+                  s++;
                 }
+              if (had_quant && s < g1_end
+                  && (*s == '*' || *s == '?' || *s == '+' || *s == '{'))
+                return;
             }
           else
             {
               if (*s == '*')
                 {
                   qmin = 0;
+                  had_quant = true;
                   s++;
                 }
               else if (*s == '\\' && s + 1 < g1_end)
@@ -869,28 +956,47 @@ analyze_backref_filter (char const *p, idx_t len, reg_syntax_t syntax_bits,
                   if (s[1] == '?')
                     {
                       qmin = 0;
+                      had_quant = true;
                       s += 2;
                     }
                   else if (s[1] == '+')
                     {
                       qmin = 1;
+                      had_quant = true;
                       s += 2;
                     }
                   else if (s[1] == '{')
                     {
                       s += 2;
                       qmin = 0;
+                      bool has_content = false;
                       while (s < g1_end && *s >= '0' && *s <= '9')
                         {
+                          has_content = true;
+                          if (qmin > 255)
+                            return;
                           qmin = qmin * 10 + (*s - '0');
                           s++;
                         }
-                      while (s + 1 < g1_end && !(s[0] == '\\' && s[1] == '}'))
-                        s++;
-                      if (s + 1 < g1_end)
-                        s += 2;
+                      if (s < g1_end && *s == ',')
+                        {
+                          has_content = true;
+                          s++;
+                          while (s < g1_end && *s >= '0' && *s <= '9')
+                            s++;
+                        }
+                      if (!has_content || s + 1 >= g1_end
+                          || s[0] != '\\' || s[1] != '}')
+                        return;
+                      had_quant = true;
+                      s += 2;
                     }
                 }
+              if (had_quant && s < g1_end
+                  && (*s == '*'
+                      || (*s == '\\' && s + 1 < g1_end
+                          && (s[1] == '?' || s[1] == '+' || s[1] == '{'))))
+                return;
             }
         }
       min_len += atom_base * qmin;
@@ -921,22 +1027,17 @@ analyze_backref_filter (char const *p, idx_t len, reg_syntax_t syntax_bits,
     {
       if (no_bk_parens)
         {
-          if (*after_1 == '?' || *after_1 == '*')
-            return;
-          if (*after_1 == '{' && after_1 + 1 < lim && after_1[1] == '0')
+          if (*after_1 == '?' || *after_1 == '*'
+              || *after_1 == '+' || *after_1 == '{')
             return;
         }
       else
         {
           if (*after_1 == '*')
             return;
-          if (*after_1 == '\\' && after_1 + 1 < lim)
-            {
-              if (after_1[1] == '?')
-                return;
-              if (after_1[1] == '{' && after_1 + 2 < lim && after_1[2] == '0')
-                return;
-            }
+          if (*after_1 == '\\' && after_1 + 1 < lim
+              && (after_1[1] == '?' || after_1[1] == '+' || after_1[1] == '{'))
+            return;
         }
     }
 

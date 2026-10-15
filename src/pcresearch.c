@@ -191,17 +191,22 @@ skip_pcre_escape (char const *pat, idx_t p, idx_t size)
       if (p < size && pat[p] == '}')
         p++;
     }
-  else if (esc == '0' || (esc >= '1' && esc <= '7'))
+  else if (esc == '0' || (esc >= '1' && esc <= '9'))
     {
-      for (int i = 0; i < 2 && p < size && pat[p] >= '0' && pat[p] <= '7'; i++)
+      while (p < size && pat[p] >= '0' && pat[p] <= '9')
         p++;
     }
-  else if ((esc == 'p' || esc == 'P' || esc == 'N') && p < size && pat[p] == '{')
+  else if ((esc == 'p' || esc == 'P' || esc == 'N') && p < size)
     {
-      p++;
-      while (p < size && pat[p] != '}')
-        p++;
-      if (p < size && pat[p] == '}')
+      if (pat[p] == '{')
+        {
+          p++;
+          while (p < size && pat[p] != '}')
+            p++;
+          if (p < size && pat[p] == '}')
+            p++;
+        }
+      else if (esc == 'p' || esc == 'P')
         p++;
     }
   else if ((esc == 'g' || esc == 'k') && p < size)
@@ -216,6 +221,13 @@ skip_pcre_escape (char const *pat, idx_t p, idx_t size)
           while (p < size && pat[p] != closer)
             p++;
           if (p < size && pat[p] == closer)
+            p++;
+        }
+      else if (esc == 'g')
+        {
+          if (pat[p] == '-' || pat[p] == '+')
+            p++;
+          while (p < size && pat[p] >= '0' && pat[p] <= '9')
             p++;
         }
     }
@@ -274,6 +286,8 @@ find_must_literal (char const *pat, idx_t size, idx_t *out_len)
     {
       if (pat[p] == '(')
         {
+          if (p + 1 < size && pat[p + 1] == '*')
+            return nullptr;
           if (p + 1 < size && pat[p + 1] == '?')
             {
               bool ok = false;
@@ -294,6 +308,8 @@ find_must_literal (char const *pat, idx_t size, idx_t *out_len)
                 p = skip_pcre_char_class (pat, p, size);
               else if (pat[p] == '(')
                 {
+                  if (p + 1 < size && pat[p + 1] == '*')
+                    return nullptr;
                   if (p + 1 < size && pat[p + 1] == '?')
                     {
                       bool ok = false;
@@ -360,7 +376,15 @@ find_must_literal (char const *pat, idx_t size, idx_t *out_len)
 
       if (!is_lit_char (pat[p]))
         {
-          p++;
+          if (pat[p] == '{')
+            {
+              while (p < size && pat[p] != '}')
+                p++;
+              if (p < size && pat[p] == '}')
+                p++;
+            }
+          else
+            p++;
           continue;
         }
 

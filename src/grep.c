@@ -2153,6 +2153,18 @@ grep (int fd, struct stat *st, bool *ineof)
           if (list_files == LISTFILES_MATCHING
               || (done_on_match && out_quiet && !count_matches))
             {
+              if (list_files == LISTFILES_NONE)
+                {
+                  file_used = true;
+                  if (!buffering_enabled)
+                    global_used = true;
+                  task_had_prtext = true;
+                  if (exit_on_match && !buffering_enabled)
+                    {
+                      stdout_errno = -1;
+                      exit (EXIT_SUCCESS);
+                    }
+                }
               nlines = 1;
               *ineof = true;
               goto finish_grep;
@@ -2246,6 +2258,18 @@ grep (int fd, struct stat *st, bool *ineof)
                         nlines = 1;
                     }
                   munmap ((void *) map, st->st_size);
+                  if (nlines > 0 && list_files == LISTFILES_NONE)
+                    {
+                      file_used = true;
+                      if (!buffering_enabled)
+                        global_used = true;
+                      task_had_prtext = true;
+                      if (exit_on_match && !buffering_enabled)
+                        {
+                          stdout_errno = -1;
+                          exit (EXIT_SUCCESS);
+                        }
+                    }
                   goto finish_grep;
                 }
             }
@@ -4239,7 +4263,7 @@ worker_thread_func (void *arg)
 
               while (p < clim)
                 {
-                  if (out_before <= 0 && out_after <= 0 && atomic_load (&state->match_overflow))
+                  if (out_before < 0 && out_after < 0 && atomic_load (&state->match_overflow))
                     break;
 
                   ptrdiff_t mo;
@@ -4272,7 +4296,7 @@ worker_thread_func (void *arg)
                         }
 
                       pthread_mutex_lock (&state->match_mutex);
-                      if (out_before > 0 || out_after > 0)
+                      if (0 <= out_before || 0 <= out_after)
                         {
                           if (state->match_count >= state->match_cap)
                             {
@@ -4754,6 +4778,15 @@ producer_enqueue_stdin (void)
   q_count++;
 
   pthread_cond_signal (&q_not_empty_cv);
+  while (commit_seq < next_seq)
+    {
+      rob_try_commit_locked ();
+      if (commit_seq >= next_seq)
+        break;
+      rob_done_waiters++;
+      pthread_cond_wait (&rob_done_cv, &pool_mutex);
+      rob_done_waiters--;
+    }
   pthread_mutex_unlock (&pool_mutex);
 }
 
@@ -5474,8 +5507,8 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
       return;
     }
 
-  /* Case 2: Mode 2: Independent Chunks (!out_line && out_before <= 0 && out_after <= 0 && max_count == INTMAX_MAX) */
-  if (!out_line && out_before <= 0 && out_after <= 0 && max_count == INTMAX_MAX)
+  /* Case 2: Mode 2: Independent Chunks (!out_line && out_before < 0 && out_after < 0 && max_count == INTMAX_MAX) */
+  if (!out_line && out_before < 0 && out_after < 0 && max_count == INTMAX_MAX)
     {
       for (size_t k = 0; k < num_chunks; ++k)
         {
@@ -5538,7 +5571,7 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
   state->chunk_nls = xnmalloc (num_chunks, sizeof *state->chunk_nls);
   state->prefix_nls = xnmalloc (num_chunks + 1, sizeof *state->prefix_nls);
   state->chunk_has_matches = xnmalloc (num_chunks, sizeof *state->chunk_has_matches);
-  state->match_cap = (out_before > 0 || out_after > 0) ? 65536 : 4096;
+  state->match_cap = (0 <= out_before || 0 <= out_after) ? 65536 : 4096;
   state->matches = xnmalloc (state->match_cap, sizeof *state->matches);
   state->match_count = 0;
   atomic_init (&state->match_overflow, false);
@@ -5591,7 +5624,7 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
     state->prefix_nls[k + 1] = state->prefix_nls[k] + state->chunk_nls[k];
 
   /* Sparse match fast-path (context lines or rare matches with line numbers/byte offsets) */
-  if ((out_before > 0 || out_after > 0)
+  if ((0 <= out_before || 0 <= out_after)
       || (!out_invert && !count_matches && list_files == LISTFILES_NONE
           && !atomic_load (&state->match_overflow) && state->match_count < state->match_cap))
     {
@@ -7680,13 +7713,24 @@ producer_run (char *const *files)
               && st.st_size >= 2 * 1024 * 1024
               && !SAME_INODE (st, out_stat)
               && lseek (STDIN_FILENO, 0, SEEK_CUR) == 0
-              && (!out_invert || (out_before <= 0 && out_after <= 0))
+              && (!out_invert || (out_before < 0 && out_after < 0))
               && max_count == INTMAX_MAX)
             {
               chunked_grep_fd (STDIN_FILENO, false, label ? label : _("(standard input)"), &st);
+              pthread_mutex_lock (&pool_mutex);
+              while (commit_seq < next_seq)
+                {
+                  rob_try_commit_locked ();
+                  if (commit_seq >= next_seq)
+                    break;
+                  rob_done_waiters++;
+                  pthread_cond_wait (&rob_done_cv, &pool_mutex);
+                  rob_done_waiters--;
+                }
+              pthread_mutex_unlock (&pool_mutex);
             }
           else if (pool_target > 1 && !isatty (STDIN_FILENO)
-                   && out_before <= 0 && out_after <= 0 && max_count == INTMAX_MAX
+                   && out_before < 0 && out_after < 0 && max_count == INTMAX_MAX
                    && binary_files != WITHOUT_MATCH_BINARY_FILES)
             stream_slicer_stdin ();
           else
@@ -7714,7 +7758,7 @@ producer_run (char *const *files)
                   f = f_end - 1;
                 }
               else if (S_ISREG (st.st_mode) && st.st_size >= 2 * 1024 * 1024 && pool_target > 1
-                       && (!out_invert || (out_before <= 0 && out_after <= 0))
+                       && (!out_invert || (out_before < 0 && out_after < 0))
                        && max_count == INTMAX_MAX)
                 chunked_grep_file (*f, &st);
               else
@@ -8470,11 +8514,11 @@ main (int argc, char **argv)
                                  && !SAME_INODE (in_st, out_stat)
                                  && lseek (STDIN_FILENO, 0, SEEK_CUR) == 0
                                  && (!out_invert
-                                     || (out_before <= 0 && out_after <= 0)));
+                                     || (out_before < 0 && out_after < 0)));
       bool can_slice_stdin = ((!stdin_is_reg
                                || (in_st.st_size >= 2 * 1024 * 1024
                                    && !SAME_INODE (in_st, out_stat)))
-                              && out_before <= 0 && out_after <= 0
+                              && out_before < 0 && out_after < 0
                               && max_count == INTMAX_MAX
                               && binary_files != WITHOUT_MATCH_BINARY_FILES);
       can_parallelize_stdin = stdin_is_large_reg || can_slice_stdin;
@@ -8488,7 +8532,7 @@ main (int argc, char **argv)
       is_single_large_file = (S_ISREG (tmp_st.st_mode)
                               && tmp_st.st_size >= 2 * 1024 * 1024
                               && (!out_invert
-                                  || (out_before <= 0 && out_after <= 0)));
+                                  || (out_before < 0 && out_after < 0)));
       is_dir_recurse = (directories == RECURSE_DIRECTORIES
                         && S_ISDIR (tmp_st.st_mode));
     }

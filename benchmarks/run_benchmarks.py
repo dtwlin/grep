@@ -532,6 +532,24 @@ def run_edge_case_conformance():
     checks.append(("GREP_COLORS rv inverted", ["--color=always", "-v", "-m", "20", "INFO", test_file],
                    {"GREP_COLORS": "rv:sl=01;31:cx=01;32"}, None))
 
+    # 25. Round 2 audit regressions (zero-context chunk boundaries, fast-mmap separator/-q, pre-filters)
+    bin_fast_file = os.path.join(BENCH_DIR, "regress_bin_fast.bin")
+    with open(bin_fast_file, "wb") as f:
+        f.write(b"hdr\x00nul\n" + (b"x" * 70 + b"\n") * 5000 + b"MT_CHUNK_1 hit\n" + (b"y" * 70 + b"\n") * 30000)
+
+    checks.append(("Zero-context -C 0 adjacent chunks", ["-C", "0", "-c", "MT_CHUNK_1", mt_chunk1], None, None))
+    checks.append(("Zero-context -A 0 adjacent chunks", ["-A", "0", "MT_CHUNK_1", mt_chunk1], None, None))
+    checks.append(("Zero-context -B 0 adjacent chunks", ["-B", "0", "MT_CHUNK_1", mt_chunk1], None, None))
+    checks.append(("Zero-context -0 adjacent chunks", ["-0", "MT_CHUNK_1", mt_chunk1], None, None))
+    checks.append(("Fast-mmap binary + text -C 1 sep", ["-F", "-C", "1", "MT_CHUNK_1", bin_fast_file, test_file], None, None))
+    checks.append(("Fast-mmap binary -q + missing", ["-F", "-q", "MT_CHUNK_1", bin_fast_file, os.path.join(BENCH_DIR, "no_such_after.log")], {"GREP_THREADS": "1"}, None))
+    checks.append(("BRE kwsmusts_multi \\+ quantifier", ["-e", r"MT_CHUNK_\+1", "-e", "NEVER_HIT", test_file], None, None))
+    checks.append(("ERE kwsmusts_multi {m,n} quant", ["-E", "MT_CHUNK_[0-9]{1,2}|NEVER_HIT", test_file], None, None))
+    checks.append(("Backref stacked quant (a{3}?)\\1", ["-E", "-c", r"(a{3}?)\1", test_file], None, None))
+    checks.append(("Backref invalid interval (a{10,x})\\1", ["-E", "-c", r"(a{10,x})\1", test_file], None, None))
+    checks.append(("PCRE (*ACCEPT) must-literal", ["-P", "-c", "MT_CHUNK_1(*ACCEPT)NEVER_LITERAL", test_file], None, None))
+    checks.append(("PCRE .{10,20} must-literal", ["-P", "-c", r".{10,20}MT_CHUNK_1", test_file], None, None))
+
     passed = 0
     total = len(checks)
     for name, args, env_vars, preexec in checks:

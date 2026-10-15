@@ -517,7 +517,13 @@ Fexecute (void *vcp, char const *buf, idx_t size, idx_t *match_size,
   char const *search_start = start_ptr ? start_ptr : buf;
   if (off >= 0)
     {
-      idx_t check_len = (off + core_msize) - (search_start - buf);
+      char const *check_end = buf + off + core_msize;
+      if (start_ptr)
+        {
+          char const *nl = memchr (check_end, eolbyte, (buf + size) - check_end);
+          check_end = nl ? nl + 1 : buf + size;
+        }
+      idx_t check_len = check_end - search_start;
       if (find_utf8_icase_quirk (search_start, check_len, kwsearch->utf8_quirk_mask))
         return Fexecute_with_utf8_quirk (kwsearch, buf, size, match_size, start_ptr);
       *match_size = core_msize;
