@@ -61,7 +61,11 @@ $PERL -e '
   }
 '
 GREP_THREADS=1 grep -r 'fd_pressure_match' fd_tree > fd_exp 2> fd_err1
-(ulimit -n 20 && GREP_THREADS=2 grep -r 'fd_pressure_match' fd_tree 0<&-) > fd_act 2> fd_err2
+(
+  { set +x; } 2>/dev/null
+  for fd in $(seq 3 63); do eval "exec $fd>&-"; done 2>/dev/null
+  ulimit -n 20 && GREP_THREADS=2 grep -r 'fd_pressure_match' fd_tree 0<&- > fd_act 2> fd_err2
+)
 compare fd_exp fd_act || fail=1
 compare fd_err1 fd_err2 || fail=1
 
