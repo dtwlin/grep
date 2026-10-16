@@ -19,6 +19,7 @@ check_threads ()
   shift
   GREP_THREADS=1 "$@" > "exp_$tag" 2> "experr_$tag"
   rc_exp=$?
+  test "$rc_exp" -le 2 || { fail=1; echo "bad rc_exp=$rc_exp: $tag" >&2; }
   for t in 2 4; do
     GREP_THREADS=$t "$@" > "out_${tag}_$t" 2> "outerr_${tag}_$t"
     rc_got=$?
@@ -228,6 +229,7 @@ check_threads bref_bre_qqmark grep '\(ab\?c\)\1' dfa_in.txt
 check_threads bref_bre_qrange grep '\(a\{2,12\}\)\1' dfa_in.txt
 check_threads bref_bre_qbig grep '\(a\{3000\}\)\1' dfa_in.txt
 check_threads bref_bre_qbad grep '\(a\{10,x\}\)\1' dfa_in.txt
+check_threads bref_ere_qbad grep -E '(a{10,x})\1' dfa_in.txt
 check_threads bref_bre_after1 grep '\(abc\)\1*' dfa_in.txt
 check_threads bref_multisep grep -E '(abc)--\1' dfa_in.txt
 

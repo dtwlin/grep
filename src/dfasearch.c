@@ -1116,7 +1116,6 @@ regex_compile (struct dfa_comp *dc, char const *p, idx_t len,
       return true;
     }
 
-  regfree (&pat);
   free (pat.fastmap);
 
   /* Emit a filename:lineno: prefix for patterns taken from files.  */
@@ -1214,11 +1213,15 @@ GEAcompile (char *pattern, idx_t size, reg_syntax_t syntax_bits,
           dc->bref_filters = dc->bref_filters_alloc + 1;
         }
 
+      bool ok = true;
       if (!suppress_dfawarn || backref)
         {
           if (!regex_compile (dc, p, len, dc->pcount, lineno, syntax_bits,
                               !backref))
-            compilation_failed = true;
+            {
+              compilation_failed = true;
+              ok = false;
+            }
         }
 
       char const *pat_line = p;
@@ -1227,10 +1230,13 @@ GEAcompile (char *pattern, idx_t size, reg_syntax_t syntax_bits,
 
       if (backref)
         {
-          if (!match_icase)
-            analyze_backref_filter (pat_line, len, syntax_bits,
-                                    &dc->bref_filters[dc->pcount]);
-          dc->pcount++;
+          if (ok)
+            {
+              if (!match_icase)
+                analyze_backref_filter (pat_line, len, syntax_bits,
+                                        &dc->bref_filters[dc->pcount]);
+              dc->pcount++;
+            }
           prev = p;
         }
     }
@@ -1595,6 +1601,8 @@ EGexecute (void *vdc, char const *buf, idx_t size, idx_t *match_size,
 
           dc->patterns[i].not_eol = 0;
           dc->patterns[i].newline_anchor = eolbyte == '\n';
+          if (dc->regs.num_regs > 0)
+            dc->patterns[i].regs_allocated = REGS_REALLOCATE;
           start = re_search (&dc->patterns[i], beg, end - beg - 1,
                              ptr - beg, end - ptr - 1, &dc->regs);
           if (start < -1)
