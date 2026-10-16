@@ -128,7 +128,7 @@ if (grep -P --version) >/dev/null 2>&1; then
   returns_ 2 grep -P '(*NO_JIT)(*LIMIT_HEAP=1)((a+)*)+$' pcre_lim.txt >/dev/null 2>&1 || fail=1
 
   # Octal escapes \o{...}, \101, backref \1, leading-] character classes, nested groups/verbs/quantifiers
-  printf 'Abcde\n]bcde\nxbcde\nabbcde\nabcde\nabbbcde\n' > pcre_must.txt || framework_failure_
+  printf 'Abcde\n]bcde\nxbcde\nabbcde\nabcde\nabbbcde\nfoo(bar)\n' > pcre_must.txt || framework_failure_
   grep -P '\o{101}bcde' pcre_must.txt >/dev/null || fail=1
   grep -P '\101bcde' pcre_must.txt >/dev/null || fail=1
   grep -P '(a)\1bcde' pcre_must.txt >/dev/null && fail=1
@@ -137,9 +137,22 @@ if (grep -P --version) >/dev/null 2>&1; then
   grep -P '((a(*ACCEPT)))bcde' pcre_must.txt >/dev/null || fail=1
   grep -P '((?:ab))bcde' pcre_must.txt >/dev/null || fail=1
   grep -P '((?<=ab))bcde' pcre_must.txt >/dev/null || fail=1
+  grep -P '(?>ab)cde' pcre_must.txt >/dev/null || fail=1
+  grep -P '(?=ab)abcde' pcre_must.txt >/dev/null || fail=1
+  grep -P '(?<!xy)abcde' pcre_must.txt >/dev/null || fail=1
   grep -P '((?!xy))bcde' pcre_must.txt >/dev/null || fail=1
+  grep -P 'abcde|xyz' pcre_must.txt >/dev/null || fail=1
+  grep -P '(?:a|b)bcde' pcre_must.txt >/dev/null || fail=1
+  grep -P '([a-z]\w)bcde' pcre_must.txt >/dev/null || fail=1
+  grep -P '(?i)abcde' pcre_must.txt >/dev/null || fail=1
   grep -P '(ab){1,2}bcde' pcre_must.txt >/dev/null || fail=1
   grep -P 'ab{2,3}cde' pcre_must.txt >/dev/null || fail=1
+  grep -P '.{1,2}cde' pcre_must.txt >/dev/null || fail=1
+  grep -P 'abc+de' pcre_must.txt >/dev/null || fail=1
+  grep -P 'foo\(bar\)' pcre_must.txt >/dev/null || fail=1
+  grep -P 'foo\(?bar\)' pcre_must.txt >/dev/null || fail=1
+  grep -P -w 'abcde' pcre_must.txt >/dev/null || fail=1
+  grep -P -x 'abcde' pcre_must.txt >/dev/null || fail=1
 fi
 
 # -------------------------------------------------------------------------
@@ -193,6 +206,13 @@ check_threads dfa_word_esc grep -E 'foo\w+xyz|quv\bmnt' dfa_in.txt
 check_threads dfa_bre_qesc grep 'foo\+xyz\|quv\?mnt' dfa_in.txt
 check_threads dfa_bre_meta grep '^fooxyz\|quv.*mnt' dfa_in.txt
 check_threads dfa_short_fb grep -E 'fooxyz|q[0-9]+' dfa_in.txt
+
+# Secondary must-substring extraction (extract_secondary_must & EGexecute must2 filter)
+check_threads dfa_must2_dot grep -E 'foo.*xyz' dfa_in.txt dfa_in.txt
+check_threads dfa_must2_brk grep -E 'foo[0-9a-z.]+xyz' dfa_in.txt
+check_threads dfa_must2_esc grep -E 'foo\w+xyz' dfa_in.txt
+check_threads dfa_must2_grp grep -E 'foo(word|5)xyz' dfa_in.txt
+check_threads dfa_must2_bre grep 'foo\(word\|5\)xyz' dfa_in.txt
 
 # possible_backrefs_in_pattern trailing '\\', regex_compile error with -e and -f,
 # safe_dfaexec >4KiB line with begline, EGexecute match > best_match and shorter_len > 0
@@ -318,10 +338,10 @@ compare out_stm_n_1 out_stm_n_4 || fail=1
 compare out_stm_nv_1 out_stm_nv_2 || fail=1
 compare out_stm_nv_1 out_stm_nv_4 || fail=1
 
-# Stream slicer with a > 100 KiB line crossing the 4 MiB boundary (next_residue > residue_cap)
+# Stream slicer with a > 100 KiB line crossing the 1 MiB boundary (next_residue > residue_cap)
 awk 'BEGIN {
-  for (i = 1; i <= 52300; i++)
-    printf "line %05d: filler_padding_to_reach_just_under_4mib_boundary_0123456789\n", i
+  for (i = 1; i <= 13600; i++)
+    printf "line %05d: filler_padding_to_reach_just_under_1mib_boundary_0123456789\n", i
   printf "HUGE_CROSSING_LINE:"
   for (j = 1; j <= 12000; j++)
     printf "0123456789"
@@ -405,7 +425,16 @@ rm -f dense_68k.txt out_dense_68k || framework_failure_
 # -------------------------------------------------------------------------
 mkdir -p walk_slash_dir/sub || framework_failure_
 printf 'SLASH_DIR_TOKEN here\n' > walk_slash_dir/sub/f.txt || framework_failure_
+printf 'no_match_here\n' > walk_slash_dir/sub/g.txt || framework_failure_
 check_threads walk_trailing_slash grep -r SLASH_DIR_TOKEN walk_slash_dir///
+check_threads walk_rc grep -r -c SLASH_DIR_TOKEN walk_slash_dir
+check_threads walk_rc_h grep -r -c -h SLASH_DIR_TOKEN walk_slash_dir
+check_threads walk_rc_Z grep -r -c -Z SLASH_DIR_TOKEN walk_slash_dir
+check_threads walk_rc_lb grep -r -c --line-buffered SLASH_DIR_TOKEN walk_slash_dir
+check_threads walk_rl grep -r -l SLASH_DIR_TOKEN walk_slash_dir
+check_threads walk_rL grep -r -L SLASH_DIR_TOKEN walk_slash_dir
+check_threads walk_rl_lb grep -r -l --line-buffered SLASH_DIR_TOKEN walk_slash_dir
+check_threads walk_r_Tn grep -r -T -n SLASH_DIR_TOKEN walk_slash_dir
 (cd walk_slash_dir && GREP_THREADS=1 grep -r SLASH_DIR_TOKEN) > exp_walk_cwd || fail=1
 (cd walk_slash_dir && GREP_THREADS=4 grep -r SLASH_DIR_TOKEN) > out_walk_cwd || fail=1
 compare exp_walk_cwd out_walk_cwd || fail=1

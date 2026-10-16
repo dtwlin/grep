@@ -36,6 +36,8 @@ struct shared_dfa_kwset
 {
   kwset_t kwset;
   idx_t kwset_exact_matches;
+  char must2[64];
+  idx_t must2_len;
   bool begline;
   atomic_ptrdiff_t refs;
   char *pattern;
@@ -44,7 +46,6 @@ struct shared_dfa_kwset
   char eolbyte;
   reg_syntax_t syntax_bits;
   bool dfa_supported;
-  bool dfa_fast;
 };
 
 static struct shared_dfa_kwset *dfa_kwset_cache;
@@ -56,6 +57,8 @@ struct dfa_comp
      any string matching the regexp. */
   kwset_t kwset;
   struct shared_dfa_kwset *shared_kwset;
+  char must2[64];
+  idx_t must2_len;
 
   /* DFA compiled regexp. */
   struct dfa *dfa;
@@ -613,6 +616,70 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
   free (slices);
 }
 
+static char const * _GL_ATTRIBUTE_PURE
+skip_bracket_expr (char const *s, char const *lim);
+
+static void
+extract_secondary_must (struct dfa_comp *dc, char const *raw_pat,
+                        idx_t raw_size, reg_syntax_t syntax_bits,
+                        char const *primary_must)
+{
+  char const *lim = raw_pat + raw_size;
+  char best_lit[64];
+  char cur_lit[64];
+  idx_t best_len = 0, cur_len = 0;
+
+  for (char const *bp = raw_pat; bp < lim; )
+    {
+      if (*bp == '[')
+        {
+          cur_len = 0;
+          bp = skip_quantifiers (skip_bracket_expr (bp, lim), lim, syntax_bits);
+          continue;
+        }
+      bool is_meta = (*bp == '\n' || *bp == '^' || *bp == '$'
+                      || *bp == '.' || *bp == '*' || *bp == '\\'
+                      || ((syntax_bits & RE_NO_BK_VBAR)
+                          && (*bp == '|' || *bp == '+' || *bp == '?'
+                              || *bp == '{' || *bp == '(' || *bp == ')')));
+      if (is_meta || is_quantifier (bp + 1, lim, syntax_bits))
+        {
+          if (*bp == '\n'
+              || ((syntax_bits & RE_NO_BK_VBAR)
+                  && (*bp == '|' || *bp == '(' || *bp == ')'))
+              || (*bp == '\\' && bp + 1 < lim
+                  && (bp[1] == '|' || bp[1] == '(' || bp[1] == ')')))
+            {
+              best_len = cur_len = 0;
+              break;
+            }
+          cur_len = 0;
+          if (*bp == '\\' && bp + 1 < lim)
+            bp = skip_quantifiers (bp + 2, lim, syntax_bits);
+          else
+            bp = skip_quantifiers (bp + 1, lim, syntax_bits);
+          continue;
+        }
+      if (cur_len < (idx_t) sizeof cur_lit - 1)
+        {
+          cur_lit[cur_len++] = *bp;
+          cur_lit[cur_len] = '\0';
+          if (cur_len >= 2 && cur_len > best_len
+              && !strstr (primary_must, cur_lit))
+            {
+              memcpy (best_lit, cur_lit, cur_len + 1);
+              best_len = cur_len;
+            }
+        }
+      bp++;
+    }
+  if (best_len >= 2)
+    {
+      memcpy (dc->must2, best_lit, best_len);
+      dc->must2_len = best_len;
+    }
+}
+
 /* If the DFA turns out to have some set of fixed strings one of
    which must occur in the match, then we build a kwset matcher
    to find those strings, and thus quickly filter out impossible
@@ -655,6 +722,8 @@ kwsmusts (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
       /* Otherwise, filtering with this substring should help reduce the
          search space, but we'll still have to use the regexp matcher.  */
       kwsincr (dc->kwset, dm->must, strlen (dm->must));
+      if (!match_icase && (!localeinfo.multibyte || localeinfo.using_utf8))
+        extract_secondary_must (dc, raw_pat, raw_size, syntax_bits, dm->must);
     }
   kwsprep (dc->kwset);
   dfamustfree (dm);
@@ -1309,6 +1378,9 @@ GEAcompile (char *pattern, idx_t size, reg_syntax_t syntax_bits,
       dc->kwset = sk->kwset;
       dc->kwset_exact_matches = sk->kwset_exact_matches;
       dc->begline = sk->begline;
+      dc->must2_len = sk->must2_len;
+      if (sk->must2_len)
+        memcpy (dc->must2, sk->must2, sk->must2_len);
       atomic_fetch_add (&sk->refs, 1);
 
       if (suppress_dfawarn && sk->dfa_supported && !exact && dc->pcount == 0)
@@ -1337,6 +1409,9 @@ GEAcompile (char *pattern, idx_t size, reg_syntax_t syntax_bits,
           sk->kwset = dc->kwset;
           sk->kwset_exact_matches = dc->kwset_exact_matches;
           sk->begline = dc->begline;
+          sk->must2_len = dc->must2_len;
+          if (dc->must2_len)
+            memcpy (sk->must2, dc->must2, dc->must2_len);
           sk->pattern = ximemdup (pattern, size);
           sk->size = size;
           sk->match_icase = match_icase;
@@ -1346,7 +1421,6 @@ GEAcompile (char *pattern, idx_t size, reg_syntax_t syntax_bits,
           sk->eolbyte = eolbyte;
           sk->syntax_bits = syntax_bits;
           sk->dfa_supported = dfasupported (dc->dfa);
-          sk->dfa_fast = dfaisfast (dc->dfa);
           atomic_init (&sk->refs, 2);
           dfa_kwset_cache = sk;
           dc->shared_kwset = sk;
@@ -1377,67 +1451,17 @@ GEAcompile (char *pattern, idx_t size, reg_syntax_t syntax_bits,
 
 static char *
 safe_dfaexec (struct dfa *d, char const *begin, char *end,
-              char const *buflim, idx_t *count, bool *backref)
+              char const *buflim _GL_UNUSED, idx_t *count, bool *backref)
 {
-  idx_t len = end - begin;
-  if (end < buflim && *(unsigned char const *) end == (unsigned char) eolbyte)
-    return dfaexec (d, begin, end, 0, count, backref);
-
-  char stackbuf[4096];
-
-  if (len < 0)
-    {
-      /* When EGexecute prefers the DFA to the keyword matcher, END can
-         be a byte or two before BEGIN.  dfaexec then examines only the
-         line that starts at BEGIN.  Do the same on a private copy that
-         keeps END where it was relative to BEGIN, so that the sentinel
-         is not stored into a buffer that other threads may be reading.  */
-      char const *line_end = rawmemchr (begin, eolbyte);
-      idx_t pre = begin - end;
-      idx_t n = line_end + 1 - end;
-      char *copy = n < (idx_t) sizeof stackbuf ? stackbuf : xmalloc (n + 1);
-      memcpy (copy, end, n);
-      copy[n] = eolbyte;
-      char *res = dfaexec (d, copy + pre, copy, 0, count, backref);
-      char *ret = res ? (char *) begin + (res - (copy + pre)) : nullptr;
-      if (copy != stackbuf)
-        free (copy);
-      return ret;
-    }
-
-  if (len >= sizeof stackbuf && end > begin + 1)
-    {
-      char *prev_nl = memrchr (begin, eolbyte, (end - 1) - begin);
-      if (prev_nl)
-        {
-          char *split = prev_nl + 1;
-          if (split < buflim)
-            {
-              char *r1 = dfaexec (d, begin, split, 0, count, backref);
-              if (r1 && r1 < split)
-                return r1;
-              begin = split;
-              len = end - begin;
-            }
-        }
-    }
-
-  char *copy = (len < sizeof stackbuf) ? stackbuf : xmalloc (len + 1);
-  memcpy (copy, begin, len);
-  copy[len] = eolbyte;
-
-  char *res = dfaexec (d, copy, copy + len, 0, count, backref);
-  char *ret;
-  if (!res)
-    ret = nullptr;
-  else if (res == copy + len)
-    ret = end;
-  else
-    ret = (char *) begin + (res - copy);
-
-  if (copy != stackbuf)
-    free (copy);
-  return ret;
+  /* END always points one byte past an eolbyte (either buflim or
+     rawmemchr (..., eol) + 1), and BEGIN < END.  Passing END - 1 as
+     the end pointer makes *(END - 1) == eolbyte in dfaexec_main, so
+     dfaexec never writes a sentinel into shared read-only memory and
+     needs zero buffer copies.  Since allow_nl is false, eolbyte never
+     transitions into a pattern match; any match in [BEGIN, END) is
+     detected at p <= END - 1, and scanning stops as soon as p
+     consumes *(END - 1) (p == END > END - 1).  */
+  return dfaexec (d, begin, end - 1, 0, count, backref);
 }
 
 ptrdiff_t
@@ -1451,8 +1475,6 @@ EGexecute (void *vdc, char const *buf, idx_t size, idx_t *match_size,
   struct kwsmatch kwsm;
   idx_t i;
   struct dfa_comp *dc = vdc;
-  bool dfafast = dc->shared_kwset ? dc->shared_kwset->dfa_fast
-                                  : (dc->dfa_compiled ? dfaisfast (dc->dfa) : false);
 
   mb_start = buf;
   buflim = buf + size;
@@ -1471,8 +1493,6 @@ EGexecute (void *vdc, char const *buf, idx_t size, idx_t *match_size,
           /* Try matching with KWset, if it's defined.  */
           if (dc->kwset)
             {
-              char const *prev_beg;
-
               /* Find a possible match using the KWset matcher.  */
               ptrdiff_t offset = kwsexec (dc->kwset, beg - dc->begline,
                                           buflim - beg + dc->begline,
@@ -1480,34 +1500,15 @@ EGexecute (void *vdc, char const *buf, idx_t size, idx_t *match_size,
               if (offset < 0)
                 return offset;
               match = beg + offset;
-              prev_beg = beg;
 
               /* Narrow down to the line containing the possible match.  */
               beg = memrchr (buf, eol, match - buf);
               beg = beg ? beg + 1 : buf;
               dfa_beg = beg;
+              end = rawmemchr (match, eol);
+              end++;
 
-              /* Determine the end pointer to give the DFA next.  Typically
-                 this is after the first newline after MATCH; but if the KWset
-                 match is not exact, the DFA is fast, and the offset from
-                 PREV_BEG is less than 64 or (MATCH - PREV_BEG), this is the
-                 greater of the latter two values; this temporarily prefers
-                 the DFA to KWset.  */
               exact_kwset_match = kwsm.index < dc->kwset_exact_matches;
-              if (exact_kwset_match || !dfafast
-                  || MAX (16, match - beg) < (match - prev_beg) >> 2)
-                {
-                  end = rawmemchr (match, eol);
-                  end++;
-                }
-              else if (MAX (16, match - beg) < (buflim - prev_beg) >> 2)
-                {
-                  end = rawmemchr (prev_beg + 4 * MAX (16, match - beg), eol);
-                  end++;
-                }
-              else
-                end = buflim;
-
               if (exact_kwset_match)
                 {
                   if (!localeinfo.multibyte | localeinfo.using_utf8)
@@ -1521,6 +1522,9 @@ EGexecute (void *vdc, char const *buf, idx_t size, idx_t *match_size,
                      beginning of the next character.  */
                   dfa_beg = mb_start;
                 }
+              else if (dc->must2_len
+                       && !memmem (beg, end - 1 - beg, dc->must2, dc->must2_len))
+                continue;
             }
 
           if (!dc->dfa_compiled)
@@ -1539,7 +1543,7 @@ EGexecute (void *vdc, char const *buf, idx_t size, idx_t *match_size,
                  than falling back to KWset would be.  */
               next_beg = safe_dfaexec (superset, dfa_beg, (char *) end,
                                        buflim, &count, nullptr);
-              if (!next_beg || next_beg == end)
+              if (!next_beg)
                 continue;
 
               /* Narrow down to the line we've found.  */
@@ -1561,7 +1565,7 @@ EGexecute (void *vdc, char const *buf, idx_t size, idx_t *match_size,
 
           /* If there's no match, or if we've matched the sentinel,
              we're done.  */
-          if (!next_beg || next_beg == end)
+          if (!next_beg)
             continue;
 
           /* Narrow down to the line we've found.  */

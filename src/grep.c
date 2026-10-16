@@ -961,6 +961,11 @@ static char *walk_ent_path (struct walk_dir const *d, struct walk_ent const *e);
 static char const *walk_shown_name (char const *path);
 static _Thread_local struct walk_dir const *walk_cur_dir;
 static _Thread_local struct walk_ent const *walk_cur_ent;
+static _Thread_local bool walk_ent_defer_post;
+static _Thread_local bool walk_ent_post_grep;
+static _Thread_local intmax_t walk_ent_count;
+static _Thread_local char const *cached_filename_ptr;
+static _Thread_local size_t cached_filename_len;
 
 char const *
 input_filename (void)
@@ -1680,12 +1685,48 @@ nlscan (char const *lim)
   lastnl = lim;
 }
 
+/* Format nonnegative VAL into the end of BUF[0..31], padded with
+   leading spaces to at least WIDTH bytes, and return the start
+   pointer; store the formatted length in *OUT_LEN.  */
+static char *
+format_intmax_width (char buf[32], intmax_t val, int width, size_t *out_len)
+{
+  uintmax_t v = (uintmax_t) val;
+  char *p = buf + 32;
+  do
+    {
+      *--p = '0' + (v % 10);
+      v /= 10;
+    }
+  while (v != 0);
+  int len = (int) ((buf + 32) - p);
+  while (len < width && p > buf)
+    {
+      *--p = ' ';
+      len++;
+    }
+  *out_len = (size_t) ((buf + 32) - p);
+  return p;
+}
+
 /* Print the current filename.  */
 static void
 print_filename (void)
 {
   pr_sgr_start_if (filename_color);
-  fputs_errno (input_filename ());
+  char const *fn = input_filename ();
+  if (buffering_enabled)
+    {
+      if (fn != cached_filename_ptr)
+        {
+          cached_filename_ptr = fn;
+          cached_filename_len = strlen (fn);
+        }
+      note_big_write (cached_filename_len);
+      membuf_append (&tls_out, fn, cached_filename_len);
+    }
+  else
+    fputs_errno (fn);
   pr_sgr_end_if (filename_color);
 }
 
@@ -1703,7 +1744,10 @@ static void
 print_offset (intmax_t pos, const char *color)
 {
   pr_sgr_start_if (color);
-  printf_errno ("%*"PRIdMAX, offset_width, pos);
+  char numbuf[32];
+  size_t numlen;
+  char *numstr = format_intmax_width (numbuf, pos, offset_width, &numlen);
+  fwrite_errno (numstr, 1, numlen);
   pr_sgr_end_if (color);
 }
 
@@ -2623,6 +2667,19 @@ grepdesc (int desc, bool command_line)
 
   count = grep (desc, &st, &ineof);
  post_grep:
+  status = !count;
+  if (walk_ent_defer_post && tls_err.len == 0
+      && (count_matches || list_files != LISTFILES_NONE))
+    {
+      if (count_matches
+          || list_files == (status ? LISTFILES_NONMATCHING : LISTFILES_MATCHING))
+        {
+          walk_ent_post_grep = true;
+          walk_ent_count = count;
+        }
+      goto closeout;
+    }
+
   if (count_matches)
     {
       if (out_file)
@@ -2633,12 +2690,14 @@ grepdesc (int desc, bool command_line)
           else
             putchar_errno (0);
         }
-      printf_errno ("%" PRIdMAX "\n", count);
+      char numbuf[33];
+      size_t numlen;
+      char *numstr = format_intmax_width (numbuf, count, 0, &numlen);
+      numstr[numlen] = '\n';
+      fwrite_errno (numstr, 1, numlen + 1);
       if (line_buffered)
         fflush_errno ();
     }
-
-  status = !count;
 
   if (list_files == LISTFILES_NONE)
     finalize_input (desc, &st, ineof);
@@ -3479,8 +3538,8 @@ static size_t rob_done_waiters = 0;
 static bool pool_terminate;
 static void rob_try_commit_locked (void);
 
-enum { SLICE_BUF_SIZE = 4 * 1024 * 1024 };
-enum { SLICE_POOL_CAP = 32 };
+enum { SLICE_BUF_SIZE = 1024 * 1024 };
+enum { SLICE_POOL_CAP = 64 };
 static char *slice_freelist[SLICE_POOL_CAP];
 static int slice_freelist_cnt = 0;
 static pthread_cond_t slice_avail_cv = PTHREAD_COND_INITIALIZER;
@@ -3667,6 +3726,9 @@ task_reset (void)
   membuf_reset (&tls_big);
   tls_errseen = false;
   tls_deferred = false;
+  walk_ent_post_grep = false;
+  walk_ent_count = 0;
+  cached_filename_ptr = nullptr;
   out_quiet = initial_out_quiet;
   done_on_match = initial_done_on_match;
   totalcc = 0;
@@ -3946,7 +4008,13 @@ rob_try_commit_locked (void)
                       else
                         putchar_errno (0);
                     }
-                  printf_errno ("%" PRIdMAX "\n", chunk_accumulated_count);
+                  char numbuf[33];
+                  size_t numlen;
+                  char *numstr = format_intmax_width (numbuf,
+                                                      chunk_accumulated_count,
+                                                      0, &numlen);
+                  numstr[numlen] = '\n';
+                  fwrite_errno (numstr, 1, numlen + 1);
                   if (line_buffered)
                     fflush_errno ();
                 }
@@ -5976,6 +6044,7 @@ struct walk_ent
 {
   char const *name;
   ino_t ino;                    /* d_ino, for sorting */
+  intmax_t count;               /* -c count when post_grep is true */
   struct walk_out *out;         /* output to commit, or null */
   struct walk_dir *sub;         /* WALK_DIR: the directory, once read */
   unsigned short namelen;       /* length of name */
@@ -5986,6 +6055,7 @@ struct walk_ent
   bool used;                    /* prtext was called */
   bool sep;                     /* see TASK_SEP */
   bool defer;                   /* the output file; see TLS_MAY_DEFER */
+  bool post_grep;               /* emit -c/-l/-L output in walk_commit_ent */
   atomic_bool done;             /* the entry can be committed */
 };
 
@@ -6143,6 +6213,7 @@ walk_path_len (struct walk_dir const *d, char const *name, size_t nlen)
   *p++ = '/';
   memcpy (p, name, nlen);
   p[nlen] = '\0';
+  cached_filename_ptr = nullptr;
   return walk_pbuf;
 }
 
@@ -6778,8 +6849,12 @@ walk_search (struct walk_dir *d, int dfd, struct walk_ent *e, bool may_defer)
   known_reg_nostat = (d->parent != nullptr && !walk.logical && e->type == DT_REG
                       && !(S_ISREG (out_stat.st_mode)
                            && (e->ino == 0 || e->ino == out_stat.st_ino)));
+  walk_ent_defer_post = true;
   e->status = grepfile (dfd, search_name,
                         walk.logical || !d->parent, !d->parent);
+  walk_ent_defer_post = false;
+  e->post_grep = walk_ent_post_grep;
+  e->count = walk_ent_count;
   known_reg_nostat = false;
   walk_cur_dir = nullptr;
   walk_cur_ent = nullptr;
@@ -6962,7 +7037,8 @@ walk_push_dir (struct walk_dir *d, int fd)
   for (size_t i = 0; i <= d->nents; i++)
     {
       struct walk_ent *e = i < d->nents ? &d->ents[i] : nullptr;
-      bool flush = batch_files && (!e || batch_files == WALK_BATCH);
+      bool flush = batch_files && (!e || batch_files == WALK_BATCH
+                                   || (e->kind == WALK_DIR && nv == 0));
       for (int pass = 0; pass < 2; pass++)
         {
           struct walk_task *t = nullptr;
@@ -7202,7 +7278,7 @@ walk_search_files (struct walk_task *t)
         walk_commit ();
       walk_maybe_recruit ();
 
-      if (WALK_SPLIT_MIN_REM <= t->hi - (i + 1))
+      if (((i - t->lo) & 3) == 3 && WALK_SPLIT_MIN_REM <= t->hi - (i + 1))
         {
           struct timespec now;
           clock_gettime (CLOCK_MONOTONIC, &now);
@@ -7271,13 +7347,47 @@ walk_search_deferred (struct walk_dir *d, struct walk_ent *e)
   walk_unref (d);
 }
 
-/* Commit the results of entry E.  */
+/* Commit the results of entry E of directory D.  */
 static void
-walk_commit_ent (struct walk_ent *e)
+walk_commit_ent (struct walk_dir *d, struct walk_ent *e)
 {
   bool sep = need_group_separator (e->used, e->sep);
   if (e->used)
     global_used = true;
+  if (e->post_grep)
+    {
+      filename = nullptr;
+      walk_cur_dir = d;
+      walk_cur_ent = e;
+      if (count_matches)
+        {
+          if (out_file)
+            {
+              print_filename ();
+              if (filename_mask)
+                print_sep (SEP_CHAR_SELECTED);
+              else
+                putchar_errno (0);
+            }
+          char numbuf[33];
+          size_t numlen;
+          char *numstr = format_intmax_width (numbuf, e->count, 0, &numlen);
+          numstr[numlen] = '\n';
+          fwrite_errno (numstr, 1, numlen + 1);
+          if (line_buffered)
+            fflush_errno ();
+        }
+      if (list_files == (e->status ? LISTFILES_NONMATCHING : LISTFILES_MATCHING))
+        {
+          print_filename ();
+          putchar_errno ('\n' & filename_mask);
+          if (line_buffered)
+            fflush_errno ();
+        }
+      filename = nullptr;
+      walk_cur_dir = nullptr;
+      walk_cur_ent = nullptr;
+    }
   struct walk_out *o = e->out;
   if (o)
     {
@@ -7335,7 +7445,7 @@ walk_commit_locked (void)
         break;
       if (e->defer)
         walk_search_deferred (d, e);
-      walk_commit_ent (e);
+      walk_commit_ent (d, e);
       if (e->sub)
         {
           d = e->sub;

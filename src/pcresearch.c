@@ -157,7 +157,76 @@ is_lit_char (char c)
           (c >= 'A' && c <= 'Z') ||
           (c >= '0' && c <= '9') ||
           c == '_' || c == '-' || c == '/' || c == ':' ||
-          c == '=' || c == '@' || c == '%' || c == '#' || c == '~');
+          c == '=' || c == '@' || c == '%' || c == '#' ||
+          c == '~' || c == ';' || c == ',');
+}
+
+static inline bool
+is_escaped_lit_char (char c)
+{
+  return (c == '(' || c == ')' || c == '[' || c == ']' ||
+          c == '{' || c == '}' || c == '.' || c == '*' ||
+          c == '+' || c == '?' || c == '^' || c == '$' ||
+          c == '\\' || c == '/' || c == '|' || c == '-' ||
+          c == ':' || c == '=');
+}
+
+static bool
+pcre_group_header (char const *pat, idx_t p, idx_t size,
+                   idx_t *header_len, bool *is_neg_lookaround)
+{
+  *is_neg_lookaround = false;
+  if (p + 1 < size && pat[p + 1] == '*')
+    return false;
+  if (p + 1 < size && pat[p + 1] == '?')
+    {
+      if (p + 2 < size
+          && (pat[p + 2] == ':' || pat[p + 2] == '=' || pat[p + 2] == '>'))
+        {
+          *header_len = 3;
+          return true;
+        }
+      if (p + 2 < size && pat[p + 2] == '!')
+        {
+          *header_len = 3;
+          *is_neg_lookaround = true;
+          return true;
+        }
+      if (p + 3 < size && pat[p + 2] == '<' && pat[p + 3] == '=')
+        {
+          *header_len = 4;
+          return true;
+        }
+      if (p + 3 < size && pat[p + 2] == '<' && pat[p + 3] == '!')
+        {
+          *header_len = 4;
+          *is_neg_lookaround = true;
+          return true;
+        }
+      return false;
+    }
+  *header_len = 1;
+  return true;
+}
+
+static idx_t _GL_ATTRIBUTE_PURE
+skip_pcre_quantifiers (char const *pat, idx_t p, idx_t size)
+{
+  while (p < size)
+    {
+      if (pat[p] == '*' || pat[p] == '?' || pat[p] == '+')
+        p++;
+      else if (pat[p] == '{')
+        {
+          while (p < size && pat[p] != '}')
+            p++;
+          if (p < size && pat[p] == '}')
+            p++;
+        }
+      else
+        break;
+    }
+  return p;
 }
 
 static idx_t _GL_ATTRIBUTE_PURE
@@ -271,163 +340,174 @@ skip_pcre_char_class (char const *pat, idx_t p, idx_t size)
 static char *
 find_must_literal (char const *pat, idx_t size, idx_t *out_len)
 {
-  if (memchr (pat, '|', size))
+  if (size < 2)
     return nullptr;
 
   for (idx_t i = 0; i + 1 < size; ++i)
-    if (pat[i] == '\\' && (pat[i+1] == 'Q' || pat[i+1] == 'E' || pat[i+1] == 'c'))
+    if (pat[i] == '\\' && (pat[i + 1] == 'Q' || pat[i + 1] == 'E' || pat[i + 1] == 'c'))
       return nullptr;
 
-  char const *best_str = nullptr;
+  char *best_buf = ximalloc (size + 1);
+  char *cur_buf = ximalloc (size + 1);
   idx_t best_len = 0;
   idx_t p = 0;
 
   while (p < size)
     {
+      if (pat[p] == '|')
+        {
+          free (best_buf);
+          free (cur_buf);
+          return nullptr;
+        }
+
       if (pat[p] == '(')
         {
-          if (p + 1 < size && pat[p + 1] == '*')
-            return nullptr;
-          if (p + 1 < size && pat[p + 1] == '?')
+          idx_t header_len = 0;
+          bool is_neg = false;
+          if (!pcre_group_header (pat, p, size, &header_len, &is_neg))
             {
-              bool ok = false;
-              if (p + 2 < size && (pat[p + 2] == ':' || pat[p + 2] == '='))
-                ok = true;
-              else if (p + 3 < size && pat[p + 2] == '<' && pat[p + 3] == '=')
-                ok = true;
-              if (!ok)
-                return nullptr;
+              free (best_buf);
+              free (cur_buf);
+              return nullptr;
             }
           int depth = 1;
-          p++;
-          while (p < size && depth > 0)
+          bool has_alt = false;
+          idx_t q = p + header_len;
+          while (q < size && depth > 0)
             {
-              if (pat[p] == '\\')
-                p = skip_pcre_escape (pat, p, size);
-              else if (pat[p] == '[')
-                p = skip_pcre_char_class (pat, p, size);
-              else if (pat[p] == '(')
+              if (pat[q] == '\\')
+                q = skip_pcre_escape (pat, q, size);
+              else if (pat[q] == '[')
+                q = skip_pcre_char_class (pat, q, size);
+              else if (pat[q] == '(')
                 {
-                  if (p + 1 < size && pat[p + 1] == '*')
-                    return nullptr;
-                  if (p + 1 < size && pat[p + 1] == '?')
+                  idx_t inner_hdr = 0;
+                  bool inner_neg = false;
+                  if (!pcre_group_header (pat, q, size, &inner_hdr, &inner_neg))
                     {
-                      bool ok = false;
-                      if (p + 2 < size && (pat[p + 2] == ':' || pat[p + 2] == '='))
-                        ok = true;
-                      else if (p + 3 < size && pat[p + 2] == '<' && pat[p + 3] == '=')
-                        ok = true;
-                      if (!ok)
-                        return nullptr;
+                      free (best_buf);
+                      free (cur_buf);
+                      return nullptr;
                     }
                   depth++;
-                  p++;
+                  q += inner_hdr;
                 }
-              else if (pat[p] == ')')
+              else if (pat[q] == ')')
                 {
                   depth--;
-                  p++;
+                  if (depth == 0)
+                    break;
+                  q++;
                 }
-              else
-                p++;
-            }
-          while (p < size)
-            {
-              if (pat[p] == '*' || pat[p] == '?' || pat[p] == '+')
-                p++;
-              else if (pat[p] == '{')
+              else if (pat[q] == '|' && depth == 1)
                 {
-                  while (p < size && pat[p] != '}')
-                    p++;
-                  if (p < size && pat[p] == '}')
-                    p++;
+                  has_alt = true;
+                  q++;
                 }
               else
-                break;
+                q++;
             }
+          idx_t after_p = q + 1;
+          bool is_optional = (after_p < size
+                              && (pat[after_p] == '*' || pat[after_p] == '?'
+                                  || pat[after_p] == '{'));
+          after_p = skip_pcre_quantifiers (pat, after_p, size);
+          if (is_neg || is_optional || has_alt)
+            p = after_p;
+          else
+            p += header_len;
+          continue;
+        }
+
+      if (pat[p] == ')')
+        {
+          p = skip_pcre_quantifiers (pat, p + 1, size);
           continue;
         }
 
       if (pat[p] == '[')
         {
           p = skip_pcre_char_class (pat, p, size);
-          while (p < size)
-            {
-              if (pat[p] == '*' || pat[p] == '?' || pat[p] == '+')
-                p++;
-              else if (pat[p] == '{')
-                {
-                  while (p < size && pat[p] != '}')
-                    p++;
-                  if (p < size && pat[p] == '}')
-                    p++;
-                }
-              else
-                break;
-            }
+          p = skip_pcre_quantifiers (pat, p, size);
           continue;
         }
 
-      if (pat[p] == '\\')
+      if (pat[p] == '\\' && !(p + 1 < size && is_escaped_lit_char (pat[p + 1])))
         {
           p = skip_pcre_escape (pat, p, size);
+          p = skip_pcre_quantifiers (pat, p, size);
           continue;
         }
 
-      if (!is_lit_char (pat[p]))
+      if (!is_lit_char (pat[p])
+          && !(pat[p] == '\\' && p + 1 < size && is_escaped_lit_char (pat[p + 1])))
         {
           if (pat[p] == '{')
-            {
-              while (p < size && pat[p] != '}')
-                p++;
-              if (p < size && pat[p] == '}')
-                p++;
-            }
+            p = skip_pcre_quantifiers (pat, p, size);
           else
             p++;
           continue;
         }
 
-      idx_t run_start = p;
-      while (p < size && is_lit_char (pat[p]))
+      idx_t cur_len = 0;
+      while (p < size)
         {
-          if (p + 1 < size && (pat[p + 1] == '*' || pat[p + 1] == '?' || pat[p + 1] == '{'))
+          char c;
+          idx_t next_p;
+          if (pat[p] == '\\' && p + 1 < size && is_escaped_lit_char (pat[p + 1]))
+            {
+              c = pat[p + 1];
+              next_p = p + 2;
+            }
+          else if (is_lit_char (pat[p]))
+            {
+              c = pat[p];
+              next_p = p + 1;
+            }
+          else
             break;
-          p++;
-        }
 
-      idx_t run_len = p - run_start;
-      if (run_len >= 2 && run_len > best_len)
-        {
-          best_len = run_len;
-          best_str = pat + run_start;
-        }
+          if (next_p < size
+              && (pat[next_p] == '*' || pat[next_p] == '?' || pat[next_p] == '{'))
+            break;
 
-      if (p < size && is_lit_char (pat[p]) && p + 1 < size
-          && (pat[p + 1] == '*' || pat[p + 1] == '?' || pat[p + 1] == '{'))
-        {
-          p++;
-          if (pat[p] == '{')
+          cur_buf[cur_len++] = c;
+          p = next_p;
+
+          if (p < size && pat[p] == '+')
             {
-              while (p < size && pat[p] != '}')
-                p++;
-              if (p < size && pat[p] == '}')
-                p++;
+              p = skip_pcre_quantifiers (pat, p, size);
+              break;
             }
-          else
-            p++;
+        }
+
+      if (cur_len >= 2 && cur_len > best_len)
+        {
+          best_len = cur_len;
+          memcpy (best_buf, cur_buf, cur_len);
+        }
+
+      if (p < size
+          && ((pat[p] == '\\' && p + 1 < size && is_escaped_lit_char (pat[p + 1]))
+              || is_lit_char (pat[p])))
+        {
+          idx_t next_p = (pat[p] == '\\') ? p + 2 : p + 1;
+          if (next_p < size
+              && (pat[next_p] == '*' || pat[next_p] == '?' || pat[next_p] == '{'))
+            p = skip_pcre_quantifiers (pat, next_p, size);
         }
     }
 
+  free (cur_buf);
   if (best_len >= 2)
     {
       *out_len = best_len;
-      char *res = ximalloc (best_len + 1);
-      memcpy (res, best_str, best_len);
-      res[best_len] = '\0';
-      return res;
+      best_buf[best_len] = '\0';
+      return best_buf;
     }
 
+  free (best_buf);
   return nullptr;
 }
 
@@ -440,6 +520,8 @@ Pcompile (char *pattern, idx_t size, reg_syntax_t ignored, bool exact)
   PCRE2_SIZE e;
   int ec;
   int flags = PCRE2_DOLLAR_ENDONLY | (match_icase ? PCRE2_CASELESS : 0);
+  char const *raw_pat = pattern;
+  idx_t raw_size = size;
   char *patlim = pattern + size;
   struct pcre_comp *pc = ximalloc (sizeof *pc);
   pcre2_general_context *gcontext = pc->gcontext
@@ -570,10 +652,10 @@ Pcompile (char *pattern, idx_t size, reg_syntax_t ignored, bool exact)
 
   pc->must_kwset = nullptr;
   pc->is_clone = false;
-  if (!match_lines && !match_words && (!match_icase || !localeinfo.multibyte))
+  if (!match_icase || !localeinfo.multibyte)
     {
       idx_t lit_len = 0;
-      char *lit = find_must_literal (pattern, size, &lit_len);
+      char *lit = find_must_literal (raw_pat, raw_size, &lit_len);
       if (lit)
         {
           kwset_t kws = kwsinit (true);
