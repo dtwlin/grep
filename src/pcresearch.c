@@ -209,6 +209,30 @@ pcre_group_header (char const *pat, idx_t p, idx_t size,
   return true;
 }
 
+static bool _GL_ATTRIBUTE_PURE
+is_pcre_brace_quantifier (char const *pat, idx_t p, idx_t size)
+{
+  if (p >= size || pat[p] != '{')
+    return false;
+  p++;
+  idx_t digits = 0;
+  while (p < size && pat[p] >= '0' && pat[p] <= '9')
+    {
+      digits++;
+      p++;
+    }
+  if (p < size && pat[p] == ',')
+    {
+      p++;
+      while (p < size && pat[p] >= '0' && pat[p] <= '9')
+        {
+          digits++;
+          p++;
+        }
+    }
+  return digits > 0 && p < size && pat[p] == '}';
+}
+
 static idx_t _GL_ATTRIBUTE_PURE
 skip_pcre_quantifiers (char const *pat, idx_t p, idx_t size)
 {
@@ -216,7 +240,7 @@ skip_pcre_quantifiers (char const *pat, idx_t p, idx_t size)
     {
       if (pat[p] == '*' || pat[p] == '?' || pat[p] == '+')
         p++;
-      else if (pat[p] == '{')
+      else if (is_pcre_brace_quantifier (pat, p, size))
         {
           while (p < size && pat[p] != '}')
             p++;
@@ -319,13 +343,14 @@ skip_pcre_char_class (char const *pat, idx_t p, idx_t size)
                && (pat[p + 1] == ':' || pat[p + 1] == '.' || pat[p + 1] == '='))
         {
           char ctype = pat[p + 1];
-          p += 2;
-          while (p + 1 < size && !(pat[p] == ctype && pat[p + 1] == ']'))
-            p++;
-          if (p + 1 < size)
-            p += 2;
+          idx_t q = p + 2;
+          while (q + 1 < size && pat[q] != ']'
+                 && !(pat[q] == ctype && pat[q + 1] == ']'))
+            q++;
+          if (q + 1 < size && pat[q] == ctype && pat[q + 1] == ']')
+            p = q + 2;
           else
-            return size;
+            p++;
         }
       else
         p++;
@@ -411,7 +436,7 @@ find_must_literal (char const *pat, idx_t size, idx_t *out_len)
           idx_t after_p = q + 1;
           bool is_optional = (after_p < size
                               && (pat[after_p] == '*' || pat[after_p] == '?'
-                                  || pat[after_p] == '{'));
+                                  || is_pcre_brace_quantifier (pat, after_p, size)));
           after_p = skip_pcre_quantifiers (pat, after_p, size);
           if (is_neg || is_optional || has_alt)
             p = after_p;
@@ -443,7 +468,7 @@ find_must_literal (char const *pat, idx_t size, idx_t *out_len)
       if (!is_lit_char (pat[p])
           && !(pat[p] == '\\' && p + 1 < size && is_escaped_lit_char (pat[p + 1])))
         {
-          if (pat[p] == '{')
+          if (is_pcre_brace_quantifier (pat, p, size))
             p = skip_pcre_quantifiers (pat, p, size);
           else
             p++;
@@ -469,7 +494,8 @@ find_must_literal (char const *pat, idx_t size, idx_t *out_len)
             break;
 
           if (next_p < size
-              && (pat[next_p] == '*' || pat[next_p] == '?' || pat[next_p] == '{'))
+              && (pat[next_p] == '*' || pat[next_p] == '?'
+                  || is_pcre_brace_quantifier (pat, next_p, size)))
             break;
 
           cur_buf[cur_len++] = c;
@@ -494,7 +520,8 @@ find_must_literal (char const *pat, idx_t size, idx_t *out_len)
         {
           idx_t next_p = (pat[p] == '\\') ? p + 2 : p + 1;
           if (next_p < size
-              && (pat[next_p] == '*' || pat[next_p] == '?' || pat[next_p] == '{'))
+              && (pat[next_p] == '*' || pat[next_p] == '?'
+                  || is_pcre_brace_quantifier (pat, next_p, size)))
             p = skip_pcre_quantifiers (pat, next_p, size);
         }
     }

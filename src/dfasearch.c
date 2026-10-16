@@ -99,6 +99,46 @@ dfawarn (char const *mesg)
 }
 
 static bool _GL_ATTRIBUTE_PURE
+is_dfa_brace_quantifier (char const *p, char const *lim,
+                         reg_syntax_t syntax_bits)
+{
+  bool ere = (syntax_bits & RE_NO_BK_VBAR) != 0;
+  if (ere)
+    {
+      if (p >= lim || *p != '{')
+        return false;
+      p++;
+    }
+  else
+    {
+      if (p + 1 >= lim || p[0] != '\\' || p[1] != '{')
+        return false;
+      p += 2;
+    }
+  idx_t digits = 0;
+  while (p < lim && *p >= '0' && *p <= '9')
+    {
+      digits++;
+      p++;
+    }
+  if (p < lim && *p == ',')
+    {
+      p++;
+      while (p < lim && *p >= '0' && *p <= '9')
+        {
+          digits++;
+          p++;
+        }
+    }
+  if (digits == 0)
+    return false;
+  if (ere)
+    return p < lim && *p == '}';
+  else
+    return p + 1 < lim && p[0] == '\\' && p[1] == '}';
+}
+
+static bool _GL_ATTRIBUTE_PURE
 is_quantifier (char const *p, char const *lim, reg_syntax_t syntax_bits)
 {
   if (p >= lim)
@@ -107,7 +147,7 @@ is_quantifier (char const *p, char const *lim, reg_syntax_t syntax_bits)
     {
       if (*p == '*' || *p == '+' || *p == '?')
         return true;
-      if (*p == '{')
+      if (is_dfa_brace_quantifier (p, lim, syntax_bits))
         return true;
       return false;
     }
@@ -117,7 +157,9 @@ is_quantifier (char const *p, char const *lim, reg_syntax_t syntax_bits)
         return true;
       if (p + 1 < lim && *p == '\\')
         {
-          if (p[1] == '+' || p[1] == '?' || p[1] == '{')
+          if (p[1] == '+' || p[1] == '?')
+            return true;
+          if (is_dfa_brace_quantifier (p, lim, syntax_bits))
             return true;
         }
       return false;
@@ -136,13 +178,12 @@ skip_quantifiers (char const *p, char const *lim, reg_syntax_t syntax_bits)
               p++;
               continue;
             }
-          if (*p == '{')
+          if (is_dfa_brace_quantifier (p, lim, syntax_bits))
             {
               p++;
-              while (p < lim && *p != '}')
+              while (*p != '}')
                 p++;
-              if (p < lim)
-                p++;
+              p++;
               continue;
             }
           break;
@@ -161,15 +202,12 @@ skip_quantifiers (char const *p, char const *lim, reg_syntax_t syntax_bits)
                   p += 2;
                   continue;
                 }
-              if (p[1] == '{')
+              if (is_dfa_brace_quantifier (p, lim, syntax_bits))
                 {
                   p += 2;
-                  while (p + 1 < lim && !(p[0] == '\\' && p[1] == '}'))
+                  while (!(p[0] == '\\' && p[1] == '}'))
                     p++;
-                  if (p + 1 < lim)
-                    p += 2;
-                  else
-                    p = lim;
+                  p += 2;
                   continue;
                 }
             }
@@ -479,7 +517,7 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
               char const *lit_escapes = (syntax_bits & RE_NO_BK_VBAR)
                                         ? "^.[$()|*+?{}\\"
                                         : "^.[$*\\";
-              if (strchr (lit_escapes, c) != nullptr)
+              if (c != '\0' && strchr (lit_escapes, c) != nullptr)
                 {
                   if (is_quantifier (bp + 2, blim, syntax_bits))
                     {
@@ -521,7 +559,8 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
           if (syntax_bits & RE_NO_BK_VBAR) /* ERE */
             {
               if (*bp == '^' || *bp == '$' || *bp == '.' || *bp == '*'
-                  || *bp == '+' || *bp == '?' || *bp == '{' || *bp == '|')
+                  || *bp == '+' || *bp == '?' || *bp == '{' || *bp == '}'
+                  || *bp == '|')
                 is_meta = true;
             }
           else /* BRE */
@@ -546,8 +585,15 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
               continue;
             }
 
-          /* Ordinary character */
-          if (is_quantifier (bp + 1, blim, syntax_bits))
+          /* Ordinary character (possibly multibyte UTF-8) */
+          idx_t clen = 1;
+          if (localeinfo.using_utf8 && (unsigned char) *bp >= 0x80)
+            {
+              while (bp + clen < blim
+                     && ((unsigned char) bp[clen] & 0xC0) == 0x80)
+                clen++;
+            }
+          if (is_quantifier (bp + clen, blim, syntax_bits))
             {
               branch_is_pure = false;
               if (cur_len > best_len)
@@ -556,12 +602,13 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
                   best_len = cur_len;
                 }
               cur_len = 0;
-              bp = skip_quantifiers (bp + 1, blim, syntax_bits);
+              bp = skip_quantifiers (bp + clen, blim, syntax_bits);
             }
           else
             {
-              cur_lit[cur_len++] = *bp;
-              bp++;
+              memcpy (cur_lit + cur_len, bp, clen);
+              cur_len += clen;
+              bp += clen;
             }
         }
 
@@ -641,14 +688,23 @@ extract_secondary_must (struct dfa_comp *dc, char const *raw_pat,
                       || *bp == '.' || *bp == '*' || *bp == '\\'
                       || ((syntax_bits & RE_NO_BK_VBAR)
                           && (*bp == '|' || *bp == '+' || *bp == '?'
-                              || *bp == '{' || *bp == '(' || *bp == ')')));
-      if (is_meta || is_quantifier (bp + 1, lim, syntax_bits))
+                              || *bp == '{' || *bp == '}'
+                              || *bp == '(' || *bp == ')')));
+      idx_t clen = 1;
+      if (!is_meta && localeinfo.using_utf8 && (unsigned char) *bp >= 0x80)
+        {
+          while (bp + clen < lim && ((unsigned char) bp[clen] & 0xC0) == 0x80)
+            clen++;
+        }
+      if (is_meta || is_quantifier (bp + clen, lim, syntax_bits))
         {
           if (*bp == '\n'
               || ((syntax_bits & RE_NO_BK_VBAR)
-                  && (*bp == '|' || *bp == '(' || *bp == ')'))
+                  && (*bp == '|' || *bp == '(' || *bp == ')'
+                      || *bp == '{' || *bp == '}'))
               || (*bp == '\\' && bp + 1 < lim
-                  && (bp[1] == '|' || bp[1] == '(' || bp[1] == ')')))
+                  && (bp[1] == '|' || bp[1] == '(' || bp[1] == ')'
+                      || bp[1] == '{' || bp[1] == '}')))
             {
               best_len = cur_len = 0;
               break;
@@ -657,12 +713,13 @@ extract_secondary_must (struct dfa_comp *dc, char const *raw_pat,
           if (*bp == '\\' && bp + 1 < lim)
             bp = skip_quantifiers (bp + 2, lim, syntax_bits);
           else
-            bp = skip_quantifiers (bp + 1, lim, syntax_bits);
+            bp = skip_quantifiers (bp + clen, lim, syntax_bits);
           continue;
         }
-      if (cur_len < (idx_t) sizeof cur_lit - 1)
+      if (cur_len + clen < (idx_t) sizeof cur_lit)
         {
-          cur_lit[cur_len++] = *bp;
+          memcpy (cur_lit + cur_len, bp, clen);
+          cur_len += clen;
           cur_lit[cur_len] = '\0';
           if (cur_len >= 2 && cur_len > best_len
               && !strstr (primary_must, cur_lit))
@@ -671,7 +728,7 @@ extract_secondary_must (struct dfa_comp *dc, char const *raw_pat,
               best_len = cur_len;
             }
         }
-      bp++;
+      bp += clen;
     }
   if (best_len >= 2)
     {
