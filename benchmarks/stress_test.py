@@ -33,13 +33,16 @@ def generate_workload(tmpdir, cycle):
     workload_type = random.choice([
         "tree",
         "chunked",
+        "chunked_tricky",
         "small",
         "giant_line",
         "binary",
+        "nul_pattern",
         "nonl",
         "empty",
         "multi_file",
         "pipe",
+        "pipe_large",
     ])
     work_path = os.path.join(tmpdir, f"work_{cycle}")
     os.makedirs(work_path, exist_ok=True)
@@ -80,6 +83,38 @@ def generate_workload(tmpdir, cycle):
                     fp.write(f"chunk line {i:06d}: hit {target} token\n".encode())
                 else:
                     fp.write(b"x" * 60 + b" chunk filler data line payload 0123456789\n")
+        file_operands = [fpath]
+
+    elif workload_type == "chunked_tricky":
+        # > 2.2 MiB file with either a 1.5 MiB chunk-spanning line or a NUL byte at 70 KiB
+        fpath = os.path.join(work_path, "chunked_tricky.bin")
+        target = "TRICKY_CHUNK_HIT"
+        targets.append(target)
+        variant = random.choice(["span_chunk", "nul_70k"])
+        with open(fpath, "wb") as fp:
+            if variant == "span_chunk":
+                fp.write(f"{target} line 1\n".encode())
+                fp.write(b"S" * 600000 + f" {target} ".encode() + b"T" * 950000 + b"\n")
+                fp.write(f"{target} after giant\n".encode())
+                fp.write((b"filler chunk line 0123456789abcdef\n") * 25000)
+            else:
+                fp.write(f"{target} early hit\n".encode())
+                fp.write((b"x" * 69 + b"\n") * 1000)
+                fp.write(b"nul\x00at_70k\n")
+                fp.write((b"y" * 69 + b"\n") * 32000)
+        file_operands = [fpath]
+
+    elif workload_type == "nul_pattern":
+        fpath = os.path.join(work_path, "nul_in.bin")
+        pat_file = os.path.join(work_path, "nul_pat.bin")
+        with open(pat_file, "wb") as fp:
+            fp.write(b"foo\x00bar\n")
+        with open(fpath, "wb") as fp:
+            if random.random() < 0.5:
+                fp.write(b"hello foo\x00bar world\nplain foo\n")
+            else:
+                fp.write((b"filler line without nul 0123456789\n") * 55000 + b"hello foo\x00bar world\n")
+        targets.append("__NUL_PAT_FILE__:" + pat_file)
         file_operands = [fpath]
 
     elif workload_type == "giant_line":
@@ -151,6 +186,24 @@ def generate_workload(tmpdir, cycle):
         stdin_data = b"".join(buf)
         file_operands = []
 
+    elif workload_type == "pipe_large":
+        # > 1 MiB streaming STDIN input (either exact 1 MiB slice boundary or > 1.3 MiB single line)
+        target = "PIPE_LARGE_TARGET"
+        targets.append(target)
+        if random.random() < 0.5:
+            stdin_data = (f"{target}_" + "x" * 45 + "\n").encode() * 16384
+        else:
+            stdin_data = (
+                b"line 1 before\n"
+                + b"A" * 600000
+                + f" {target} ".encode()
+                + b"B" * 750000
+                + f" {target} end\n".encode()
+                + f"line 3 {target}\n".encode()
+                + (b"pipe trailing filler 0123456789\n") * 25000
+            )
+        file_operands = []
+
     else:
         # Default small file
         fpath = os.path.join(work_path, "small.txt")
@@ -159,7 +212,7 @@ def generate_workload(tmpdir, cycle):
         with open(fpath, "wb") as fp:
             for i in range(random.randint(10, 100)):
                 fp.write(f"small line {i:03d} data {random.randint(1, 99)}\n".encode())
-            fp.write(f"small line hit {target}\n".encode())
+            fp.write(f"small line hit {target}\nfoo{{defx\nfooxxxb\nabcd\n".encode())
         file_operands = [fpath]
 
     if not targets:
@@ -170,8 +223,15 @@ def generate_workload(tmpdir, cycle):
 
 def select_pattern_and_options(targets, workload_type, cycle):
     """Selects an adversarial pattern, engine, and flag permutation."""
-    pat_engine = random.choice(["F", "E", "P", "G", "literal_single", "multi_kw"])
     base_target = random.choice(targets)
+    if base_target.startswith("__NUL_PAT_FILE__:"):
+        pat_file = base_target.split(":", 1)[1]
+        opts = ["-F"]
+        opts.extend(random.choice([[], ["-a"], ["-I"], ["-c"], ["-a", "-c"], ["-q"]]))
+        opts.extend(["-f", pat_file])
+        return opts, None
+
+    pat_engine = random.choice(["F", "E", "P", "G", "literal_single", "multi_kw"])
     options = []
     pattern = base_target
 
@@ -194,12 +254,29 @@ def select_pattern_and_options(targets, workload_type, cycle):
             f"{base_target}.*line",
             f"^{base_target}",
             f"{base_target}$",
+            f"foo.{{a|foo}}xyz|{base_target}",
+            f"[a-c]*.{{,2}}{base_target}",
+            f"foo.*€*b|{base_target}",
+            f"abé?cd|{base_target}",
         ]
         pattern = random.choice(pat_variants)
     elif pat_engine == "P":
         options.append("-P")
         prefix = base_target[:4]
-        pattern = f"(?<={prefix})[A-Za-z0-9_]+"
+        pat_variants = [
+            f"(?<={prefix})[A-Za-z0-9_]+",
+            f"foo{{def|{base_target}}}x",
+            f"{prefix}{'{,2}'}[A-Za-z0-9_]+",
+            f"ab[[:]|{base_target}:]gh[i]",
+        ]
+        pattern = random.choice(pat_variants)
+    elif pat_engine == "G":
+        pat_variants = [
+            base_target,
+            rf"abé\?cd\|{base_target}",
+            rf"{base_target}.\{'{,2}'}line",
+        ]
+        pattern = random.choice(pat_variants)
     else:
         pattern = base_target
 
@@ -214,6 +291,7 @@ def select_pattern_and_options(targets, workload_type, cycle):
         ["-c", "-v"],
         ["-l"],
         ["-L"],
+        ["-q"],
         ["-m", "1"],
         ["-m", "5"],
         ["-m", "0"],
@@ -224,7 +302,7 @@ def select_pattern_and_options(targets, workload_type, cycle):
     ])
 
     # Omit conflicting or quiet options on certain workloads
-    if workload_type == "pipe" and "-l" in mode_flag:
+    if workload_type in ("pipe", "pipe_large") and "-l" in mode_flag:
         mode_flag = ["-n"]
     if "-o" in mode_flag and "-v" in mode_flag:
         mode_flag = ["-n"]
@@ -289,7 +367,7 @@ def run_stress_test(baseline_bin, candidate_bin, duration_secs=300):
             w_type, w_path, file_args, stdin_data, targets = generate_workload(tmpdir, cycle)
             options, pattern = select_pattern_and_options(targets, w_type, cycle)
 
-            cmd_args = options + [pattern] + file_args
+            cmd_args = options + ([pattern] if pattern is not None else []) + file_args
 
             # Execute baseline
             b_env = os.environ.copy()

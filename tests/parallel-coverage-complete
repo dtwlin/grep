@@ -518,6 +518,85 @@ with open("big_ac_in.txt", "w") as f:
 ' || framework_failure_
   check_threads kw_ac_fallback grep -F -f big_ac_pats.txt big_ac_in.txt
   rm -f big_ac_pats.txt big_ac_in.txt kw_avl.txt out_kw_avl kw_short.txt || framework_failure_
+
+  # 10. System-level correctness regressions: brace quantifiers, UTF-8 quantifiers,
+  #     NUL patterns, > 1 MiB pipe line growth, -I -q 96 KiB NUL check, chunk-spanning line
+  printf 'abc{defx\nabc{ghix\nghi}x\nabcd\nabccd\nabcccd\nab:ghijklmnop\ndef:]ghijklmnop\nabXghijklmnop\n' > pcre_brace.txt || framework_failure_
+  check_threads pcre_brace_nonq grep -P 'abc{def|ghi}x' pcre_brace.txt
+  check_threads pcre_brace_q02 grep -P 'abc{,2}d' pcre_brace.txt
+  check_threads pcre_brace_empty grep -P 'abc{}d' pcre_brace.txt
+  check_threads pcre_cclass_colon grep -P 'ab[[:]|def:]gh[i]jklmnop' pcre_brace.txt
+  check_threads pcre_cclass_posix grep -P 'ab[[:alpha:]]ghijklmnop' pcre_brace.txt
+  rm -f pcre_brace.txt || framework_failure_
+
+  printf 'foo_axyz\nfoo}xyz\nabbar{b\nfoo12xyz\nfoo123xyz\nfoo{}xyz\nfooaaxyz\n' > dfa_brace.txt || framework_failure_
+  check_threads ere_brace_must2 grep -E 'foo.{a|foo}xyz' dfa_brace.txt
+  check_threads ere_brace_multi grep -E '[a-c]*.{,2}bar?{a|b}{,2}' dfa_brace.txt
+  check_threads ere_brace_litq grep -E 'fooa{,2}xyz|NEVER_HIT' dfa_brace.txt
+  check_threads ere_brace_empty grep -E 'foo.{}xyz|NEVER_HIT' dfa_brace.txt
+  check_threads bre_brace_must2 grep 'foo.\{1,2\}xyz' dfa_brace.txt
+  check_threads bre_brace_lit grep 'foo.{a\|foo}xyz' dfa_brace.txt
+  check_threads bre_brace_q02 grep 'fooa\{,2\}xyz\|NEVER_HIT' dfa_brace.txt
+  rm -f dfa_brace.txt || framework_failure_
+
+  if test -n "$u8_loc"; then
+    printf 'fooxxxb\nfoo\342\202\254\342\202\254b\nabcd\nab\303\251cd\nxyz\n' > utf8_quant.txt || framework_failure_
+    LC_ALL=$u8_loc check_threads utf8_must2 grep -E 'foo.*€*b' utf8_quant.txt
+    LC_ALL=$u8_loc check_threads utf8_ere_alt grep -E 'abé?cd|xyz' utf8_quant.txt
+    LC_ALL=$u8_loc check_threads utf8_bre_alt grep 'abé\?cd\|xyz' utf8_quant.txt
+    rm -f utf8_quant.txt || framework_failure_
+  fi
+
+  python3 -c '
+with open("pat_nul.bin", "wb") as f:
+    f.write(b"foo\x00bar\n")
+with open("in_nul_small.bin", "wb") as f:
+    f.write(b"hello foo\x00bar world\nplain foo\n")
+with open("in_nul_large.bin", "wb") as f:
+    f.write((b"filler line without nul bytes 0123456789\n") * 55000 + b"hello foo\x00bar world\n")
+with open("pipe_giant.txt", "wb") as f:
+    f.write(b"line 1 before giant\n")
+    f.write(b"A" * 600000 + b" PIPE_GIANT_HIT " + b"B" * 1600000 + b" PIPE_GIANT_HIT end\n")
+    f.write(b"line 3 after giant PIPE_GIANT_HIT\n")
+    f.write((b"trailing pipe line filler 0123456789\n") * 30000)
+with open("pipe_noeol_giant.txt", "wb") as f:
+    f.write(b"A" * 1200000 + b" PIPE_NOEOL_GIANT_HIT")
+with open("pipe_exact_1mb.txt", "wb") as f:
+    f.write((b"EXACT_1MB_TOK_" + b"x" * 49 + b"\n") * 16384)
+with open("bin_70k_nul.bin", "wb") as f:
+    f.write(b"EARLY_HIT_TOK line 1\n" + (b"x" * 69 + b"\n") * 1000 + b"nul\x00here\n" + (b"y" * 69 + b"\n") * 32000)
+with open("span_chunk.txt", "wb") as f:
+    f.write(b"SPAN_CHUNK_HIT start\n")
+    f.write((b"normal line filler 0123456789abcdef\n") * 20000)
+    f.write(b"S" * 1600000 + b" SPAN_CHUNK_HIT end\n")
+' || framework_failure_
+
+  returns_ 1 env GREP_THREADS=1 grep -F -f pat_nul.bin in_nul_small.bin > exp_nul_def || fail=1
+  returns_ 1 env GREP_THREADS=4 grep -F -f pat_nul.bin in_nul_small.bin > out_nul_def || fail=1
+  compare exp_nul_def out_nul_def || fail=1
+  check_threads nul_pat_a grep -a -F -f pat_nul.bin in_nul_small.bin
+  returns_ 1 env GREP_THREADS=4 grep -F -f pat_nul.bin in_nul_large.bin > out_nul_lg || fail=1
+  check_threads nul_pat_lg_c grep -c -F -f pat_nul.bin in_nul_large.bin
+  check_threads nul_pat_lg_ac grep -a -c -F -f pat_nul.bin in_nul_large.bin
+
+  cat pipe_giant.txt | GREP_THREADS=1 grep -n -b PIPE_GIANT_HIT > exp_pipe_giant || fail=1
+  cat pipe_giant.txt | GREP_THREADS=4 grep -n -b PIPE_GIANT_HIT > out_pipe_giant || fail=1
+  compare exp_pipe_giant out_pipe_giant || fail=1
+  cat pipe_giant.txt | GREP_THREADS=1 grep -v -c PIPE_GIANT_HIT > exp_pipe_vc || fail=1
+  cat pipe_giant.txt | GREP_THREADS=4 grep -v -c PIPE_GIANT_HIT > out_pipe_vc || fail=1
+  compare exp_pipe_vc out_pipe_vc || fail=1
+  cat pipe_noeol_giant.txt | GREP_THREADS=4 grep -c PIPE_NOEOL_GIANT_HIT > out_pipe_noeol_g || fail=1
+  cat pipe_exact_1mb.txt | GREP_THREADS=1 grep -c EXACT_1MB_TOK > exp_pipe_1m_c || fail=1
+  cat pipe_exact_1mb.txt | GREP_THREADS=4 grep -c EXACT_1MB_TOK > out_pipe_1m_c || fail=1
+  compare exp_pipe_1m_c out_pipe_1m_c || fail=1
+
+  returns_ 1 env GREP_THREADS=1 grep -I -q EARLY_HIT_TOK bin_70k_nul.bin || fail=1
+  returns_ 1 env GREP_THREADS=4 grep -I -q EARLY_HIT_TOK bin_70k_nul.bin || fail=1
+  check_threads span_chunk_n grep -n -b SPAN_CHUNK_HIT span_chunk.txt
+  check_threads span_chunk_c1 grep -C 1 -n SPAN_CHUNK_HIT span_chunk.txt
+
+  rm -f pat_nul.bin in_nul_small.bin in_nul_large.bin pipe_giant.txt pipe_noeol_giant.txt pipe_exact_1mb.txt bin_70k_nul.bin span_chunk.txt \
+        exp_nul_def out_nul_def out_nul_lg exp_pipe_giant out_pipe_giant exp_pipe_vc out_pipe_vc out_pipe_noeol_g exp_pipe_1m_c out_pipe_1m_c || framework_failure_
 fi
 
 Exit $fail

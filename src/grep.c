@@ -1255,6 +1255,7 @@ static _Thread_local off_t after_last_match;	/* Pointer after last matching line
                                    outputting characters. */
 static _Thread_local bool skip_nuls;		/* Skip '\0' in data.  */
 static bool skip_empty_lines;	/* Skip empty lines in data.  */
+static bool patterns_have_nul;	/* True if any raw pattern contains '\0'.  */
 static _Thread_local intmax_t totalnl;	/* Total newline count before lastnl. */
 static _Thread_local bool buffer_is_mmap;
 
@@ -2173,6 +2174,7 @@ grep (int fd, struct stat *st, bool *ineof)
                           && list_files != LISTFILES_NONMATCHING
                           && raw_matcher_index == F_MATCHER_INDEX
                           && !match_lines
+                          && skip_empty_lines && !patterns_have_nul
                           && bufbeg < buflim && buflim[-1] == eol
                           && binary_files != TEXT_BINARY_FILES && eol);
       if (defer_nulls)
@@ -2254,16 +2256,14 @@ grep (int fd, struct stat *st, bool *ineof)
 
       bool can_fast_mmap = (out_quiet && done_on_match && !out_invert
                             && !count_matches
+                            && skip_empty_lines && !patterns_have_nul
                             && (nlines_first_null == 0
                                 || (nlines_first_null < 0
                                     && binary_files != WITHOUT_MATCH_BINARY_FILES))
                             && raw_matcher_index == F_MATCHER_INDEX
                             && !match_lines && !match_words && eol != '\0'
                             && (!localeinfo.multibyte || localeinfo.using_utf8));
-      bool skip_zap = (nlines_first_null == 0 && can_fast_mmap
-                       && list_files == LISTFILES_NONE);
-      if (!skip_zap)
-        zap_nuls (beg, buflim, nul_zapper);
+      zap_nuls (beg, buflim, nul_zapper);
 
       /* Determine new residue (the length of an incomplete line at the end of
          the buffer, 0 means there is no incomplete last line).  */
@@ -3550,7 +3550,7 @@ alloc_slice_buf_locked (void)
   if (slice_freelist_cnt > 0)
     return slice_freelist[--slice_freelist_cnt];
 
-  size_t buf_sz = SLICE_BUF_SIZE + 2 + uword_size;
+  size_t buf_sz = sizeof (size_t) + SLICE_BUF_SIZE + 2 + uword_size;
   void *p = MAP_FAILED;
   if (MAP_POPULATE)
     p = mmap (NULL, buf_sz, PROT_READ | PROT_WRITE,
@@ -3562,26 +3562,59 @@ alloc_slice_buf_locked (void)
       if (p == MAP_FAILED)
         xalloc_die ();
     }
-  return p;
+  size_t cap = SLICE_BUF_SIZE;
+  memcpy (p, &cap, sizeof cap);
+  return (char *) p + sizeof (size_t);
 }
 
 static void
 free_slice_buf_locked (char *ptr)
 {
-  if (slice_freelist_cnt < SLICE_POOL_CAP)
+  char *raw = ptr - sizeof (size_t);
+  size_t cap;
+  memcpy (&cap, raw, sizeof cap);
+  if (cap == SLICE_BUF_SIZE && slice_freelist_cnt < SLICE_POOL_CAP)
     {
       slice_freelist[slice_freelist_cnt++] = ptr;
       pthread_cond_signal (&slice_avail_cv);
     }
   else
-    munmap (ptr, SLICE_BUF_SIZE + 2 + uword_size);
+    munmap (raw, sizeof (size_t) + cap + 2 + uword_size);
+}
+
+static char *
+grow_slice_buf (char *chunk_alloc, size_t used_len, size_t new_cap)
+{
+  char *old_raw = chunk_alloc - sizeof (size_t);
+  size_t old_cap;
+  memcpy (&old_cap, old_raw, sizeof old_cap);
+  size_t new_map_sz = sizeof (size_t) + new_cap + 2 + uword_size;
+  void *new_raw = mmap (NULL, new_map_sz, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (new_raw == MAP_FAILED)
+    xalloc_die ();
+  memcpy (new_raw, &new_cap, sizeof new_cap);
+  char *new_alloc = (char *) new_raw + sizeof (size_t);
+  memcpy (new_alloc, chunk_alloc, 1 + used_len);
+  if (old_cap == SLICE_BUF_SIZE)
+    {
+      pthread_mutex_lock (&pool_mutex);
+      free_slice_buf_locked (chunk_alloc);
+      pthread_mutex_unlock (&pool_mutex);
+    }
+  else
+    munmap (old_raw, sizeof (size_t) + old_cap + 2 + uword_size);
+  return new_alloc;
 }
 
 static void
 cleanup_slice_freelist (void)
 {
   for (int i = 0; i < slice_freelist_cnt; ++i)
-    munmap (slice_freelist[i], SLICE_BUF_SIZE + 2 + uword_size);
+    {
+      char *raw = slice_freelist[i] - sizeof (size_t);
+      munmap (raw, sizeof (size_t) + SLICE_BUF_SIZE + 2 + uword_size);
+    }
   slice_freelist_cnt = 0;
 }
 
@@ -4274,7 +4307,8 @@ chunk_grepbuf (char *beg, char *lim, struct chunk_file_state *state,
              further on matters only if it would make the file not
              match.  */
           search = false;
-          if (binary_files != WITHOUT_MATCH_BINARY_FILES)
+          if (binary_files != WITHOUT_MATCH_BINARY_FILES
+              && !patterns_have_nul && skip_empty_lines)
             check = false;
         }
       p = q;
@@ -4328,75 +4362,73 @@ worker_thread_func (void *arg)
           char const *cbeg = task.chunk_data;
           char const *clim = task.chunk_data + task.chunk_len;
 
-          state->chunk_nls[idx] = chunk_count_newlines (cbeg, clim, state);
-
-          idx_t match_size;
-          ptrdiff_t off = execute (compiled_pattern, cbeg, clim - cbeg, &match_size, nullptr);
-          bool matched = (off >= 0);
-          if (!out_invert && off >= 0 && cbeg + off == clim)
-            matched = false;
-          state->chunk_has_matches[idx] = out_invert ? true : matched;
-
-          if (state->chunk_has_matches[idx] && !out_invert && !count_matches
-              && list_files == LISTFILES_NONE)
+          if (cbeg == clim)
             {
-              char const *nl_cursor = cbeg;
-              idx_t running_nl = 0;
-              char const *p = cbeg;
+              state->chunk_nls[idx] = 0;
+              state->chunk_has_matches[idx] = false;
+            }
+          else
+            {
+              state->chunk_nls[idx] = chunk_count_newlines (cbeg, clim, state);
 
-              while (p < clim)
+              idx_t match_size;
+              ptrdiff_t off = execute (compiled_pattern, cbeg, clim - cbeg,
+                                       &match_size, nullptr);
+              bool matched = (off >= 0);
+              if (!out_invert && off >= 0 && cbeg + off == clim)
+                matched = false;
+              state->chunk_has_matches[idx] = out_invert ? true : matched;
+
+              if (state->chunk_has_matches[idx] && !out_invert && !count_matches
+                  && list_files == LISTFILES_NONE)
                 {
-                  if (out_before < 0 && out_after < 0 && atomic_load (&state->match_overflow))
-                    break;
+                  char const *nl_cursor = cbeg;
+                  idx_t running_nl = 0;
+                  char const *p = cbeg;
 
-                  ptrdiff_t mo;
-                  if (p == cbeg && off >= 0 && !out_invert)
-                    mo = off;
-                  else
-                    mo = execute (compiled_pattern, p, clim - p, &match_size, nullptr);
-
-                  if (mo < 0)
+                  while (p < clim)
                     {
-                      if (!out_invert) break;
-                      mo = clim - p;
-                      match_size = 0;
-                    }
-                  char const *b = p + mo;
-                  char const *endp = b + match_size;
-                  if (!out_invert && b == clim) break;
-                  if (!out_invert || p < b)
-                    {
-                      char const *mbeg = out_invert ? p : b;
-                      char const *lbeg = mbeg;
-                      while (lbeg > cbeg && lbeg[-1] != eolbyte) lbeg--;
-                      char const *lend = memchr (mbeg, eolbyte, clim - mbeg);
-                      lend = lend ? lend + 1 : clim;
+                      if (out_before < 0 && out_after < 0 && atomic_load (&state->match_overflow))
+                        break;
 
-                      if (out_line)
-                        {
-                          running_nl += count_newlines (nl_cursor, lbeg);
-                          nl_cursor = lbeg;
-                        }
-
-                      pthread_mutex_lock (&state->match_mutex);
-                      if (0 <= out_before || 0 <= out_after)
-                        {
-                          if (state->match_count >= state->match_cap)
-                            {
-                              state->match_cap *= 2;
-                              state->matches = xrealloc (state->matches,
-                                                         state->match_cap * sizeof *state->matches);
-                            }
-                          state->matches[state->match_count].chunk_idx = idx;
-                          state->matches[state->match_count].line_beg = lbeg;
-                          state->matches[state->match_count].line_end = lend;
-                          state->matches[state->match_count].rel_nl = running_nl;
-                          state->match_count++;
-                        }
+                      ptrdiff_t mo;
+                      if (p == cbeg && off >= 0 && !out_invert)
+                        mo = off;
                       else
+                        mo = execute (compiled_pattern, p, clim - p, &match_size, nullptr);
+
+                      if (mo < 0)
                         {
-                          if (state->match_count < state->match_cap)
+                          if (!out_invert) break;
+                          mo = clim - p;
+                          match_size = 0;
+                        }
+                      char const *b = p + mo;
+                      char const *endp = b + match_size;
+                      if (!out_invert && b == clim) break;
+                      if (!out_invert || p < b)
+                        {
+                          char const *mbeg = out_invert ? p : b;
+                          char const *lbeg = mbeg;
+                          while (lbeg > cbeg && lbeg[-1] != eolbyte) lbeg--;
+                          char const *lend = memchr (mbeg, eolbyte, clim - mbeg);
+                          lend = lend ? lend + 1 : clim;
+
+                          if (out_line)
                             {
+                              running_nl += count_newlines (nl_cursor, lbeg);
+                              nl_cursor = lbeg;
+                            }
+
+                          pthread_mutex_lock (&state->match_mutex);
+                          if (0 <= out_before || 0 <= out_after)
+                            {
+                              if (state->match_count >= state->match_cap)
+                                {
+                                  state->match_cap *= 2;
+                                  state->matches = xrealloc (state->matches,
+                                                             state->match_cap * sizeof *state->matches);
+                                }
                               state->matches[state->match_count].chunk_idx = idx;
                               state->matches[state->match_count].line_beg = lbeg;
                               state->matches[state->match_count].line_end = lend;
@@ -4404,11 +4436,22 @@ worker_thread_func (void *arg)
                               state->match_count++;
                             }
                           else
-                            atomic_store (&state->match_overflow, true);
+                            {
+                              if (state->match_count < state->match_cap)
+                                {
+                                  state->matches[state->match_count].chunk_idx = idx;
+                                  state->matches[state->match_count].line_beg = lbeg;
+                                  state->matches[state->match_count].line_end = lend;
+                                  state->matches[state->match_count].rel_nl = running_nl;
+                                  state->match_count++;
+                                }
+                              else
+                                atomic_store (&state->match_overflow, true);
+                            }
+                          pthread_mutex_unlock (&state->match_mutex);
                         }
-                      pthread_mutex_unlock (&state->match_mutex);
+                      p = endp;
                     }
-                  p = endp;
                 }
             }
 
@@ -4607,7 +4650,8 @@ worker_thread_func (void *arg)
 
                   /* With --binary-files=without-match, a null byte
                      before the first match makes the file not match.  */
-                  if (binary_files == WITHOUT_MATCH_BINARY_FILES)
+                  if (binary_files == WITHOUT_MATCH_BINARY_FILES
+                      || patterns_have_nul || !skip_empty_lines)
                     chunk_grepbuf (bufbeg, buflim, state, false);
                 }
               else
@@ -5344,22 +5388,40 @@ static void
 chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st_in)
 {
   producer_flush_batch ();
-  if (exit_on_match && !out_invert && !pool_started)
+  struct stat st;
+  bool have_st = false;
+  if (st_in)
     {
-      char prebuf[65536 + 1];
+      st = *st_in;
+      have_st = true;
+    }
+  else if (fstat (fd, &st) == 0)
+    have_st = true;
+
+  if (have_st && exit_on_match && !out_invert && !pool_started)
+    {
+      char prebuf[GOOD_READSIZE_MIN + 2 + sizeof (uword)];
       prebuf[0] = eolbyte;
       ssize_t n;
       do
-        n = pread (fd, prebuf + 1, 65536, 0);
+        n = pread (fd, prebuf + 1, GOOD_READSIZE_MIN, 0);
       while (n < 0 && errno == EINTR);
-      if (n > 0 && (!eolbyte || binary_files == TEXT_BINARY_FILES || memchr (prebuf + 1, '\0', n) == nullptr))
+      if (n > 0
+          && (!eolbyte || binary_files == TEXT_BINARY_FILES
+              || (!patterns_have_nul
+                  && memchr (prebuf + 1, '\0', n) == nullptr
+                  && (binary_files != WITHOUT_MATCH_BINARY_FILES
+                      || !file_must_have_nulls (n, fd, &st)))))
         {
-          char const *lim = memrchr (prebuf + 1, eolbyte, n);
-          if (lim && lim > prebuf + 1)
+          char *lim = memrchr (prebuf + 1, eolbyte, n);
+          if (lim)
             {
+              idx_t scan_len = (lim + 1) - (prebuf + 1);
+              memset (lim + 1, 0, uword_size);
               idx_t msize = 0;
-              ptrdiff_t off = execute (compiled_pattern, prebuf + 1, lim - (prebuf + 1), &msize, nullptr);
-              if (off >= 0)
+              ptrdiff_t off = execute (compiled_pattern, prebuf + 1, scan_len,
+                                       &msize, nullptr);
+              if (off >= 0 && off < scan_len)
                 {
                   atomic_store (&skip_clean_up_stdout, true);
                   exit (EXIT_SUCCESS);
@@ -5368,10 +5430,7 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
         }
     }
   ensure_pool ();
-  struct stat st;
-  if (st_in)
-    st = *st_in;
-  else if (fstat (fd, &st) != 0)
+  if (!have_st)
     {
       if (!suppress_errors)
         producer_enqueue_error (errno, fname);
@@ -5451,7 +5510,7 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
     data[file_size] = eolbyte;
 
   if (eolbyte && binary_files != TEXT_BINARY_FILES
-      && (memchr (data, '\0', MIN (file_size, 64 * 1024)) != nullptr
+      && (memchr (data, '\0', MIN (file_size, GOOD_READSIZE_MIN)) != nullptr
           || file_must_have_nulls (0, fd, &st)))
     {
       munmap (base, total_alloc);
@@ -5826,7 +5885,6 @@ stream_slicer_stdin (void)
   char *residue_buf = xmalloc (residue_cap);
   size_t residue_len = 0;
   intmax_t stream_totalcc = 0;
-  bool is_first_chunk = true;
 
   while (true)
     {
@@ -5841,12 +5899,13 @@ stream_slicer_stdin (void)
         memcpy (chunk_data, residue_buf, residue_len);
 
       size_t total_in_buf = residue_len;
+      size_t slice_cap = SLICE_BUF_SIZE;
       bool is_eof = false;
 
-      while (total_in_buf < SLICE_BUF_SIZE)
+      while (total_in_buf < slice_cap)
         {
           ssize_t nread = safe_read (STDIN_FILENO, chunk_data + total_in_buf,
-                                     SLICE_BUF_SIZE - total_in_buf);
+                                     slice_cap - total_in_buf);
           if (nread <= 0)
             {
               if (nread < 0)
@@ -5857,28 +5916,46 @@ stream_slicer_stdin (void)
           total_in_buf += nread;
         }
 
+      while (!is_eof && memrchr (chunk_data, eolbyte, total_in_buf) == nullptr)
+        {
+          slice_cap *= 2;
+          chunk_alloc = grow_slice_buf (chunk_alloc, total_in_buf, slice_cap);
+          chunk_data = chunk_alloc + 1;
+          while (total_in_buf < slice_cap)
+            {
+              ssize_t nread = safe_read (STDIN_FILENO, chunk_data + total_in_buf,
+                                         slice_cap - total_in_buf);
+              if (nread <= 0)
+                {
+                  if (nread < 0)
+                    suppressible_error (errno);
+                  is_eof = true;
+                  break;
+                }
+              size_t old_pos = total_in_buf;
+              total_in_buf += nread;
+              if (memchr (chunk_data + old_pos, eolbyte, (size_t) nread) != nullptr)
+                break;
+            }
+        }
+
       if (total_in_buf == 0)
         {
           pthread_mutex_lock (&pool_mutex);
           free_slice_buf_locked (chunk_alloc);
-          if (is_first_chunk)
-            {
-              uint64_t seq = producer_alloc_slot_locked ();
-              struct rob_slot *slot = &rob[seq % ROB_CAP];
-              slot->status = true;
-              slot->errseen = false;
-              slot->had_prtext = false;
-              slot->is_chunk = true;
-              slot->is_last_chunk = true;
-              slot->filename = label ? xstrdup (label) : nullptr;
-              slot->state = ROB_SLOT_DONE;
-              rob_try_commit_locked ();
-            }
+          uint64_t seq = producer_alloc_slot_locked ();
+          struct rob_slot *slot = &rob[seq % ROB_CAP];
+          slot->status = true;
+          slot->errseen = false;
+          slot->had_prtext = false;
+          slot->is_chunk = true;
+          slot->is_last_chunk = true;
+          slot->filename = label ? xstrdup (label) : nullptr;
+          slot->state = ROB_SLOT_DONE;
+          rob_try_commit_locked ();
           pthread_mutex_unlock (&pool_mutex);
           break;
         }
-
-      is_first_chunk = false;
 
       size_t chunk_len = 0;
       size_t next_residue = 0;
@@ -5896,16 +5973,8 @@ stream_slicer_stdin (void)
       else
         {
           char const *last_eol = memrchr (chunk_data, eolbyte, total_in_buf);
-          if (last_eol)
-            {
-              chunk_len = last_eol + 1 - chunk_data;
-              next_residue = total_in_buf - chunk_len;
-            }
-          else
-            {
-              chunk_len = total_in_buf;
-              next_residue = 0;
-            }
+          chunk_len = last_eol + 1 - chunk_data;
+          next_residue = total_in_buf - chunk_len;
         }
 
       if (next_residue > 0)
@@ -8556,6 +8625,7 @@ main (int argc, char **argv)
   raw_keys[keycc] = '\n';
   raw_keys[keycc + 1] = '\0';
   raw_keycc = keycc;
+  patterns_have_nul = memchr (raw_keys, '\0', raw_keycc) != nullptr;
   raw_matcher_syntax = matchers[matcher].syntax;
   raw_matcher_index = matcher;
   raw_exact = only_matching | color_option;

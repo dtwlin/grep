@@ -174,6 +174,11 @@ def run_once(binary, args, env_vars=None, pipe_mode=None, preexec_fn=None):
         proc = subprocess.run(cmd, stdin=cat_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, preexec_fn=preexec_fn)
         cat_proc.stdout.close()
         cat_proc.wait()
+    elif isinstance(pipe_mode, str) and pipe_mode.startswith("pipe:"):
+        cat_proc = subprocess.Popen(["cat", pipe_mode[5:]], stdout=subprocess.PIPE)
+        proc = subprocess.run(cmd, stdin=cat_proc.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, preexec_fn=preexec_fn)
+        cat_proc.stdout.close()
+        cat_proc.wait()
     else:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, preexec_fn=preexec_fn)
     t1 = time.perf_counter()
@@ -564,14 +569,90 @@ def run_edge_case_conformance():
     checks.append(("PCRE nested group+lookbehind", ["-P", "-c", "((?:MT_))(?<=MT_)CHUNK_1", test_file], None, None))
     checks.append(("Color never + binary without-match", ["--color=never", "--binary-files=without-match", "-n", "MT_CHUNK_1", test_file], None, None))
 
+    # 31. System-level correctness audit regressions (Bugs 1-8: brace quantifiers, UTF-8 quantifiers, NUL patterns, >1MB pipe lines, 96KB -I -q NUL, chunk-spanning lines)
+    pcre_brace_file = os.path.join(BENCH_DIR, "regress_pcre_brace.txt")
+    with open(pcre_brace_file, "wb") as f:
+        f.write(b"abc{defx\nabc{ghix\nghi}x\nabcd\nabccd\nabcccd\nab:ghijklmnop\ndef:]ghijklmnop\n")
+
+    dfa_brace_file = os.path.join(BENCH_DIR, "regress_dfa_brace.txt")
+    with open(dfa_brace_file, "wb") as f:
+        f.write(b"foo_axyz\nfoo}xyz\nabbar{b\nfoo12xyz\nfoo123xyz\n")
+
+    utf8_quant_file = os.path.join(BENCH_DIR, "regress_utf8_quant.txt")
+    with open(utf8_quant_file, "wb") as f:
+        f.write("fooxxxb\nfoo€€b\nabcd\nabécd\nxyz\n".encode("utf-8"))
+
+    pat_with_nul = os.path.join(BENCH_DIR, "regress_pat_nul.bin")
+    with open(pat_with_nul, "wb") as f:
+        f.write(b"foo\x00bar\n")
+
+    bin_with_nul_pat = os.path.join(BENCH_DIR, "regress_bin_nul_pat.bin")
+    with open(bin_with_nul_pat, "wb") as f:
+        f.write(b"hello foo\x00bar world\nplain foo\nplain bar\n")
+
+    bin_large_nul_pat = os.path.join(BENCH_DIR, "regress_bin_large_nul_pat.bin")
+    with open(bin_large_nul_pat, "wb") as f:
+        f.write((b"filler line without nul bytes 0123456789\n") * 55000 + b"hello foo\x00bar world\n")
+
+    pipe_giant_line = os.path.join(BENCH_DIR, "regress_pipe_giant_line.txt")
+    with open(pipe_giant_line, "wb") as f:
+        f.write(b"line 1 before giant\n")
+        f.write(b"A" * 600000 + b" PIPE_GIANT_HIT " + b"B" * 750000 + b" PIPE_GIANT_HIT end\n")
+        f.write(b"line 3 after giant PIPE_GIANT_HIT\n")
+        f.write((b"trailing pipe line filler 0123456789\n") * 30000)
+
+    pipe_exact_1mb = os.path.join(BENCH_DIR, "regress_pipe_exact_1mb.txt")
+    with open(pipe_exact_1mb, "wb") as f:
+        f.write((b"EXACT_1MB_TOK_" + b"x" * 49 + b"\n") * 16384)
+
+    bin_70k_nul = os.path.join(BENCH_DIR, "regress_bin_70k_nul.bin")
+    with open(bin_70k_nul, "wb") as f:
+        f.write(b"EARLY_HIT_TOK line 1\n" + (b"x" * 69 + b"\n") * 1000 + b"nul\x00here\n" + (b"y" * 69 + b"\n") * 32000)
+
+    span_chunk_file = os.path.join(BENCH_DIR, "regress_span_chunk.txt")
+    with open(span_chunk_file, "wb") as f:
+        f.write(b"SPAN_CHUNK_HIT start\n")
+        f.write(b"S" * 1600000 + b"\n")
+        f.write(b"SPAN_CHUNK_HIT after giant\n")
+        f.write((b"normal line filler 0123456789abcdef\n") * 30000)
+
+    checks.append(("PCRE non-quantifier {def|ghi}", ["-P", "abc{def|ghi}x", pcre_brace_file], None, None))
+    checks.append(("PCRE {,2} interval quantifier", ["-P", "abc{,2}d", pcre_brace_file], None, None))
+    checks.append(("PCRE unclosed [[:] in char class", ["-P", "ab[[:]|def:]gh[i]jklmnop", pcre_brace_file], None, None))
+    checks.append(("ERE non-quantifier {a|foo} must2", ["-E", "foo.{a|foo}xyz", dfa_brace_file], None, None))
+    checks.append(("ERE {,2} and {a|b} kwsmusts_multi", ["-E", "[a-c]*.{,2}bar?{a|b}{,2}", dfa_brace_file], None, None))
+    checks.append(("BRE non-quantifier \\{a\\|foo\\}", [r"foo.\{a\|foo\}xyz", dfa_brace_file], None, None))
+    checks.append(("BRE \\{,2\\} interval quantifier", [r"foo.\{,2\}xyz\|NEVER_HIT", dfa_brace_file], None, None))
+    checks.append(("UTF-8 multibyte quant €* must2", ["-E", "foo.*€*b", utf8_quant_file], {"LC_ALL": "en_US.UTF-8"}, None))
+    checks.append(("UTF-8 multibyte quant é? ERE alt", ["-E", "abé?cd|xyz", utf8_quant_file], {"LC_ALL": "en_US.UTF-8"}, None))
+    checks.append(("UTF-8 multibyte quant é\\? BRE alt", [r"abé\?cd\|xyz", utf8_quant_file], {"LC_ALL": "en_US.UTF-8"}, None))
+    checks.append(("NUL pattern -F -f binary default", ["-F", "-f", pat_with_nul, bin_with_nul_pat], None, None))
+    checks.append(("NUL pattern -F -f binary -a", ["-a", "-F", "-f", pat_with_nul, bin_with_nul_pat], None, None))
+    checks.append(("NUL pattern -F -f binary -I", ["-I", "-F", "-f", pat_with_nul, bin_with_nul_pat], None, None))
+    checks.append(("NUL pattern -F -f large -c", ["-c", "-F", "-f", pat_with_nul, bin_large_nul_pat], None, None))
+    checks.append(("NUL pattern -F -f large -a -c", ["-a", "-c", "-F", "-f", pat_with_nul, bin_large_nul_pat], None, None))
+    checks.append(("Pipe >1MB line default", ["PIPE_GIANT_HIT"], None, f"pipe:{pipe_giant_line}"))
+    checks.append(("Pipe >1MB line -n -b", ["-n", "-b", "PIPE_GIANT_HIT"], None, f"pipe:{pipe_giant_line}"))
+    checks.append(("Pipe >1MB line -v -c", ["-v", "-c", "PIPE_GIANT_HIT"], None, f"pipe:{pipe_giant_line}"))
+    checks.append(("Pipe >1MB line -C 1 -n", ["-C", "1", "-n", "PIPE_GIANT_HIT"], None, f"pipe:{pipe_giant_line}"))
+    checks.append(("Pipe exact 1MB -c", ["-c", "EXACT_1MB_TOK"], None, f"pipe:{pipe_exact_1mb}"))
+    checks.append(("Pipe exact 1MB -l", ["-l", "EXACT_1MB_TOK"], None, f"pipe:{pipe_exact_1mb}"))
+    checks.append(("Pipe exact 1MB -L", ["-L", "NEVER_HIT_TOK"], None, f"pipe:{pipe_exact_1mb}"))
+    checks.append(("Large -I -q NUL at 70KB", ["-I", "-q", "EARLY_HIT_TOK", bin_70k_nul], None, None))
+    checks.append(("Large -I -c NUL at 70KB", ["-I", "-c", "EARLY_HIT_TOK", bin_70k_nul], None, None))
+    checks.append(("Large chunk-spanning 1.5MB line -n", ["-n", "-b", "SPAN_CHUNK_HIT", span_chunk_file], None, None))
+    checks.append(("Large chunk-spanning 1.5MB line -C 1", ["-C", "1", "-n", "SPAN_CHUNK_HIT", span_chunk_file], None, None))
+
     passed = 0
     total = len(checks)
     for name, args, env_vars, preexec in checks:
         b_env = dict(env_vars) if env_vars else {}
         if BASELINE_BIN == CURRENT_BIN:
             b_env["GREP_THREADS"] = "1"
-        _, b_rc, b_out, b_err, _ = run_once(BASELINE_BIN, args, env_vars=b_env, preexec_fn=None)
-        _, c_rc, c_out, c_err, c_len = run_once(CURRENT_BIN, args, env_vars=env_vars, preexec_fn=preexec)
+        p_mode = preexec if isinstance(preexec, str) and preexec.startswith("pipe:") else None
+        p_fn = None if p_mode else preexec
+        _, b_rc, b_out, b_err, _ = run_once(BASELINE_BIN, args, env_vars=b_env, pipe_mode=p_mode, preexec_fn=None)
+        _, c_rc, c_out, c_err, c_len = run_once(CURRENT_BIN, args, env_vars=env_vars, pipe_mode=p_mode, preexec_fn=p_fn)
 
         if b_rc == c_rc and b_out == c_out and b_err == c_err:
             passed += 1
