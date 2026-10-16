@@ -102,6 +102,8 @@ static bool _GL_ATTRIBUTE_PURE
 is_dfa_brace_quantifier (char const *p, char const *lim,
                          reg_syntax_t syntax_bits)
 {
+  if (!(syntax_bits & RE_INTERVALS))
+    return false;
   bool ere = (syntax_bits & RE_NO_BK_VBAR) != 0;
   if (ere)
     {
@@ -116,6 +118,7 @@ is_dfa_brace_quantifier (char const *p, char const *lim,
       p += 2;
     }
   idx_t digits = 0;
+  bool has_comma = false;
   while (p < lim && *p >= '0' && *p <= '9')
     {
       digits++;
@@ -123,6 +126,7 @@ is_dfa_brace_quantifier (char const *p, char const *lim,
     }
   if (p < lim && *p == ',')
     {
+      has_comma = true;
       p++;
       while (p < lim && *p >= '0' && *p <= '9')
         {
@@ -130,7 +134,7 @@ is_dfa_brace_quantifier (char const *p, char const *lim,
           p++;
         }
     }
-  if (digits == 0)
+  if (digits == 0 && !has_comma)
     return false;
   if (ere)
     return p < lim && *p == '}';
@@ -255,6 +259,12 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
                 p++;
               if (p + 1 < lim)
                 p += 2;
+              continue;
+            }
+          if ((syntax_bits & RE_BACKSLASH_ESCAPE_IN_LISTS)
+              && *p == '\\' && p + 1 < lim)
+            {
+              p += 2;
               continue;
             }
           if (*p == ']')
@@ -407,6 +417,12 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
                     bp++;
                   if (bp + 1 < blim)
                     bp += 2;
+                  continue;
+                }
+              if ((syntax_bits & RE_BACKSLASH_ESCAPE_IN_LISTS)
+                  && *bp == '\\' && bp + 1 < blim)
+                {
+                  bp += 2;
                   continue;
                 }
               if (*bp == ']')
@@ -664,7 +680,7 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
 }
 
 static char const * _GL_ATTRIBUTE_PURE
-skip_bracket_expr (char const *s, char const *lim);
+skip_bracket_expr (char const *s, char const *lim, reg_syntax_t syntax_bits);
 
 static void
 extract_secondary_must (struct dfa_comp *dc, char const *raw_pat,
@@ -681,7 +697,8 @@ extract_secondary_must (struct dfa_comp *dc, char const *raw_pat,
       if (*bp == '[')
         {
           cur_len = 0;
-          bp = skip_quantifiers (skip_bracket_expr (bp, lim), lim, syntax_bits);
+          bp = skip_quantifiers (skip_bracket_expr (bp, lim, syntax_bits),
+                                 lim, syntax_bits);
           continue;
         }
       bool is_meta = (*bp == '\n' || *bp == '^' || *bp == '$'
@@ -827,7 +844,7 @@ possible_backrefs_in_pattern (char const *keys, idx_t len, bool bs_safe)
 }
 
 static char const * _GL_ATTRIBUTE_PURE
-skip_bracket_expr (char const *s, char const *lim)
+skip_bracket_expr (char const *s, char const *lim, reg_syntax_t syntax_bits)
 {
   /* Skip '['.  */
   s++;
@@ -837,6 +854,12 @@ skip_bracket_expr (char const *s, char const *lim)
     s++;
   while (s < lim && *s != ']')
     {
+      if ((syntax_bits & RE_BACKSLASH_ESCAPE_IN_LISTS)
+          && *s == '\\' && s + 1 < lim)
+        {
+          s += 2;
+          continue;
+        }
       if (s + 1 < lim && *s == '['
           && (s[1] == ':' || s[1] == '.' || s[1] == '='))
         {
@@ -880,7 +903,7 @@ analyze_backref_filter (char const *p, idx_t len, reg_syntax_t syntax_bits,
     {
       if (*s == '[')
         {
-          s = skip_bracket_expr (s, lim) - 1;
+          s = skip_bracket_expr (s, lim, syntax_bits) - 1;
           continue;
         }
       if (*s == '\\')
@@ -898,6 +921,8 @@ analyze_backref_filter (char const *p, idx_t len, reg_syntax_t syntax_bits,
                 }
               else if (*s == ')')
                 {
+                  if (depth <= 0)
+                    return;
                   depth--;
                   if (depth == 0 && g1_start && !g1_end)
                     g1_end = s - 1;
@@ -918,6 +943,8 @@ analyze_backref_filter (char const *p, idx_t len, reg_syntax_t syntax_bits,
             }
           else if (*s == ')')
             {
+              if (depth <= 0)
+                return;
               depth--;
               if (depth == 0 && g1_start && !g1_end)
                 g1_end = s;
@@ -927,14 +954,14 @@ analyze_backref_filter (char const *p, idx_t len, reg_syntax_t syntax_bits,
         }
     }
 
-  if (!g1_start || !g1_end || g1_start > g1_end)
+  if (depth != 0 || !g1_start || !g1_end || g1_start > g1_end)
     return;
 
   for (char const *s = g1_start; s < g1_end; s++)
     {
       if (*s == '[')
         {
-          s = skip_bracket_expr (s, g1_end) - 1;
+          s = skip_bracket_expr (s, g1_end, syntax_bits) - 1;
           continue;
         }
       if (*s == '\\')
@@ -957,33 +984,45 @@ analyze_backref_filter (char const *p, idx_t len, reg_syntax_t syntax_bits,
       idx_t atom_base = 1;
       if (*s == '[')
         {
-          s = skip_bracket_expr (s, g1_end);
+          s = skip_bracket_expr (s, g1_end, syntax_bits);
         }
       else if (*s == '\\')
         {
           s++;
-          if (s < g1_end)
-            {
-              if (*s == 'b' || *s == 'B' || *s == '<' || *s == '>'
-                  || *s == '\'' || *s == '`')
-                atom_base = 0;
-              s++;
-            }
+          if (s >= g1_end)
+            return;
+          if ((unsigned char) *s >= 0x80
+              || *s == '+' || *s == '?' || *s == '{' || *s == '}'
+              || *s == '(' || *s == ')' || *s == '|'
+              || (*s >= '1' && *s <= '9'))
+            return;
+          if (*s == 'b' || *s == 'B' || *s == '<' || *s == '>'
+              || *s == '\'' || *s == '`')
+            atom_base = 0;
+          s++;
         }
       else if (*s == '^' || *s == '$')
         {
           atom_base = 0;
           s++;
         }
+      else if (*s == '*' || *s == '+' || *s == '?'
+               || *s == '{' || *s == '}'
+               || *s == '(' || *s == ')' || *s == '|')
+        return;
       else
         {
           char const *atom_start = s;
-          s++;
           if (localeinfo.using_utf8 && (unsigned char) atom_start[0] >= 0x80)
             {
-              while (s < g1_end && ((unsigned char) *s & 0xC0) == 0x80)
-                s++;
+              mbstate_t mbs = { 0 };
+              size_t clen = mbrlen (s, g1_end - s, &mbs);
+              if (clen == (size_t) -1 || clen == (size_t) -2 || clen == 0)
+                return;
+              s += clen;
             }
+          else
+            s++;
           atom_base = (*atom_start == '.') ? 1 : (s - atom_start);
         }
 
@@ -1586,8 +1625,10 @@ EGexecute (void *vdc, char const *buf, idx_t size, idx_t *match_size,
 
           if (!dc->dfa_compiled)
             {
+              suppress_dfawarn = true;
               dfaparse (dc->dfa_pattern, dc->dfa_pattern_size, dc->dfa);
               dfacomp (nullptr, 0, dc->dfa, 1);
+              suppress_dfawarn = false;
               dc->dfa_compiled = true;
             }
           struct dfa *superset = dfasuperset (dc->dfa);

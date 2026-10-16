@@ -254,7 +254,7 @@ skip_pcre_quantifiers (char const *pat, idx_t p, idx_t size)
 }
 
 static idx_t _GL_ATTRIBUTE_PURE
-skip_pcre_escape (char const *pat, idx_t p, idx_t size)
+skip_pcre_escape (char const *pat, idx_t p, idx_t size, bool in_char_class)
 {
   p++;
   if (p >= size)
@@ -302,7 +302,7 @@ skip_pcre_escape (char const *pat, idx_t p, idx_t size)
       else if (esc == 'p' || esc == 'P')
         p++;
     }
-  else if ((esc == 'g' || esc == 'k') && p < size)
+  else if (!in_char_class && (esc == 'g' || esc == 'k') && p < size)
     {
       char closer = 0;
       if (pat[p] == '{') closer = '}';
@@ -338,7 +338,7 @@ skip_pcre_char_class (char const *pat, idx_t p, idx_t size)
   while (p < size && pat[p] != ']')
     {
       if (pat[p] == '\\')
-        p = skip_pcre_escape (pat, p, size);
+        p = skip_pcre_escape (pat, p, size, true);
       else if (p + 1 < size && pat[p] == '['
                && (pat[p + 1] == ':' || pat[p + 1] == '.' || pat[p + 1] == '='))
         {
@@ -402,7 +402,7 @@ find_must_literal (char const *pat, idx_t size, idx_t *out_len)
           while (q < size && depth > 0)
             {
               if (pat[q] == '\\')
-                q = skip_pcre_escape (pat, q, size);
+                q = skip_pcre_escape (pat, q, size, false);
               else if (pat[q] == '[')
                 q = skip_pcre_char_class (pat, q, size);
               else if (pat[q] == '(')
@@ -460,7 +460,7 @@ find_must_literal (char const *pat, idx_t size, idx_t *out_len)
 
       if (pat[p] == '\\' && !(p + 1 < size && is_escaped_lit_char (pat[p + 1])))
         {
-          p = skip_pcre_escape (pat, p, size);
+          p = skip_pcre_escape (pat, p, size, false);
           p = skip_pcre_quantifiers (pat, p, size);
           continue;
         }

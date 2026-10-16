@@ -247,7 +247,8 @@ Fexecute_core (void *vcp, char const *buf, idx_t size, idx_t *match_size,
   bool mb_check = localeinfo.multibyte & !localeinfo.using_utf8 & !match_lines;
   bool longest = (mb_check | !!start_ptr | match_words) & !match_lines;
 
-  for (mb_start = beg = start_ptr ? start_ptr : buf; beg <= buf + size; beg++)
+  mb_start = kwsearch->utf8_quirk_mask ? buf : (start_ptr ? start_ptr : buf);
+  for (beg = start_ptr ? start_ptr : buf; beg <= buf + size; beg++)
     {
       struct kwsmatch kwsmatch;
       ptrdiff_t offset = kwsexec (kwset, beg - match_lines,
@@ -365,16 +366,25 @@ Fexecute_with_utf8_quirk (struct kwsearch *kwsearch, char const *buf,
 {
   char eol = eolbyte;
   unsigned char mask = kwsearch->utf8_quirk_mask;
-  char const *p = start_ptr ? start_ptr : buf;
+  char const *p = buf;
+  if (start_ptr)
+    {
+      char const *prev_nl = memrchr (buf, eol, start_ptr - buf);
+      p = prev_nl ? prev_nl + 1 : buf;
+    }
   char const *buflim = buf + size;
 
   while (p < buflim)
     {
+      char const *cur_start = (start_ptr
+                               ? ((p <= start_ptr && start_ptr <= buflim)
+                                  ? start_ptr : p)
+                               : nullptr);
       char const *quirk_pos = find_utf8_icase_quirk (p, buflim - p, mask);
       if (!quirk_pos)
         {
           ptrdiff_t off = Fexecute_core (kwsearch, p, buflim - p, match_size,
-                                         p == start_ptr ? start_ptr : nullptr);
+                                         cur_start);
           if (off < 0)
             return -1;
           return (p - buf) + off;
@@ -386,8 +396,7 @@ Fexecute_with_utf8_quirk (struct kwsearch *kwsearch, char const *buf,
       if (quirk_line_start > p)
         {
           ptrdiff_t off = Fexecute_core (kwsearch, p, quirk_line_start - p,
-                                         match_size,
-                                         p == start_ptr ? start_ptr : nullptr);
+                                         match_size, cur_start);
           if (off >= 0)
             return (p - buf) + off;
           p = quirk_line_start;
@@ -420,10 +429,13 @@ Fexecute_with_utf8_quirk (struct kwsearch *kwsearch, char const *buf,
 
       norm[-1] = eol;
 
+      idx_t norm_start_idx = 0;
       idx_t nlen = 0;
       idx_t i = 0;
       while (i < line_len)
         {
+          if (start_ptr && line_beg + i <= start_ptr)
+            norm_start_idx = (line_beg + i == start_ptr) ? nlen : nlen + 1;
           orig_off[nlen] = i;
           if (i + 1 < line_len)
             {
@@ -444,6 +456,8 @@ Fexecute_with_utf8_quirk (struct kwsearch *kwsearch, char const *buf,
             }
           norm[nlen++] = line_beg[i++];
         }
+      if (start_ptr && line_beg + line_len <= start_ptr)
+        norm_start_idx = nlen;
       orig_off[nlen] = line_len;
       orig_off[nlen + 1] = line_len;
       orig_off[nlen + 2] = line_len;
@@ -451,7 +465,7 @@ Fexecute_with_utf8_quirk (struct kwsearch *kwsearch, char const *buf,
       norm[nlen] = (nl ? eol : 0);
       norm[nlen + 1] = 0;
 
-      char const *norm_start = (start_ptr && line_beg == start_ptr) ? norm : nullptr;
+      char const *norm_start = start_ptr ? norm + norm_start_idx : nullptr;
 
       idx_t norm_msize = 0;
       ptrdiff_t norm_off = Fexecute_core (kwsearch, norm, nlen, &norm_msize, norm_start);
