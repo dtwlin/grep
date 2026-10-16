@@ -153,6 +153,7 @@ TESTS =						\
   parallel-kwset-ac				\
   parallel-multithread-cases			\
   parallel-pcre-must				\
+  parallel-refactor				\
   parallel-stage1-optim				\
   parallel-stream-stdin				\
   parallel-stress-test				\

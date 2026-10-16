@@ -1,0 +1,160 @@
+#!/bin/sh
+# Test refactored helper functions across serial, worker pool, chunked mmap,
+# stream slicer, parallel tree walk, and DFA must-literal / backreference paths.
+#
+# Copyright (C) 2026 Free Software Foundation, Inc.
+# Copyright (C) 2026 David Lin <dtwlin@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+
+fail=0
+
+# Helper: compare GREP_THREADS=1 against GREP_THREADS=4 and GREP_THREADS=8
+# for stdout, stderr, and exit code.
+check_parallel_eq()
+{
+  label=$1
+  shift
+  GREP_THREADS=1 grep "$@" > exp_out 2> exp_err
+  exp_rc=$?
+
+  for t in 2 4 8; do
+    GREP_THREADS=$t grep "$@" > act_out 2> act_err
+    act_rc=$?
+    if test $exp_rc -ne $act_rc; then
+      echo "FAIL ($label, t=$t): rc $exp_rc vs $act_rc" >&2
+      fail=1
+    fi
+    compare exp_out act_out || { echo "FAIL ($label, t=$t): stdout mismatch" >&2; fail=1; }
+    compare exp_err act_err || { echo "FAIL ($label, t=$t): stderr mismatch" >&2; fail=1; }
+  done
+}
+
+# 1. compute_offset_width across file sizes (0 B, 9 B, 10 B, 1000 B, >2 MiB) and pipes
+: > empty.txt
+printf 'hit_nine\n' > nine.txt
+printf 'hit_ten12\n' > ten.txt
+awk 'BEGIN { for (i = 0; i < 50; i++) printf "line_%03d_hit_thousand\n", i }' > thousand.txt
+awk 'BEGIN {
+  for (i = 0; i < 70000; i++) {
+    if (i == 10 || i == 65000)
+      printf "MATCH_TOKEN_LINE_%d_0123456789abcdef\n", i
+    else
+      printf "filler_line_%06d_0123456789abcdef\n", i
+  }
+}' > large_2m.txt
+
+check_parallel_eq "offset-width-small-T-n-b" -T -n -b -H hit empty.txt nine.txt ten.txt thousand.txt
+check_parallel_eq "offset-width-large-stateless-T-n-b" -T -n -b -H MATCH_TOKEN_LINE large_2m.txt
+check_parallel_eq "offset-width-large-context-T-n-b" -T -n -b -C 2 -H MATCH_TOKEN_LINE large_2m.txt
+
+for t in 1 4 8; do
+  cat large_2m.txt | GREP_THREADS=$t grep -T -n -b -H --label=pipe_in MATCH_TOKEN_LINE > pipe_out_$t 2> pipe_err_$t
+  test $? -eq 0 || fail=1
+done
+compare pipe_out_1 pipe_out_4 || fail=1
+compare pipe_out_1 pipe_out_8 || fail=1
+
+# 2. print_file_count & print_listed_file across serial, ROB, chunked, cmd_files (>=16), and tree walk (-r)
+mkdir -p walk_dir/sub1 walk_dir/sub2
+for i in $(seq 1 20); do
+  if test $((i % 2)) -eq 0; then
+    printf 'alpha_hit_%d\nbeta_hit_%d\n' "$i" "$i" > "walk_dir/sub1/f_$i.txt"
+  else
+    printf 'no_match_here_%d\n' "$i" > "walk_dir/sub2/f_$i.txt"
+  fi
+done
+
+check_parallel_eq "count-rob-H" -c -H hit nine.txt ten.txt empty.txt thousand.txt
+check_parallel_eq "count-rob-Z" -c -Z -H hit nine.txt ten.txt empty.txt thousand.txt
+check_parallel_eq "count-rob-linebuf" --line-buffered -c -H hit nine.txt ten.txt empty.txt thousand.txt
+check_parallel_eq "list-matching-rob-Z" -l -Z hit nine.txt ten.txt empty.txt thousand.txt
+check_parallel_eq "list-nonmatching-rob-Z" -L -Z hit nine.txt ten.txt empty.txt thousand.txt
+check_parallel_eq "count-large-chunked" -c -H MATCH_TOKEN_LINE large_2m.txt
+check_parallel_eq "count-cmd-files-batch" -c -H alpha_hit walk_dir/sub1/f_*.txt walk_dir/sub2/f_*.txt
+check_parallel_eq "count-cmd-files-batch-Z" -c -Z -H alpha_hit walk_dir/sub1/f_*.txt walk_dir/sub2/f_*.txt
+check_parallel_eq "list-cmd-files-batch-l" -l -Z alpha_hit walk_dir/sub1/f_*.txt walk_dir/sub2/f_*.txt
+check_parallel_eq "list-cmd-files-batch-L" -L -Z alpha_hit walk_dir/sub1/f_*.txt walk_dir/sub2/f_*.txt
+check_parallel_eq "walk-dirs-count" -r -c alpha_hit walk_dir
+check_parallel_eq "walk-dirs-list-l" -r -l -Z alpha_hit walk_dir
+check_parallel_eq "walk-dirs-list-L" -r -L -Z alpha_hit walk_dir
+
+# 3. TLS state save/restore & rob_capture_tls_output inline_out / binary discovery in later chunk
+# 3a. Large file (>2 MiB) where chunk 0 has a small match (stored in inline_out) and chunk 1 has a NUL byte
+python3 -c '
+with open("large_inline_then_nul.bin", "wb") as f:
+    f.write(b"SMALL_INLINE_HIT\n")
+    f.write(b"x" * 79 + b"\n")
+    f.write((b"filler_0123456789abcdef_0123456789abcdef\n") * 45000)
+    f.write(b"binary_nul_\x00_and_SMALL_INLINE_HIT\n")
+    f.write((b"filler_0123456789abcdef_0123456789abcdef\n") * 20000)
+' || framework_failure_
+
+check_parallel_eq "chunk-inline-then-nul-default" SMALL_INLINE_HIT large_inline_then_nul.bin
+check_parallel_eq "chunk-inline-then-nul-text" -a SMALL_INLINE_HIT large_inline_then_nul.bin
+check_parallel_eq "chunk-inline-then-nul-ignore" -I SMALL_INLINE_HIT large_inline_then_nul.bin
+check_parallel_eq "chunk-inline-then-nul-count" -c SMALL_INLINE_HIT large_inline_then_nul.bin
+check_parallel_eq "chunk-inline-then-nul-count-I" -I -c SMALL_INLINE_HIT large_inline_then_nul.bin
+
+# 3b. TASK_TYPE_MMAP_SCAN (-l / -L / -q on >4 MiB file)
+cat large_2m.txt large_2m.txt > large_4m.txt
+check_parallel_eq "mmap-scan-l" -l MATCH_TOKEN_LINE large_4m.txt empty.txt
+check_parallel_eq "mmap-scan-L" -L NEVER_MATCH_TOKEN large_4m.txt empty.txt
+check_parallel_eq "mmap-scan-q" -q MATCH_TOKEN_LINE large_4m.txt empty.txt
+
+# 3c. stream_commit_binary & stream_commit_slice_locked on >2 MiB piped stdin
+for t in 1 4 8; do
+  cat large_inline_then_nul.bin | GREP_THREADS=$t grep SMALL_INLINE_HIT > pipe_bin_out_$t 2> pipe_bin_err_$t
+  test $? -eq 0 || fail=1
+  cat large_inline_then_nul.bin | GREP_THREADS=$t grep -a -T -n -b SMALL_INLINE_HIT > pipe_bina_out_$t 2> pipe_bina_err_$t
+  test $? -eq 0 || fail=1
+  cat large_2m.txt | GREP_THREADS=$t grep -C 1 -T -n -b -H --label=stdin_lbl MATCH_TOKEN_LINE - nine.txt > pipe_ctx_out_$t 2> pipe_ctx_err_$t
+  test $? -eq 0 || fail=1
+done
+compare pipe_bin_out_1 pipe_bin_out_4 || fail=1
+compare pipe_bin_out_1 pipe_bin_out_8 || fail=1
+compare pipe_bina_out_1 pipe_bina_out_4 || fail=1
+compare pipe_bina_out_1 pipe_bina_out_8 || fail=1
+compare pipe_ctx_out_1 pipe_ctx_out_4 || fail=1
+compare pipe_ctx_out_1 pipe_ctx_out_8 || fail=1
+
+# 3d. exact_stdout deferred search when output file is inside searched directory
+mkdir -p defer_dir
+printf 'alpha_hit\nbeta_hit\n' > defer_dir/a.txt
+printf 'alpha_hit\n' > defer_dir/z.txt
+GREP_THREADS=1 grep -r -c alpha_hit defer_dir > defer_dir/m_out.txt 2> defer_err_1
+rc1=$?
+cp defer_dir/m_out.txt defer_exp.txt
+: > defer_dir/m_out.txt
+GREP_THREADS=8 grep -r -c alpha_hit defer_dir > defer_dir/m_out.txt 2> defer_err_8
+rc8=$?
+test $rc1 -eq $rc8 || fail=1
+compare defer_exp.txt defer_dir/m_out.txt || fail=1
+compare defer_err_1 defer_err_8 || fail=1
+
+# 4. dfasearch.c refactored helpers: kwsmusts_multi & analyze_backref_filter
+cat << 'EOF' > dfa_refactor_in.txt
+alpha_123_beta
+foo]bar_exact
+foo^bar_caret
+qux_999_end
+abcd-abcd
+abcde-abcde
+a-a
+xyz=xyz
+EOF
+
+check_parallel_eq "kwsmusts-multi-posix-classes" -E '[[:alpha:]]+_[0-9]+_beta|foo[\]a]bar_exact|qux_[0-9]{3}_end' dfa_refactor_in.txt
+check_parallel_eq "kwsmusts-multi-leading-rbrack" -E 'foo[]a]bar_exact|foo[^]a]bar_caret' dfa_refactor_in.txt
+check_parallel_eq "kwsmusts-multi-bre-alt" 'foo[]a]bar_exact\|qux_[0-9]\{3\}_end' dfa_refactor_in.txt
+check_parallel_eq "backref-ere-brace-quant" -E '([a-z]{3,5})-\1' dfa_refactor_in.txt
+check_parallel_eq "backref-bre-brace-quant" '\([a-z]\{3,5\}\)-\1' dfa_refactor_in.txt
+check_parallel_eq "backref-ere-open-brace-quant" -E '([a-z]{2,})=\1' dfa_refactor_in.txt
+check_parallel_eq "backref-bre-open-brace-quant" '\([a-z]\{2,\}\)=\1' dfa_refactor_in.txt
+
+Exit $fail

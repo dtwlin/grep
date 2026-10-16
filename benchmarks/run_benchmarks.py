@@ -735,6 +735,16 @@ def run_edge_case_conformance():
     checks.append(("Multi-stdin -l on >=2MB file", ["-l", "match_target", "-", "-"], None, "redirect"))
     checks.append(("Multi-stdin -L on >=2MB file", ["-L", "match_target", "-", "-"], None, "redirect"))
 
+    # 34. Round 7 refactored helpers conformance (compute_offset_width, print_file_count,
+    #     print_listed_file, search_tls_state, kwsmusts_multi, analyze_backref_filter)
+    checks.append(("Refactor -T -n -b chunked+small", ["-T", "-n", "-b", "-H", "match_target", chunk_ctx_enc2, pipe_2m_sep], None, None))
+    checks.append(("Refactor -c -Z multi-file", ["-c", "-Z", "-H", "match_target", chunk_ctx_enc2, pipe_2m_sep], None, None))
+    checks.append(("Refactor -l -Z multi-file", ["-l", "-Z", "match_target", chunk_ctx_enc2, pipe_2m_sep], None, None))
+    checks.append(("Refactor -L -Z multi-file", ["-L", "-Z", "NEVER_MATCH_XYZZY", chunk_ctx_enc2, pipe_2m_sep], None, None))
+    checks.append(("Refactor kwsmusts_multi classes", ["-E", "[[:alpha:]]+_target|before[0-9]+|after[]0-9]+", chunk_ctx_enc2], None, None))
+    checks.append(("Refactor backref ERE {m,n}", ["-E", "([a-z]{2,4})\\1", bref_edge_file], None, None))
+    checks.append(("Refactor backref BRE \\{m,n\\}", [r"\([a-z]\{2,4\}\)\1", bref_edge_file], None, None))
+
     passed = 0
     total = len(checks)
     try:
