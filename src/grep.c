@@ -7419,12 +7419,28 @@ walk_pick (void)
 }
 
 static void
-walk_help_bin_job (struct walk_bin_job *job)
+walk_try_publish_bin_job (struct walk_bin_job *job, bool *published)
+{
+  pthread_mutex_lock (&walk.mu);
+  if (walk.bin_job == nullptr)
+    {
+      walk.bin_job = job;
+      *published = true;
+      if (walk.idle)
+        pthread_cond_broadcast (&walk.cv);
+    }
+  pthread_mutex_unlock (&walk.mu);
+}
+
+static void
+walk_help_bin_job (struct walk_bin_job *job, bool *published)
 {
   size_t slice = job->slice_size;
   size_t overlap = MAX (65536, (size_t) raw_keycc + 1);
   while (!atomic_load_explicit (&job->found, memory_order_relaxed))
     {
+      if (published && !*published)
+        walk_try_publish_bin_job (job, published);
       size_t off = atomic_fetch_add (&job->next_offset, slice);
       if (off >= job->size)
         break;
@@ -7453,17 +7469,7 @@ walk_bin_scan (char const *map, size_t size, size_t scan_offset)
   job.slice_size = 4 * 1024 * 1024;
 
   bool published = false;
-  pthread_mutex_lock (&walk.mu);
-  if (walk.bin_job == nullptr)
-    {
-      walk.bin_job = &job;
-      published = true;
-      if (walk.idle)
-        pthread_cond_broadcast (&walk.cv);
-    }
-  pthread_mutex_unlock (&walk.mu);
-
-  walk_help_bin_job (&job);
+  walk_help_bin_job (&job, &published);
 
   if (published)
     {
@@ -7498,7 +7504,7 @@ walk_participate (unsigned int gen)
               struct walk_bin_job *job = walk.bin_job;
               atomic_fetch_add (&job->active_workers, 1);
               pthread_mutex_unlock (&walk.mu);
-              walk_help_bin_job (job);
+              walk_help_bin_job (job, nullptr);
               pthread_mutex_lock (&walk.mu);
               if (atomic_fetch_sub (&job->active_workers, 1) == 2)
                 pthread_cond_broadcast (&walk.cv);
