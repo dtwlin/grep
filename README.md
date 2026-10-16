@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>GNU grep, multi-threaded and SIMD-accelerated.</b><br>
-  Same flags. Same output, byte for byte. On average <b>19× faster</b> than GNU grep and <b>2–3× faster</b> than <a href="https://github.com/BurntSushi/ripgrep">ripgrep</a>.
+  Same flags. Same output, byte for byte. On average <b>21× faster</b> than GNU grep and <b>3–4× faster</b> than <a href="https://github.com/BurntSushi/ripgrep">ripgrep</a>.
 </p>
 
 <p align="center">
@@ -24,7 +24,7 @@
 - **🔁 100% drop-in.** It *is* GNU grep 3.12 with a new engine underneath — same options, same output, same exit codes. Install it and every script, tool, and agent that calls `grep` gets faster. No new flags, no aliases, no config.
 - **🧵 Parallel by default.** Up to 32 threads search files, directories, and even a single huge file, yet results come out in exactly the order GNU grep prints them.
 - **🏎️ SIMD search engines.** AVX2 literal scanners, a dense Aho-Corasick automaton for big keyword sets, and literal pre-filters for PCRE2, backreferences, and 1,000-way alternations.
-- **⏱️ No startup tax.** Threads start lazily, so a one-file `grep` takes 2.7 ms — the same as GNU grep (ripgrep: 3.8 ms).
+- **⏱️ No startup tax.** Threads start lazily, so a one-file `grep` takes 2.6 ms — the same as GNU grep (2.7 ms; ripgrep: 3.8 ms).
 - **✅ Verified identical.** `stdout`, `stderr`, and exit status are byte-identical to upstream GNU grep across 59 kernel-tree scenarios, 200 edge-case, boundary, and multithreaded checks, continuous stress testing, 6,881 directory-traversal comparisons, and randomized multi-pattern fuzzing, at 1 to 128 threads. It passes GNU grep's own test suite and runs clean under AddressSanitizer, UndefinedBehaviorSanitizer, and ThreadSanitizer.
 
 ## 🤖 Built for AI coding tools
@@ -33,11 +33,11 @@ AI coding agents lean on `grep` constantly: every "where is this defined?" or "w
 
 | Benefit | Why it matters for agents |
 | :-- | :-- |
-| ⚡ **Repo-wide search in well under a second** | Linux kernel (96k files): ~0.2 s with 32 threads, ~0.4 s with 8, vs ~4 s for GNU grep. Shorter tool round-trips → faster agent loops. |
+| ⚡ **Repo-wide search in well under a second** | Linux kernel (96k files): ~0.16 s with 32 threads, ~0.4 s with 8, vs ~4 s for GNU grep. Shorter tool round-trips → faster agent loops. |
 | 🧠 **Nothing to re-learn** | Models already know `grep -rn`, `-i`, `-c`, `-l`, `-F -f`, `-P`. No prompt changes, no custom tool definitions, no `rg` flag translation. |
 | 🔒 **Deterministic output** | Same bytes in the same order at any thread count → stable context windows and reproducible runs. |
-| 🪶 **Same latency for small lookups** | A tiny single-file `grep` costs what it cost before (2.7 ms); the thread pool only starts when there is enough work. |
-| 📚 **Big wins where agents hurt most** | Recursive, case-insensitive, counting, and symbol-list (`-F -f`) searches are 24–81× faster than GNU grep. |
+| 🪶 **Same latency for small lookups** | A tiny single-file `grep` costs what it cost before (2.6 ms); the thread pool only starts when there is enough work. |
+| 📚 **Big wins where agents hurt most** | Recursive, case-insensitive, counting, symbol-list (`-F -f`), and PCRE2 searches are 22–124× faster than GNU grep. |
 
 ### 🧩 Suggested agent skill
 
@@ -112,24 +112,24 @@ Setup: the Linux kernel source tree (96,034 files, 1.64 GB) on an AMD EPYC serve
 | Workload | GNU grep | ripgrep | ripgrep<br>`-j 32` | ⚡ Supercharged grep | vs GNU grep | vs ripgrep¹ |
 | :-- | --: | --: | --: | --: | --: | --: |
 | Dense literal: `grep -rn 'static int'` | 4.53 s | 509 ms | 548 ms | **162 ms** | 28× | 3.2× |
-| Case-insensitive: `grep -ri copyright` | 5.10 s | 779 ms | 1.01 s | **157 ms** | 33× | 5.0× |
-| Count per file: `grep -rc '#include <linux/'`² | 3.67 s | 1.11 s | 1.54 s | **155 ms** | 24× | 7.1× |
-| 1,000 fixed strings: `grep -rF -f sym_1000.txt` | 14.0 s | 718 ms | 352 ms | **172 ms** | 81× | 2.0× |
-| PCRE2 lookaround: `grep -rP '(?<=\bstruct\s)\w+(?=\s*\*\s*\w+;)'` | 27.6 s | 2.51 s | 1.14 s | **901 ms** | 31× | 1.3× |
-| Backreference: `grep -rE '\b([a-z]{4,})_\1\b'`³ | 41.6 s | 842 ms | 357 ms | **280 ms** | 149× | 1.28× |
-| 1.4 GB file: `grep -F kmalloc_array_node linux-all.c` | 498 ms | 105 ms | 109 ms | **18.7 ms** | 27× | 5.6× |
-| 1.4 GB file: `grep -ni copyright linux-all.c` | 1.97 s | 240 ms | 267 ms | **40.5 ms** | 49× | 5.9× |
+| Case-insensitive: `grep -ri copyright` | 5.10 s | 779 ms | 1.01 s | **156 ms** | 33× | 5.0× |
+| Count per file: `grep -rc '#include <linux/'`² | 3.67 s | 1.11 s | 1.54 s | **165 ms** | 22× | 6.7× |
+| 1,000 fixed strings: `grep -rF -f sym_1000.txt` | 14.0 s | 718 ms | 352 ms | **173 ms** | 81× | 2.0× |
+| PCRE2 lookaround: `grep -rP '(?<=\bstruct\s)\w+(?=\s*\*\s*\w+;)'` | 27.6 s | 2.51 s | 1.14 s | **223 ms** | 124× | 5.1× |
+| Backreference: `grep -rE '\b([a-z]{4,})_\1\b'`³ | 41.6 s | 842 ms | 357 ms | **267 ms** | 156× | 1.34× |
+| 1.4 GB file: `grep -F kmalloc_array_node linux-all.c` | 498 ms | 105 ms | 109 ms | **21.8 ms** | 23× | 4.8× |
+| 1.4 GB file: `grep -ni copyright linux-all.c` | 1.97 s | 240 ms | 267 ms | **44.1 ms** | 45× | 5.4× |
 | One small file: `grep -n start_kernel init/main.c` | 2.7 ms | 3.8 ms | 3.7 ms | **2.6 ms** | 1.0× | 1.4× |
-| Whole tree, cold cache⁴ | 53.5 s | 4.96 s | — | **1.97 s** | 27× | 2.5× |
+| Whole tree, cold cache⁴ | 53.5 s | 4.96 s | — | **2.07 s** | 26× | 2.4× |
 
 <sub>¹ Against the faster of the two ripgrep runs. ² ripgrep needs `--include-zero` to print the `file:0` lines that `grep -c` prints. ³ ripgrep needs `-P` (PCRE2) for backreferences. ⁴ Zero-match literal after evicting the tree's file data from the page cache with `posix_fadvise` (directory metadata stays cached); `rg -j 32` was not measured cold.</sub>
 
-**Across all 59 scenarios (geometric mean): 18.71× faster than GNU grep, 3.21× faster than ripgrep at its defaults, and 2.37× faster than `rg -j 32`.** Supercharged grep's output was byte-identical to GNU grep's in every scenario.
+**Across all 59 scenarios (geometric mean): 21.17× faster than GNU grep, 3.63× faster than ripgrep at its defaults, and 2.68× faster than `rg -j 32`.** Supercharged grep's output was byte-identical to GNU grep's in every scenario.
 
 ### Is it a fair fight?
 
-- 🧮 **Same thread count:** with both tools on 12 threads (`GREP_THREADS=12` vs ripgrep's default of 12), Supercharged grep is still **1.83× faster** (geometric mean of 40 scenarios: 39 wins, 1 loss).
-- 🙈 **ripgrep's default `.gitignore` mode** (without `-uu`) does not close the gap: 391 ms (234 ms with `-j 32`) vs **153 ms** for `grep -rn --exclude-dir=.git spin_lock_irqsave`.
+- 🧮 **Same thread count:** with both tools on 12 threads (`GREP_THREADS=12` vs ripgrep's default of 12), Supercharged grep is still **1.90× faster** (geometric mean of 40 scenarios: 40 wins, 0 losses).
+- 🙈 **ripgrep's default `.gitignore` mode** (without `-uu`) does not close the gap: 391 ms (234 ms with `-j 32`) vs **155 ms** for `grep -rn --exclude-dir=.git spin_lock_irqsave`.
 - 💻 **Fewer cores:** capped at 8 threads (`GREP_THREADS=8`), it is still 9–11× faster than GNU grep on whole-tree scans and 30× faster with 1,000 patterns.
 
 📄 Full matrix, thread-scaling curves (1–128 threads), locale and cold-cache analysis: [`BENCHMARK_RESULTS.md`](BENCHMARK_RESULTS.md). Reproduce with [`benchmarks/kernel/`](benchmarks/kernel/README.md).
@@ -154,7 +154,7 @@ Everything below lives behind GNU grep's unchanged command-line interface.
 
 ### 💾 I/O
 
-- Per-worker I/O buffers, `mmap` for large files, and many reads in flight at once — which is why cold-cache tree scans finish 27× sooner than with GNU grep.
+- Per-worker I/O buffers, `mmap` for large files, and many reads in flight at once — which is why cold-cache tree scans finish 26× sooner than with GNU grep.
 
 ## 📦 Install
 
@@ -231,9 +231,8 @@ Changing `GREP_THREADS` only affects speed — the output and line order are alw
 
 ## ⚠️ Honest notes
 
-- **CPU and memory for time.** Parallel runs burn more CPU-seconds to finish sooner, and a whole-tree search peaks at ~50–112 MB of resident memory (GNU grep and ripgrep: ≤ 40 MB). Lower `GREP_THREADS` on shared machines.
-- **One known latency regression:** `grep -rq` with a match in the very first files of a tree takes ~12 ms instead of ~3 ms.
-- **Thread-matched ripgrep** (`rg -j 32`) wins 13 of the 59 scenarios — sparse whole-tree scans (`T-01`..`T-03`, `T-14`..`T-15`, `T-24`..`T-26`, `P-03`), sub-20 ms early-exit runs (`T-11`, `T-28`), one tiny UX run (`U-02`), and one micro-benchmark (`L-00`). Supercharged grep wins 44, often by 2–70×; 2 are ties.
+- **CPU and memory for time.** Parallel runs burn more CPU-seconds to finish sooner, and a whole-tree search peaks at ~35–157 MB of resident memory (GNU grep and ripgrep: ≤ 40 MB). Lower `GREP_THREADS` on shared machines.
+- **Thread-matched ripgrep** (`rg -j 32`) wins 3 of the 59 scenarios — one small sub-directory scan (`T-28`, 14.0 ms vs 15.9 ms), one naive invocation where `grep` scans the 6 GB `.git` directory while `rg` skips `.git` (`U-02`, 220 ms vs 313 ms), and one dot-star regex scan (`P-03`, 159 ms vs 163 ms). Supercharged grep wins 55, often by 2–100×; 1 is a tie (`L-00`).
 - **Piped input is the one place GNU grep itself is not deterministic.** When data read from a pipe contains NUL bytes or encoding errors, GNU grep's output depends on how much each `read` returned. Supercharged grep is deterministic there and matches GNU grep fed by a fast writer; counts, file lists, and exit codes (`-c`, `-l`, `-L`, `-q`) always match.
 - **Linux first; macOS experimental.** Every number above comes from Linux x86-64 with AVX2. The non-Linux code paths compile warning-free, but the fork has not yet been built or tested on a Mac — if you try, please report the result. Without AVX2 (including Apple Silicon) the portable 64-bit "SIMD within a register" kernels are used, and the speedups will be smaller.
 - **You own updates.** `/usr/local/bin/grep` shadows your distribution's grep, so upstream GNU grep fixes reach you only when you rebuild this fork; `sudo make uninstall` restores the distribution binary.
