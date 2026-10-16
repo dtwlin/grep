@@ -597,6 +597,112 @@ with open("span_chunk.txt", "wb") as f:
 
   rm -f pat_nul.bin in_nul_small.bin in_nul_large.bin pipe_giant.txt pipe_noeol_giant.txt pipe_exact_1mb.txt bin_70k_nul.bin span_chunk.txt \
         exp_nul_def out_nul_def out_nul_lg exp_pipe_giant out_pipe_giant exp_pipe_vc out_pipe_vc out_pipe_noeol_g exp_pipe_1m_c out_pipe_1m_c || framework_failure_
+
+  # 11. Extreme regex/engine/stream edge cases (Bugs 1-11: PCRE \g/\k in [...],
+  #     ERE/BRE backref edge cases, lazy worker dfawarn suppression, -X gawk/awk/posixawk
+  #     escaped ']' in [...], {,} / \{,\} interval quantifiers, sparse regular stdin
+  #     at non-zero offset, -n -T stdin offset_width after small file, -C 0 encoding
+  #     error in chunked file, and UTF-8 -F -i -w -o / --color quirk normalization)
+  printf 'gv}xy\ngv>xy\ngv'\''xy\nkv}xy\nkv>xy\nkv'\''xy\n' > pcre_gk_cclass.txt || framework_failure_
+  check_threads pcre_g_brace grep -P '[\g{a]*gv}[]bcdef]*xy' pcre_gk_cclass.txt
+  check_threads pcre_g_angle grep -P '[\g<a>*gv>[]bcdef]*xy' pcre_gk_cclass.txt
+  check_threads pcre_g_quote grep -P "[\g'a'*gv'[]bcdef]*xy" pcre_gk_cclass.txt
+  check_threads pcre_k_brace grep -P '[\k{a}*kv}[]bcdef]*xy' pcre_gk_cclass.txt
+  check_threads pcre_k_angle grep -P '[\k<a>*kv>[]bcdef]*xy' pcre_gk_cclass.txt
+  check_threads pcre_k_quote grep -P "[\k'a'*kv'[]bcdef]*xy" pcre_gk_cclass.txt
+  rm -f pcre_gk_cclass.txt || framework_failure_
+
+  printf 'xy\nabcdefabcdef\n' > bref_edge.txt || framework_failure_
+  check_threads bref_unmatched_rparen grep -E '(abcdef)\1)|xy' bref_edge.txt
+  check_threads bref_lead_star grep -E '(*abcdef)\1' bref_edge.txt
+  check_threads bref_lead_plus grep -E '(+abcdef)\1' bref_edge.txt
+  check_threads bref_lead_qmark grep -E '(?abcdef)\1' bref_edge.txt
+  rm -f bref_edge.txt || framework_failure_
+
+  if test -n "$u8_loc"; then
+    python3 -c '
+with open("bref_u8.bin", "wb") as f:
+    f.write(b"\x80\x80\x80\x80\x80\x80\nabcabc\n\xc3\xa9abc\xc3\xa9abc\n")
+' || framework_failure_
+    LC_ALL=$u8_loc check_threads bref_inv_u8 grep -a -E "$(printf '(\200\200{2})\\1')" bref_u8.bin
+    LC_ALL=$u8_loc check_threads bref_esc_u8 grep -a -E "$(printf '(\\\303\251*abc)\\1')" bref_u8.bin
+    rm -f bref_u8.bin || framework_failure_
+
+    printf 'i!i\ni!\304\261\n\304\261!i\ns!s\ns!\305\277\n\305\277!s\n' > utf8_quirk_w.txt || framework_failure_
+    LC_ALL=$u8_loc check_threads u8_quirk_wo_i grep -F -i -w -o -e i -e '!i' utf8_quirk_w.txt
+    LC_ALL=$u8_loc check_threads u8_quirk_wo_s grep -F -i -w -o -e s -e '!s' utf8_quirk_w.txt
+    LC_ALL=$u8_loc check_threads u8_quirk_col_i grep -F -i -w --color=always -e i -e '!i' utf8_quirk_w.txt
+    rm -f utf8_quirk_w.txt || framework_failure_
+  fi
+
+  printf 'x\nabcdef\n\nabd\nabccd\n' > gawk_brace.txt || framework_failure_
+  check_threads gawk_esc_rbrack1 grep -X gawk '[\]bcdef]*x|yz' gawk_brace.txt
+  check_threads gawk_esc_rbrack2 grep -X gawk 'abcdef[\]xyz]*' gawk_brace.txt
+  check_threads gawk_esc_rbrack3 grep -X gawk '([\]abcdef]*)\1' gawk_brace.txt
+  check_threads awk_esc_rbrack grep -X awk '[\]bcdef]*x|yz' gawk_brace.txt
+  check_threads posixawk_esc_rbrack grep -X posixawk '[\]bcdef]*x|yz' gawk_brace.txt
+  check_threads ere_empty_comma_brace grep -E 'abc{,}d|ef' gawk_brace.txt
+  check_threads bre_empty_comma_brace grep 'abc\{,\}d\|ef' gawk_brace.txt
+  rm -f gawk_brace.txt || framework_failure_
+
+  python3 -c '
+import os, subprocess
+
+# 11a. Lazy worker DFA compilation warning deduplication on > 2 MiB file
+with open("dfawarn_big.txt", "wb") as f:
+    f.write((b"a" * 100 + b"\n") * 30000)
+
+# 11b. Sparse regular file on stdin at non-zero initial offset
+with open("sparse_stdin.bin", "wb") as f:
+    f.write(b"0123456789match_sparse_here\n" + (b"x" * 79 + b"\n") * 30000)
+    f.seek(4 * 1024 * 1024)
+    f.write(b"tail\n")
+
+# 11c. Small slow file for -n -T stdin offset_width test
+with open("small_slow_align.txt", "wb") as f:
+    f.write(b"aaaaaaaaaaaaaaaaaaaaaaaa\n")
+
+# 11d. > 2 MiB file with encoding error and -C 0
+with open("chunk_c0_enc.bin", "wb") as f:
+    f.write((b"filler line 0123456789abcdef\n") * 40000)
+    f.write(b"ENC_C0_HIT \x80 invalid utf8\n")
+    f.write((b"filler line 0123456789abcdef\n") * 40000)
+' || framework_failure_
+
+  check_threads dfawarn_dedup grep -E '\q.' dfawarn_big.txt
+
+  python3 -c '
+import os, subprocess
+for th, out_f, err_f in [("1", "exp_sparse_out", "exp_sparse_err"), ("4", "out_sparse_out", "out_sparse_err")]:
+    fd = os.open("sparse_stdin.bin", os.O_RDONLY)
+    os.lseek(fd, 10, os.SEEK_SET)
+    env = os.environ.copy()
+    env["GREP_THREADS"] = th
+    p = subprocess.run(["grep", "match_sparse_here"], stdin=fd, capture_output=True, env=env)
+    os.close(fd)
+    with open(out_f, "wb") as f:
+        f.write(p.stdout)
+    with open(err_f, "wb") as f:
+        f.write(p.stderr)
+' || framework_failure_
+  compare exp_sparse_out out_sparse_out || fail=1
+  compare exp_sparse_err out_sparse_err || fail=1
+
+  printf 'bb\n' | GREP_THREADS=1 grep -E -n -T '(a|a)((a+)+b)\2|(b)\4' small_slow_align.txt - > exp_nt_stdin || fail=1
+  printf 'bb\n' | GREP_THREADS=4 grep -E -n -T '(a|a)((a+)+b)\2|(b)\4' small_slow_align.txt - > out_nt_stdin || fail=1
+  compare exp_nt_stdin out_nt_stdin || fail=1
+
+  if test -n "$u8_loc"; then
+    LC_ALL=$u8_loc GREP_THREADS=1 grep -C 0 ENC_C0_HIT chunk_c0_enc.bin > exp_c0_enc_out 2> exp_c0_enc_err || fail=1
+    LC_ALL=$u8_loc GREP_THREADS=4 grep -C 0 ENC_C0_HIT chunk_c0_enc.bin > out_c0_enc_out 2> out_c0_enc_err || fail=1
+    compare exp_c0_enc_out out_c0_enc_out || fail=1
+    compare exp_c0_enc_err out_c0_enc_err || fail=1
+  fi
+
+  rm -f dfawarn_big.txt sparse_stdin.bin small_slow_align.txt chunk_c0_enc.bin \
+        exp_dfawarn_out out_dfawarn_out exp_dfawarn_err out_dfawarn_err \
+        exp_sparse_out out_sparse_out exp_sparse_err out_sparse_err \
+        exp_nt_stdin out_nt_stdin exp_c0_enc_out out_c0_enc_out exp_c0_enc_err out_c0_enc_err || framework_failure_
 fi
 
 Exit $fail

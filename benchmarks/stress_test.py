@@ -231,14 +231,16 @@ def select_pattern_and_options(targets, workload_type, cycle):
         opts.extend(["-f", pat_file])
         return opts, None
 
-    pat_engine = random.choice(["F", "E", "P", "G", "literal_single", "multi_kw"])
+    pat_engine = random.choice(["F", "E", "P", "G", "gawk", "literal_single", "multi_kw"])
     options = []
     pattern = base_target
 
     if pat_engine == "F":
         options.append("-F")
-        if random.random() < 0.2:
+        if random.random() < 0.25:
             options.append("-i")
+            if random.random() < 0.3:
+                pattern = f"i\n!i\n{base_target}"
     elif pat_engine == "multi_kw":
         # Multi-keyword with 2 to 40 keywords
         options.append("-F")
@@ -256,8 +258,12 @@ def select_pattern_and_options(targets, workload_type, cycle):
             f"{base_target}$",
             f"foo.{{a|foo}}xyz|{base_target}",
             f"[a-c]*.{{,2}}{base_target}",
+            f"[a-c]*.{{,}}{base_target}",
             f"foo.*€*b|{base_target}",
             f"abé?cd|{base_target}",
+            rf"(abcdef)\1)|{base_target}",
+            rf"(*{base_target})\1|{base_target}",
+            rf"(\é*abc)\1|{base_target}",
         ]
         pattern = random.choice(pat_variants)
     elif pat_engine == "P":
@@ -268,6 +274,8 @@ def select_pattern_and_options(targets, workload_type, cycle):
             f"foo{{def|{base_target}}}x",
             f"{prefix}{'{,2}'}[A-Za-z0-9_]+",
             f"ab[[:]|{base_target}:]gh[i]",
+            rf"[\g{{a]*gv}}[]bcdef]*{base_target}",
+            rf"[\k<a>*kv>[]bcdef]*{base_target}",
         ]
         pattern = random.choice(pat_variants)
     elif pat_engine == "G":
@@ -275,6 +283,15 @@ def select_pattern_and_options(targets, workload_type, cycle):
             base_target,
             rf"abé\?cd\|{base_target}",
             rf"{base_target}.\{'{,2}'}line",
+            rf"{base_target}.\{'{,}'}line",
+        ]
+        pattern = random.choice(pat_variants)
+    elif pat_engine == "gawk":
+        options.extend(["-X", random.choice(["gawk", "awk", "posixawk"])])
+        pat_variants = [
+            rf"[\]bcdef]*{base_target}|NEVER_HIT",
+            rf"{base_target}[\]xyz]*",
+            rf"([\]abcdef]*)\1|{base_target}",
         ]
         pattern = random.choice(pat_variants)
     else:

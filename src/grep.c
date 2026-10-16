@@ -3870,6 +3870,10 @@ stream_commit_binary (struct rob_slot *slot)
   bool saved_out_quiet = out_quiet;
   bool saved_done_on_match = done_on_match;
   bool saved_encoding_error_output = encoding_error_output;
+  int saved_offset_width = offset_width;
+  bool saved_file_used = file_used;
+  bool saved_task_had_prtext = task_had_prtext;
+  bool saved_task_sep = task_sep;
 
   buffering_enabled = false;
   filename = label;
@@ -3884,6 +3888,14 @@ stream_commit_binary (struct rob_slot *slot)
   out_quiet = initial_out_quiet;
   done_on_match = initial_done_on_match;
   encoding_error_output = false;
+  offset_width = 0;
+  if (align_tabs)
+    {
+      intmax_t num = INTMAX_MAX;
+      do
+        offset_width++;
+      while ((num /= 10) != 0);
+    }
 
   intmax_t n = beg < from ? grepbuf (beg, from) : 0;
   slot->enc_error = (binary_files == BINARY_BINARY_FILES && !out_quiet
@@ -3913,6 +3925,10 @@ stream_commit_binary (struct rob_slot *slot)
   out_quiet = saved_out_quiet;
   done_on_match = saved_done_on_match;
   encoding_error_output = saved_encoding_error_output;
+  offset_width = saved_offset_width;
+  file_used = saved_file_used;
+  task_had_prtext = saved_task_had_prtext;
+  task_sep = saved_task_sep;
 
   free_slice_buf_locked (slot->stream_chunk_alloc);
   slot->stream_chunk_alloc = nullptr;
@@ -3970,6 +3986,10 @@ rob_try_commit_locked (void)
               bool saved_out_quiet = out_quiet;
               bool saved_done_on_match = done_on_match;
               bool saved_encoding_error_output = encoding_error_output;
+              int saved_offset_width = offset_width;
+              bool saved_file_used = file_used;
+              bool saved_task_had_prtext = task_had_prtext;
+              bool saved_task_sep = task_sep;
 
               buffering_enabled = false;
               filename = label;
@@ -3984,6 +4004,14 @@ rob_try_commit_locked (void)
               out_quiet = initial_out_quiet;
               done_on_match = initial_done_on_match;
               encoding_error_output = false;
+              offset_width = 0;
+              if (align_tabs)
+                {
+                  intmax_t num = INTMAX_MAX;
+                  do
+                    offset_width++;
+                  while ((num /= 10) != 0);
+                }
 
               char *first_lbeg = slot->stream_first_lbeg;
               char *slice_lim = buflim;
@@ -4011,6 +4039,10 @@ rob_try_commit_locked (void)
               out_quiet = saved_out_quiet;
               done_on_match = saved_done_on_match;
               encoding_error_output = saved_encoding_error_output;
+              offset_width = saved_offset_width;
+              file_used = saved_file_used;
+              task_had_prtext = saved_task_had_prtext;
+              task_sep = saved_task_sep;
 
               free_slice_buf_locked (slot->stream_chunk_alloc);
               slot->stream_chunk_alloc = nullptr;
@@ -5310,7 +5342,7 @@ format_context_matches_to_rob (char const *fname, struct chunk_file_state *state
     prpending (buflim);
 
   bool status = false;
-  if ((0 < out_before || 0 < out_after) && encoding_error_output)
+  if ((0 <= out_before || 0 <= out_after) && encoding_error_output)
     {
       /* After omitting a line with an encoding error, single-threaded
          grep prints context lines that depend on where its read buffers
@@ -7901,9 +7933,9 @@ producer_run (char *const *files)
       if (STREQ (*f, "-"))
         {
           struct stat st;
+          bool stdin_is_reg = fstat (STDIN_FILENO, &st) == 0 && S_ISREG (st.st_mode);
           if (pool_target > 1 && !isatty (STDIN_FILENO)
-              && fstat (STDIN_FILENO, &st) == 0
-              && S_ISREG (st.st_mode)
+              && stdin_is_reg
               && st.st_size >= 2 * 1024 * 1024
               && !SAME_INODE (st, out_stat)
               && lseek (STDIN_FILENO, 0, SEEK_CUR) == 0
@@ -7924,6 +7956,7 @@ producer_run (char *const *files)
               pthread_mutex_unlock (&pool_mutex);
             }
           else if (pool_target > 1 && !isatty (STDIN_FILENO)
+                   && !stdin_is_reg
                    && out_before < 0 && out_after < 0 && max_count == INTMAX_MAX
                    && binary_files != WITHOUT_MATCH_BINARY_FILES)
             stream_slicer_stdin ();
@@ -8710,9 +8743,7 @@ main (int argc, char **argv)
                                  && lseek (STDIN_FILENO, 0, SEEK_CUR) == 0
                                  && (!out_invert
                                      || (out_before < 0 && out_after < 0)));
-      bool can_slice_stdin = ((!stdin_is_reg
-                               || (in_st.st_size >= 2 * 1024 * 1024
-                                   && !SAME_INODE (in_st, out_stat)))
+      bool can_slice_stdin = (!stdin_is_reg
                               && out_before < 0 && out_after < 0
                               && max_count == INTMAX_MAX
                               && binary_files != WITHOUT_MATCH_BINARY_FILES);

@@ -643,6 +643,67 @@ def run_edge_case_conformance():
     checks.append(("Large chunk-spanning 1.5MB line -n", ["-n", "-b", "SPAN_CHUNK_HIT", span_chunk_file], None, None))
     checks.append(("Large chunk-spanning 1.5MB line -C 1", ["-C", "1", "-n", "SPAN_CHUNK_HIT", span_chunk_file], None, None))
 
+    # 32. Round 5 extreme regex/engine/stream regressions (Bugs 1-11)
+    pcre_gk_file = os.path.join(BENCH_DIR, "regress_pcre_gk.txt")
+    with open(pcre_gk_file, "wb") as f:
+        f.write(b"gv}xy\ngv>xy\ngv'xy\nkv}xy\nkv>xy\nkv'xy\n")
+
+    bref_edge_file = os.path.join(BENCH_DIR, "regress_bref_edge.bin")
+    with open(bref_edge_file, "wb") as f:
+        f.write(b"xy\nabcdefabcdef\n\x80\x80\x80\x80\x80\x80\nabcabc\n\xc3\xa9abc\xc3\xa9abc\n")
+
+    gawk_brace_file = os.path.join(BENCH_DIR, "regress_gawk_brace.txt")
+    with open(gawk_brace_file, "wb") as f:
+        f.write(b"x\nabcdef\n\nabd\nabccd\n")
+
+    utf8_quirk_w_file = os.path.join(BENCH_DIR, "regress_utf8_quirk_w.txt")
+    with open(utf8_quirk_w_file, "wb") as f:
+        f.write(b"i!i\ni!\xc4\xb1\n\xc4\xb1!i\ns!s\ns!\xc5\xbf\n\xc5\xbf!s\n")
+
+    dfawarn_big_file = os.path.join(BENCH_DIR, "regress_dfawarn_big.txt")
+    with open(dfawarn_big_file, "wb") as f:
+        f.write((b"a" * 100 + b"\n") * 30000)
+
+    chunk_c0_enc_file = os.path.join(BENCH_DIR, "regress_chunk_c0_enc.bin")
+    with open(chunk_c0_enc_file, "wb") as f:
+        f.write((b"filler line 0123456789abcdef\n") * 40000)
+        f.write(b"ENC_C0_HIT \x80 invalid utf8\n")
+        f.write((b"filler line 0123456789abcdef\n") * 40000)
+
+    small_slow_file = os.path.join(BENCH_DIR, "regress_small_slow.txt")
+    with open(small_slow_file, "wb") as f:
+        f.write(b"aaaaaaaaaaaaaaaaaaaaaaaa\n")
+
+    stdin_bb_file = os.path.join(BENCH_DIR, "regress_stdin_bb.txt")
+    with open(stdin_bb_file, "wb") as f:
+        f.write(b"bb\n")
+
+    checks.append(("PCRE \\g{ in char class", ["-P", r"[\g{a]*gv}[]bcdef]*xy", pcre_gk_file], None, None))
+    checks.append(("PCRE \\g< in char class", ["-P", r"[\g<a>*gv>[]bcdef]*xy", pcre_gk_file], None, None))
+    checks.append(("PCRE \\g' in char class", ["-P", r"[\g'a'*gv'[]bcdef]*xy", pcre_gk_file], None, None))
+    checks.append(("PCRE \\k{ in char class", ["-P", r"[\k{a}*kv}[]bcdef]*xy", pcre_gk_file], None, None))
+    checks.append(("PCRE \\k< in char class", ["-P", r"[\k<a>*kv>[]bcdef]*xy", pcre_gk_file], None, None))
+    checks.append(("PCRE \\k' in char class", ["-P", r"[\k'a'*kv'[]bcdef]*xy", pcre_gk_file], None, None))
+    checks.append(("Backref unmatched ) before |", ["-a", "-E", r"(abcdef)\1)|xy", bref_edge_file], None, None))
+    checks.append(("Backref leading * in group 1", ["-a", "-E", r"(*abcdef)\1", bref_edge_file], None, None))
+    checks.append(("Backref leading + in group 1", ["-a", "-E", r"(+abcdef)\1", bref_edge_file], None, None))
+    checks.append(("Backref leading ? in group 1", ["-a", "-E", r"(?abcdef)\1", bref_edge_file], None, None))
+    checks.append(("Backref invalid UTF-8 quant", ["-a", "-E", "(\x80\x80{2})\\1", bref_edge_file], {"LC_ALL": "en_US.UTF-8"}, None))
+    checks.append(("Backref escaped UTF-8 quant", ["-a", "-E", "(\\\xc3\xa9*abc)\\1", bref_edge_file], {"LC_ALL": "en_US.UTF-8"}, None))
+    checks.append(("Lazy worker dfawarn dedup", ["-E", r"\q.", dfawarn_big_file], None, None))
+    checks.append(("Gawk [\\]bcdef]*x|yz", ["-X", "gawk", r"[\]bcdef]*x|yz", gawk_brace_file], None, None))
+    checks.append(("Gawk abcdef[\\]xyz]*", ["-X", "gawk", r"abcdef[\]xyz]*", gawk_brace_file], None, None))
+    checks.append(("Gawk ([\\]abcdef]*)\\1", ["-X", "gawk", r"([\]abcdef]*)\1", gawk_brace_file], None, None))
+    checks.append(("Awk [\\]bcdef]*x|yz", ["-X", "awk", r"[\]bcdef]*x|yz", gawk_brace_file], None, None))
+    checks.append(("Posixawk [\\]bcdef]*x|yz", ["-X", "posixawk", r"[\]bcdef]*x|yz", gawk_brace_file], None, None))
+    checks.append(("ERE {,} interval quantifier", ["-E", "abc{,}d|ef", gawk_brace_file], None, None))
+    checks.append(("BRE \\{,\\} interval quantifier", [r"abc\{,\}d\|ef", gawk_brace_file], None, None))
+    checks.append(("Stdin -n -T after small file", ["-E", "-n", "-T", r"(a|a)((a+)+b)\2|(b)\4", small_slow_file, "-"], None, f"pipe:{stdin_bb_file}"))
+    checks.append(("Chunked -C 0 encoding error", ["-C", "0", "ENC_C0_HIT", chunk_c0_enc_file], {"LC_ALL": "en_US.UTF-8"}, None))
+    checks.append(("UTF-8 -F -i -w -o i/!i quirk", ["-F", "-i", "-w", "-o", "-e", "i", "-e", "!i", utf8_quirk_w_file], {"LC_ALL": "en_US.UTF-8"}, None))
+    checks.append(("UTF-8 -F -i -w -o s/!s quirk", ["-F", "-i", "-w", "-o", "-e", "s", "-e", "!s", utf8_quirk_w_file], {"LC_ALL": "en_US.UTF-8"}, None))
+    checks.append(("UTF-8 -F -i -w --color i/!i", ["-F", "-i", "-w", "--color=always", "-e", "i", "-e", "!i", utf8_quirk_w_file], {"LC_ALL": "en_US.UTF-8"}, None))
+
     passed = 0
     total = len(checks)
     for name, args, env_vars, preexec in checks:
