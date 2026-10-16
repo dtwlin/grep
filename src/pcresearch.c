@@ -360,6 +360,116 @@ skip_pcre_char_class (char const *pat, idx_t p, idx_t size)
   return p;
 }
 
+/* Inspect the parenthesized group starting at PAT[P] == '('.  Store the
+   next scan index in *NEXT_P_OUT (either skipping the entire group if it is
+   negative, optional, or contains top-level alternation, or stepping just past
+   its opening header if its body is unconditionally required).  Return false
+   if the group header is unsupported for literal extraction.  */
+static bool
+scan_pcre_group (char const *pat, idx_t p, idx_t size, idx_t *next_p_out)
+{
+  idx_t header_len = 0;
+  bool is_neg = false;
+  if (!pcre_group_header (pat, p, size, &header_len, &is_neg))
+    return false;
+
+  int depth = 1;
+  bool has_alt = false;
+  idx_t q = p + header_len;
+  while (q < size && depth > 0)
+    {
+      if (pat[q] == '\\')
+        q = skip_pcre_escape (pat, q, size, false);
+      else if (pat[q] == '[')
+        q = skip_pcre_char_class (pat, q, size);
+      else if (pat[q] == '(')
+        {
+          idx_t inner_hdr = 0;
+          bool inner_neg = false;
+          if (!pcre_group_header (pat, q, size, &inner_hdr, &inner_neg))
+            return false;
+          depth++;
+          q += inner_hdr;
+        }
+      else if (pat[q] == ')')
+        {
+          depth--;
+          if (depth == 0)
+            break;
+          q++;
+        }
+      else if (pat[q] == '|' && depth == 1)
+        {
+          has_alt = true;
+          q++;
+        }
+      else
+        q++;
+    }
+
+  idx_t after_p = skip_pcre_quantifiers (pat, q + 1, size);
+  bool is_optional = (q + 1 < size
+                      && (pat[q + 1] == '*' || pat[q + 1] == '?'
+                          || is_pcre_brace_quantifier (pat, q + 1, size)));
+  *next_p_out = (is_neg || is_optional || has_alt) ? after_p : p + header_len;
+  return true;
+}
+
+/* Consume a contiguous run of unconditionally required literal characters
+   starting at PAT[P] into CUR_BUF, storing the run length in *RUN_LEN_OUT
+   and returning the updated pattern index.  */
+static idx_t
+consume_pcre_literal_run (char const *pat, idx_t p, idx_t size,
+                          char *cur_buf, idx_t *run_len_out)
+{
+  idx_t cur_len = 0;
+  while (p < size)
+    {
+      char c;
+      idx_t next_p;
+      if (pat[p] == '\\' && p + 1 < size && is_escaped_lit_char (pat[p + 1]))
+        {
+          c = pat[p + 1];
+          next_p = p + 2;
+        }
+      else if (is_lit_char (pat[p]))
+        {
+          c = pat[p];
+          next_p = p + 1;
+        }
+      else
+        break;
+
+      if (next_p < size
+          && (pat[next_p] == '*' || pat[next_p] == '?'
+              || is_pcre_brace_quantifier (pat, next_p, size)))
+        break;
+
+      cur_buf[cur_len++] = c;
+      p = next_p;
+
+      if (p < size && pat[p] == '+')
+        {
+          p = skip_pcre_quantifiers (pat, p, size);
+          break;
+        }
+    }
+
+  if (p < size
+      && ((pat[p] == '\\' && p + 1 < size && is_escaped_lit_char (pat[p + 1]))
+          || is_lit_char (pat[p])))
+    {
+      idx_t next_p = (pat[p] == '\\') ? p + 2 : p + 1;
+      if (next_p < size
+          && (pat[next_p] == '*' || pat[next_p] == '?'
+              || is_pcre_brace_quantifier (pat, next_p, size)))
+        p = skip_pcre_quantifiers (pat, next_p, size);
+    }
+
+  *run_len_out = cur_len;
+  return p;
+}
+
 /* Extract the longest contiguous literal ASCII substring (>= 2 chars)
    that is unconditionally required by the PCRE pattern. */
 static char *
@@ -369,7 +479,8 @@ find_must_literal (char const *pat, idx_t size, idx_t *out_len)
     return nullptr;
 
   for (idx_t i = 0; i + 1 < size; ++i)
-    if (pat[i] == '\\' && (pat[i + 1] == 'Q' || pat[i + 1] == 'E' || pat[i + 1] == 'c'))
+    if (pat[i] == '\\'
+        && (pat[i + 1] == 'Q' || pat[i + 1] == 'E' || pat[i + 1] == 'c'))
       return nullptr;
 
   char *best_buf = ximalloc (size + 1);
@@ -388,60 +499,12 @@ find_must_literal (char const *pat, idx_t size, idx_t *out_len)
 
       if (pat[p] == '(')
         {
-          idx_t header_len = 0;
-          bool is_neg = false;
-          if (!pcre_group_header (pat, p, size, &header_len, &is_neg))
+          if (!scan_pcre_group (pat, p, size, &p))
             {
               free (best_buf);
               free (cur_buf);
               return nullptr;
             }
-          int depth = 1;
-          bool has_alt = false;
-          idx_t q = p + header_len;
-          while (q < size && depth > 0)
-            {
-              if (pat[q] == '\\')
-                q = skip_pcre_escape (pat, q, size, false);
-              else if (pat[q] == '[')
-                q = skip_pcre_char_class (pat, q, size);
-              else if (pat[q] == '(')
-                {
-                  idx_t inner_hdr = 0;
-                  bool inner_neg = false;
-                  if (!pcre_group_header (pat, q, size, &inner_hdr, &inner_neg))
-                    {
-                      free (best_buf);
-                      free (cur_buf);
-                      return nullptr;
-                    }
-                  depth++;
-                  q += inner_hdr;
-                }
-              else if (pat[q] == ')')
-                {
-                  depth--;
-                  if (depth == 0)
-                    break;
-                  q++;
-                }
-              else if (pat[q] == '|' && depth == 1)
-                {
-                  has_alt = true;
-                  q++;
-                }
-              else
-                q++;
-            }
-          idx_t after_p = q + 1;
-          bool is_optional = (after_p < size
-                              && (pat[after_p] == '*' || pat[after_p] == '?'
-                                  || is_pcre_brace_quantifier (pat, after_p, size)));
-          after_p = skip_pcre_quantifiers (pat, after_p, size);
-          if (is_neg || is_optional || has_alt)
-            p = after_p;
-          else
-            p += header_len;
           continue;
         }
 
@@ -476,53 +539,11 @@ find_must_literal (char const *pat, idx_t size, idx_t *out_len)
         }
 
       idx_t cur_len = 0;
-      while (p < size)
-        {
-          char c;
-          idx_t next_p;
-          if (pat[p] == '\\' && p + 1 < size && is_escaped_lit_char (pat[p + 1]))
-            {
-              c = pat[p + 1];
-              next_p = p + 2;
-            }
-          else if (is_lit_char (pat[p]))
-            {
-              c = pat[p];
-              next_p = p + 1;
-            }
-          else
-            break;
-
-          if (next_p < size
-              && (pat[next_p] == '*' || pat[next_p] == '?'
-                  || is_pcre_brace_quantifier (pat, next_p, size)))
-            break;
-
-          cur_buf[cur_len++] = c;
-          p = next_p;
-
-          if (p < size && pat[p] == '+')
-            {
-              p = skip_pcre_quantifiers (pat, p, size);
-              break;
-            }
-        }
-
+      p = consume_pcre_literal_run (pat, p, size, cur_buf, &cur_len);
       if (cur_len >= 2 && cur_len > best_len)
         {
           best_len = cur_len;
           memcpy (best_buf, cur_buf, cur_len);
-        }
-
-      if (p < size
-          && ((pat[p] == '\\' && p + 1 < size && is_escaped_lit_char (pat[p + 1]))
-              || is_lit_char (pat[p])))
-        {
-          idx_t next_p = (pat[p] == '\\') ? p + 2 : p + 1;
-          if (next_p < size
-              && (pat[next_p] == '*' || pat[next_p] == '?'
-                  || is_pcre_brace_quantifier (pat, next_p, size)))
-            p = skip_pcre_quantifiers (pat, next_p, size);
         }
     }
 
@@ -722,6 +743,121 @@ Pclone (void const *vcp)
   return pc;
 }
 
+/* Match a single line [*P_INOUT, LINE_END) using PCRE2 JIT/interpreter,
+   advancing *P_INOUT and *SUBJECT_INOUT past any invalid single-byte or
+   UTF-8 sequences.  Return the PCRE2 match status (> 0 on match).  */
+static inline _GL_ATTRIBUTE_ALWAYS_INLINE int
+pcre_match_line (struct pcre_comp *pc, PCRE2_SIZE *sub, char const *line_end,
+                 char const **p_inout, char const **subject_inout,
+                 bool *bol_inout)
+{
+  char const *p = *p_inout;
+  char const *subject = *subject_inout;
+  bool bol = *bol_inout;
+  int e = PCRE2_ERROR_NOMATCH;
+
+  for (;;)
+    {
+      /* Skip past bytes that are easily determined to be encoding
+         errors, treating them as data that cannot match.  This is
+         faster than having PCRE check them.  */
+      while (localeinfo.sbclen[to_uchar (*p)] == -1)
+        {
+          p++;
+          subject = p;
+          bol = false;
+        }
+
+      idx_t search_offset = p - subject;
+
+      /* Check for an empty match; this is faster than letting
+         PCRE do it.  */
+      if (p == line_end)
+        {
+          sub[0] = sub[1] = search_offset;
+          e = pc->empty_match[bol];
+          break;
+        }
+
+      int options = bol ? 0 : PCRE2_NOTBOL;
+      e = jit_exec (pc, subject, line_end - subject, search_offset, options);
+#if MATCH_INVALID_UTF == 0
+      if (!bad_utf8_from_pcre2 (e))
+        break;
+
+      idx_t valid_bytes = pcre2_get_startchar (pc->data);
+
+      if (search_offset <= valid_bytes)
+        {
+          if (valid_bytes == 0)
+            {
+              sub[0] = valid_bytes;
+              sub[1] = 0;
+              e = pc->empty_match[bol];
+            }
+          else
+            e = jit_exec (pc, subject, valid_bytes, search_offset,
+                          options | PCRE2_NO_UTF_CHECK | PCRE2_NOTEOL);
+
+          if (e != PCRE2_ERROR_NOMATCH)
+            break;
+
+          p = subject + valid_bytes + 1;
+          bol = false;
+        }
+
+      subject += valid_bytes + 1;
+#else
+      break;
+#endif
+    }
+
+  *p_inout = p;
+  *subject_inout = subject;
+  *bol_inout = bol;
+  return e;
+}
+
+static void
+handle_pcre_error (int e)
+{
+  switch (e)
+    {
+    case PCRE2_ERROR_NOMATCH:
+      return;
+
+    case PCRE2_ERROR_NOMEMORY:
+      die (EXIT_TROUBLE, 0, _("%s: memory exhausted"), input_filename ());
+
+    case PCRE2_ERROR_JIT_STACKLIMIT:
+      die (EXIT_TROUBLE, 0, _("%s: exhausted PCRE JIT stack"),
+           input_filename ());
+
+    case PCRE2_ERROR_MATCHLIMIT:
+      die (EXIT_TROUBLE, 0, _("%s: exceeded PCRE's backtracking limit"),
+           input_filename ());
+
+    case PCRE2_ERROR_DEPTHLIMIT:
+      die (EXIT_TROUBLE, 0,
+           _("%s: exceeded PCRE's nested backtracking limit"),
+           input_filename ());
+
+    case PCRE2_ERROR_RECURSELOOP:
+      die (EXIT_TROUBLE, 0, _("%s: PCRE detected recurse loop"),
+           input_filename ());
+
+#ifdef PCRE2_ERROR_HEAPLIMIT
+    case PCRE2_ERROR_HEAPLIMIT:
+      die (EXIT_TROUBLE, 0, _("%s: exceeded PCRE's heap limit"),
+           input_filename ());
+#endif
+
+    default:
+      die (EXIT_TROUBLE, 0, _("%s: internal PCRE error: %d"),
+           input_filename (), e);
+    }
+}
+
 ptrdiff_t
 Pexecute (void *vcp, char const *buf, idx_t size, idx_t *match_size,
           char const *start_ptr)
@@ -733,20 +869,15 @@ Pexecute (void *vcp, char const *buf, idx_t size, idx_t *match_size,
   char const *line_end;
   struct pcre_comp *pc = vcp;
   PCRE2_SIZE *sub = pcre2_get_ovector_pointer (pc->data);
-
-  /* The search address to pass to PCRE.  This is the start of
-     the buffer, or just past the most-recently discovered encoding
-     error or line end.  */
   char const *subject = buf;
 
   do
     {
-      /* Fast pre-filter: if pc->must_kwset is active and we are at line start,
-         use AVX2 kwsexec to skip lines that cannot match! */
       if (pc->must_kwset && !start_ptr && p == line_start)
         {
           struct kwsmatch kwsm;
-          ptrdiff_t off = kwsexec (pc->must_kwset, p, (buf + size) - p, &kwsm, true);
+          ptrdiff_t off = kwsexec (pc->must_kwset, p, (buf + size) - p,
+                                   &kwsm, true);
           if (off < 0)
             break;
 
@@ -757,79 +888,11 @@ Pexecute (void *vcp, char const *buf, idx_t size, idx_t *match_size,
           bol = true;
         }
 
-      /* Search line by line.  Although this formerly used something like
-         PCRE2_MULTILINE for performance, the performance wasn't always
-         better and the correctness issues were too puzzling.  See
-         Bug#22655.  */
       line_end = rawmemchr (p, eolbyte);
       if (PCRE2_SIZE_MAX < line_end - p)
         die (EXIT_TROUBLE, 0, _("exceeded PCRE's line length limit"));
 
-      for (;;)
-        {
-          /* Skip past bytes that are easily determined to be encoding
-             errors, treating them as data that cannot match.  This is
-             faster than having PCRE check them.  */
-          while (localeinfo.sbclen[to_uchar (*p)] == -1)
-            {
-              p++;
-              subject = p;
-              bol = false;
-            }
-
-          idx_t search_offset = p - subject;
-
-          /* Check for an empty match; this is faster than letting
-             PCRE do it.  */
-          if (p == line_end)
-            {
-              sub[0] = sub[1] = search_offset;
-              e = pc->empty_match[bol];
-              break;
-            }
-
-          int options = 0;
-          if (!bol)
-            options |= PCRE2_NOTBOL;
-
-          e = jit_exec (pc, subject, line_end - subject,
-                        search_offset, options);
-#if MATCH_INVALID_UTF == 0
-          if (!bad_utf8_from_pcre2 (e))
-            break;
-
-          idx_t valid_bytes = pcre2_get_startchar (pc->data);
-
-          if (search_offset <= valid_bytes)
-            {
-              /* Try to match the string before the encoding error.  */
-              if (valid_bytes == 0)
-                {
-                  /* Handle the empty-match case specially, for speed.
-                     This optimization is valid if VALID_BYTES is zero,
-                     which means SEARCH_OFFSET is also zero.  */
-                  sub[0] = valid_bytes;
-                  sub[1] = 0;
-                  e = pc->empty_match[bol];
-                }
-              else
-                e = jit_exec (pc, subject, valid_bytes, search_offset,
-                              options | PCRE2_NO_UTF_CHECK | PCRE2_NOTEOL);
-
-              if (e != PCRE2_ERROR_NOMATCH)
-                break;
-
-              /* Treat the encoding error as data that cannot match.  */
-              p = subject + valid_bytes + 1;
-              bol = false;
-            }
-
-          subject += valid_bytes + 1;
-#else
-          break;
-#endif
-        }
-
+      e = pcre_match_line (pc, sub, line_end, &p, &subject, &bol);
       if (e != PCRE2_ERROR_NOMATCH)
         break;
       bol = true;
@@ -839,67 +902,14 @@ Pexecute (void *vcp, char const *buf, idx_t size, idx_t *match_size,
 
   if (e <= 0)
     {
-      switch (e)
-        {
-        case PCRE2_ERROR_NOMATCH:
-          break;
-
-        case PCRE2_ERROR_NOMEMORY:
-          die (EXIT_TROUBLE, 0, _("%s: memory exhausted"), input_filename ());
-
-        case PCRE2_ERROR_JIT_STACKLIMIT:
-          die (EXIT_TROUBLE, 0, _("%s: exhausted PCRE JIT stack"),
-               input_filename ());
-
-        case PCRE2_ERROR_MATCHLIMIT:
-          die (EXIT_TROUBLE, 0, _("%s: exceeded PCRE's backtracking limit"),
-               input_filename ());
-
-        case PCRE2_ERROR_DEPTHLIMIT:
-          die (EXIT_TROUBLE, 0,
-               _("%s: exceeded PCRE's nested backtracking limit"),
-               input_filename ());
-
-        case PCRE2_ERROR_RECURSELOOP:
-          die (EXIT_TROUBLE, 0, _("%s: PCRE detected recurse loop"),
-               input_filename ());
-
-#ifdef PCRE2_ERROR_HEAPLIMIT
-        case PCRE2_ERROR_HEAPLIMIT:
-          die (EXIT_TROUBLE, 0, _("%s: exceeded PCRE's heap limit"),
-               input_filename ());
-#endif
-
-        default:
-          /* For now, we lump all remaining PCRE failures into this basket.
-             If anyone cares to provide sample grep usage that can trigger
-             particular PCRE errors, we can add to the list (above) of more
-             detailed diagnostics.  */
-          die (EXIT_TROUBLE, 0, _("%s: internal PCRE error: %d"),
-               input_filename (), e);
-        }
-
+      handle_pcre_error (e);
       return -1;
     }
-  else
-    {
-      char const *matchbeg = subject + sub[0];
-      char const *matchend = subject + sub[1];
-      char const *beg;
-      char const *end;
-      if (start_ptr)
-        {
-          beg = matchbeg;
-          end = matchend;
-        }
-      else
-        {
-          beg = line_start;
-          end = line_end + 1;
-        }
-      *match_size = end - beg;
-      return beg - buf;
-    }
+
+  char const *beg = start_ptr ? subject + sub[0] : line_start;
+  char const *end = start_ptr ? subject + sub[1] : line_end + 1;
+  *match_size = end - beg;
+  return beg - buf;
 }
 
 void

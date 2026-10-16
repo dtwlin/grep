@@ -76,7 +76,28 @@ struct kwsearch
      or null if it has not been compiled.  */
   void *re;
   unsigned char utf8_quirk_mask;
+
+  /* Reusable buffers for UTF-8 case-folding quirk normalization.  */
+  char *quirk_norm;
+  idx_t *quirk_orig;
+  idx_t quirk_cap;
 };
+
+static unsigned char _GL_ATTRIBUTE_PURE
+compute_utf8_quirk_mask (char const *pattern, idx_t size)
+{
+  if (!match_icase || !localeinfo.using_utf8)
+    return 0;
+  unsigned char qmask = 0;
+  for (idx_t i = 0; i < size; i++)
+    {
+      if (pattern[i] == 'i' || pattern[i] == 'I')
+        qmask |= 1;
+      else if (pattern[i] == 's' || pattern[i] == 'S')
+        qmask |= 2;
+    }
+  return qmask;
+}
 
 /* Return a shared kwset for the -F style PATTERN, containing SIZE bytes
    that are followed by '\n', compiled with the current options and
@@ -145,18 +166,7 @@ shared_kwset_get (char const *pattern, idx_t size, bool exact)
   sk->match_lines = match_lines;
   sk->exact = exact;
   sk->eolbyte = eolbyte;
-  unsigned char qmask = 0;
-  if (match_icase && localeinfo.using_utf8)
-    {
-      for (idx_t i = 0; i < size; i++)
-        {
-          if (pattern[i] == 'i' || pattern[i] == 'I')
-            qmask |= 1;
-          else if (pattern[i] == 's' || pattern[i] == 'S')
-            qmask |= 2;
-        }
-    }
-  sk->utf8_quirk_mask = qmask;
+  sk->utf8_quirk_mask = compute_utf8_quirk_mask (pattern, size);
   atomic_init (&sk->refs, 1);
   if (!kwset_cache)
     kwset_cache = sk;
@@ -179,6 +189,9 @@ Fcompile (char *pattern, idx_t size, reg_syntax_t ignored, bool exact)
   kwsearch->size = size;
   kwsearch->re = nullptr;
   kwsearch->utf8_quirk_mask = sk->utf8_quirk_mask;
+  kwsearch->quirk_norm = nullptr;
+  kwsearch->quirk_orig = nullptr;
+  kwsearch->quirk_cap = 0;
 
   if (!localeinfo.multibyte && match_words)
     {
@@ -358,6 +371,72 @@ Fexecute_core (void *vcp, char const *buf, idx_t size, idx_t *match_size,
   return beg - buf;
 }
 
+/* Normalize UTF-8 case-folding quirks (U+0131 -> 'i', U+017F -> 's') in
+   [LINE_BEG, LINE_BEG + LINE_LEN) into KWSEARCH's reusable buffer,
+   recording each normalized byte's original offset in KWSEARCH->quirk_orig.
+   Store the normalized length in *NLEN_OUT and the translated START_PTR
+   (or nullptr) in *NORM_START_OUT.  */
+static inline _GL_ATTRIBUTE_ALWAYS_INLINE char *
+normalize_utf8_quirk_line (struct kwsearch *kwsearch, char const *line_beg,
+                           idx_t line_len, bool has_eol,
+                           char const *start_ptr, idx_t *nlen_out,
+                           char const **norm_start_out)
+{
+  char eol = eolbyte;
+  unsigned char mask = kwsearch->utf8_quirk_mask;
+  idx_t needed = MAX (line_len + 8, 1024);
+  if (kwsearch->quirk_cap < needed)
+    {
+      free (kwsearch->quirk_norm);
+      free (kwsearch->quirk_orig);
+      kwsearch->quirk_cap = needed;
+      kwsearch->quirk_norm = ximalloc (needed);
+      kwsearch->quirk_orig = xinmalloc (needed, sizeof *kwsearch->quirk_orig);
+    }
+
+  char *norm = kwsearch->quirk_norm + 1;
+  idx_t *orig_off = kwsearch->quirk_orig;
+  norm[-1] = eol;
+
+  idx_t norm_start_idx = 0;
+  idx_t nlen = 0;
+  for (idx_t i = 0; i < line_len; )
+    {
+      if (start_ptr && line_beg + i <= start_ptr)
+        norm_start_idx = (line_beg + i == start_ptr) ? nlen : nlen + 1;
+      orig_off[nlen] = i;
+      if (i + 1 < line_len)
+        {
+          unsigned char c0 = line_beg[i];
+          unsigned char c1 = line_beg[i + 1];
+          if ((mask & 1) && c0 == 0xc4 && c1 == 0xb1)
+            {
+              norm[nlen++] = 'i';
+              i += 2;
+              continue;
+            }
+          if ((mask & 2) && c0 == 0xc5 && c1 == 0xbf)
+            {
+              norm[nlen++] = 's';
+              i += 2;
+              continue;
+            }
+        }
+      norm[nlen++] = line_beg[i++];
+    }
+
+  orig_off[nlen] = line_len;
+  orig_off[nlen + 1] = line_len;
+  orig_off[nlen + 2] = line_len;
+  orig_off[nlen + 3] = line_len;
+  norm[nlen] = has_eol ? eol : 0;
+  norm[nlen + 1] = 0;
+
+  *nlen_out = nlen;
+  *norm_start_out = start_ptr ? norm + norm_start_idx : nullptr;
+  return norm;
+}
+
 static ptrdiff_t
 Fexecute_with_utf8_quirk (struct kwsearch *kwsearch, char const *buf,
                           idx_t size, idx_t *match_size,
@@ -384,9 +463,7 @@ Fexecute_with_utf8_quirk (struct kwsearch *kwsearch, char const *buf,
         {
           ptrdiff_t off = Fexecute_core (kwsearch, p, buflim - p, match_size,
                                          cur_start);
-          if (off < 0)
-            return -1;
-          return (p - buf) + off;
+          return off < 0 ? -1 : (p - buf) + off;
         }
 
       char const *quirk_line_start = memrchr (p, eol, quirk_pos - p);
@@ -406,83 +483,22 @@ Fexecute_with_utf8_quirk (struct kwsearch *kwsearch, char const *buf,
       char const *line_end = nl ? nl + 1 : buflim;
       idx_t line_len = line_end - line_beg;
 
-      char stack_norm[1024];
-      idx_t stack_orig[1024];
-      char *norm;
-      char *norm_alloc = nullptr;
-      idx_t *orig_off;
-      idx_t *orig_alloc = nullptr;
-
-      if (line_len + 8 <= sizeof stack_norm)
-        {
-          norm = stack_norm + 1;
-          orig_off = stack_orig;
-        }
-      else
-        {
-          norm_alloc = ximalloc (line_len + 8);
-          norm = norm_alloc + 1;
-          orig_alloc = ximalloc ((line_len + 8) * sizeof *orig_off);
-          orig_off = orig_alloc;
-        }
-
-      norm[-1] = eol;
-
-      idx_t norm_start_idx = 0;
       idx_t nlen = 0;
-      idx_t i = 0;
-      while (i < line_len)
-        {
-          if (start_ptr && line_beg + i <= start_ptr)
-            norm_start_idx = (line_beg + i == start_ptr) ? nlen : nlen + 1;
-          orig_off[nlen] = i;
-          if (i + 1 < line_len)
-            {
-              if ((mask & 1) && (unsigned char) line_beg[i] == 0xc4
-                  && (unsigned char) line_beg[i + 1] == 0xb1)
-                {
-                  norm[nlen++] = 'i';
-                  i += 2;
-                  continue;
-                }
-              if ((mask & 2) && (unsigned char) line_beg[i] == 0xc5
-                  && (unsigned char) line_beg[i + 1] == 0xbf)
-                {
-                  norm[nlen++] = 's';
-                  i += 2;
-                  continue;
-                }
-            }
-          norm[nlen++] = line_beg[i++];
-        }
-      orig_off[nlen] = line_len;
-      orig_off[nlen + 1] = line_len;
-      orig_off[nlen + 2] = line_len;
-      orig_off[nlen + 3] = line_len;
-      norm[nlen] = (nl ? eol : 0);
-      norm[nlen + 1] = 0;
-
-      char const *norm_start = start_ptr ? norm + norm_start_idx : nullptr;
+      char const *norm_start = nullptr;
+      char *norm = normalize_utf8_quirk_line (kwsearch, line_beg, line_len,
+                                              nl != nullptr, start_ptr,
+                                              &nlen, &norm_start);
 
       idx_t norm_msize = 0;
-      ptrdiff_t norm_off = Fexecute_core (kwsearch, norm, nlen, &norm_msize, norm_start);
-
+      ptrdiff_t norm_off = Fexecute_core (kwsearch, norm, nlen, &norm_msize,
+                                          norm_start);
       if (norm_off >= 0)
         {
-          idx_t orig_mstart = orig_off[norm_off];
-          idx_t orig_mend = orig_off[norm_off + norm_msize];
+          idx_t orig_mstart = kwsearch->quirk_orig[norm_off];
+          idx_t orig_mend = kwsearch->quirk_orig[norm_off + norm_msize];
           *match_size = orig_mend - orig_mstart;
-          if (norm_alloc)
-            free (norm_alloc);
-          if (orig_alloc)
-            free (orig_alloc);
           return (line_beg - buf) + orig_mstart;
         }
-
-      if (norm_alloc)
-        free (norm_alloc);
-      if (orig_alloc)
-        free (orig_alloc);
 
       p = line_end;
     }
@@ -541,6 +557,8 @@ Ffree (void *vcp)
       free (sk->pattern);
       free (sk);
     }
+  free (kwsearch->quirk_norm);
+  free (kwsearch->quirk_orig);
   free (kwsearch->pattern);
   if (kwsearch->re)
     EGfree (kwsearch->re);

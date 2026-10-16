@@ -243,6 +243,83 @@ kwsalloc (char const *trans)
    exact for CHAR_BIT in { 4..11, 13, 15, 17, 19 }.  */
 enum { DEPTH_SIZE = CHAR_BIT + CHAR_BIT / 2 };
 
+enum tree_dir { DIR_L, DIR_R };
+
+/* Rebalance the AVL tree path recorded in LINKS[0..DEPTH] and DIRS[0..DEPTH]
+   after inserting a child under LINKS[DEPTH].  */
+static void
+rebalance_tree_after_insert (struct tree *links[], enum tree_dir const dirs[],
+                             idx_t depth)
+{
+  /* Back up the tree fixing the balance flags.  */
+  while (depth && !links[depth]->balance)
+    {
+      if (dirs[depth] == DIR_L)
+        --links[depth]->balance;
+      else
+        ++links[depth]->balance;
+      --depth;
+    }
+
+  /* Rebalance the tree by pointer rotations if necessary.  */
+  if (depth && ((dirs[depth] == DIR_L && --links[depth]->balance)
+                || (dirs[depth] == DIR_R && ++links[depth]->balance)))
+    {
+      struct tree *t, *r, *l, *rl, *lr;
+
+      switch (links[depth]->balance)
+        {
+        case (char) -2:
+          switch (dirs[depth + 1])
+            {
+            case DIR_L:
+              r = links[depth], t = r->llink, rl = t->rlink;
+              t->rlink = r, r->llink = rl;
+              t->balance = r->balance = 0;
+              break;
+            case DIR_R:
+              r = links[depth], l = r->llink, t = l->rlink;
+              rl = t->rlink, lr = t->llink;
+              t->llink = l, l->rlink = lr, t->rlink = r, r->llink = rl;
+              l->balance = t->balance != 1 ? 0 : -1;
+              r->balance = t->balance != (char) -1 ? 0 : 1;
+              t->balance = 0;
+              break;
+            default:
+              abort ();
+            }
+          break;
+        case 2:
+          switch (dirs[depth + 1])
+            {
+            case DIR_R:
+              l = links[depth], t = l->rlink, lr = t->llink;
+              t->llink = l, l->rlink = lr;
+              t->balance = l->balance = 0;
+              break;
+            case DIR_L:
+              l = links[depth], r = l->rlink, t = r->llink;
+              lr = t->llink, rl = t->rlink;
+              t->llink = l, l->rlink = lr, t->rlink = r, r->llink = rl;
+              l->balance = t->balance != 1 ? 0 : -1;
+              r->balance = t->balance != (char) -1 ? 0 : 1;
+              t->balance = 0;
+              break;
+            default:
+              abort ();
+            }
+          break;
+        default:
+          abort ();
+        }
+
+      if (dirs[depth - 1] == DIR_L)
+        links[depth - 1]->llink = t;
+      else
+        links[depth - 1]->rlink = t;
+    }
+}
+
 void
 kwsincr (kwset_t kwset, char const *text, idx_t len)
 {
@@ -266,18 +343,18 @@ kwsincr (kwset_t kwset, char const *text, idx_t len)
          of the path followed.  */
       struct tree *cur = trie->links;
       struct tree *links[DEPTH_SIZE];
-      enum { L, R } dirs[DEPTH_SIZE];
+      enum tree_dir dirs[DEPTH_SIZE];
       links[0] = (struct tree *) &trie->links;
-      dirs[0] = L;
+      dirs[0] = DIR_L;
       idx_t depth = 1;
 
       while (cur && label != cur->label)
         {
           links[depth] = cur;
           if (label < cur->label)
-            dirs[depth++] = L, cur = cur->llink;
+            dirs[depth++] = DIR_L, cur = cur->llink;
           else
-            dirs[depth++] = R, cur = cur->rlink;
+            dirs[depth++] = DIR_R, cur = cur->rlink;
         }
 
       /* The current character doesn't have an outgoing link at
@@ -302,78 +379,12 @@ kwsincr (kwset_t kwset, char const *text, idx_t len)
           kwset->nodes++;
 
           /* Install the new tree node in its parent.  */
-          if (dirs[--depth] == L)
+          if (dirs[--depth] == DIR_L)
             links[depth]->llink = cur;
           else
             links[depth]->rlink = cur;
 
-          /* Back up the tree fixing the balance flags.  */
-          while (depth && !links[depth]->balance)
-            {
-              if (dirs[depth] == L)
-                --links[depth]->balance;
-              else
-                ++links[depth]->balance;
-              --depth;
-            }
-
-          /* Rebalance the tree by pointer rotations if necessary.  */
-          if (depth && ((dirs[depth] == L && --links[depth]->balance)
-                        || (dirs[depth] == R && ++links[depth]->balance)))
-            {
-              struct tree *t, *r, *l, *rl, *lr;
-
-              switch (links[depth]->balance)
-                {
-                case (char) -2:
-                  switch (dirs[depth + 1])
-                    {
-                    case L:
-                      r = links[depth], t = r->llink, rl = t->rlink;
-                      t->rlink = r, r->llink = rl;
-                      t->balance = r->balance = 0;
-                      break;
-                    case R:
-                      r = links[depth], l = r->llink, t = l->rlink;
-                      rl = t->rlink, lr = t->llink;
-                      t->llink = l, l->rlink = lr, t->rlink = r, r->llink = rl;
-                      l->balance = t->balance != 1 ? 0 : -1;
-                      r->balance = t->balance != (char) -1 ? 0 : 1;
-                      t->balance = 0;
-                      break;
-                    default:
-                      abort ();
-                    }
-                  break;
-                case 2:
-                  switch (dirs[depth + 1])
-                    {
-                    case R:
-                      l = links[depth], t = l->rlink, lr = t->llink;
-                      t->llink = l, l->rlink = lr;
-                      t->balance = l->balance = 0;
-                      break;
-                    case L:
-                      l = links[depth], r = l->rlink, t = r->llink;
-                      lr = t->llink, rl = t->rlink;
-                      t->llink = l, l->rlink = lr, t->rlink = r, r->llink = rl;
-                      l->balance = t->balance != 1 ? 0 : -1;
-                      r->balance = t->balance != (char) -1 ? 0 : 1;
-                      t->balance = 0;
-                      break;
-                    default:
-                      abort ();
-                    }
-                  break;
-                default:
-                  abort ();
-                }
-
-              if (dirs[depth - 1] == L)
-                links[depth - 1]->llink = t;
-              else
-                links[depth - 1]->rlink = t;
-            }
+          rebalance_tree_after_insert (links, dirs, depth);
         }
 
       trie = cur->trie;
@@ -774,6 +785,205 @@ kwsprep_dfa (kwset_t kwset)
   return true;
 }
 
+/* Rebuild a single-pattern forward trie into a reversed Boyer-Moore trie.  */
+static void
+kwsprep_reverse_single (kwset_t kwset)
+{
+  struct trie *last;
+  for (struct trie *curr = last = kwset->trie; curr; curr = curr->next)
+    enqueue (curr->links, &last);
+
+  kwset->target = obstack_alloc (&kwset->obstack, kwset->mind);
+  struct trie *curr = kwset->trie;
+  for (idx_t i = 0; i < kwset->mind; i++)
+    {
+      kwset->target[i] = curr->links->label;
+      curr = curr->next;
+    }
+
+  kwset_t new_kwset = kwsalloc (kwset->trans);
+  new_kwset->kwsexec = bmexec;
+  kwsincr (new_kwset, kwset->target, kwset->mind);
+  obstack_free (&kwset->obstack, nullptr);
+  *kwset = *new_kwset;
+  free (new_kwset);
+}
+
+/* Traverse the trie in level order, computing the delta table,
+   Aho-Corasick failure links, and (if REVERSE) Boyer-Moore shift tables.  */
+static void
+kwsprep_bfs_shifts (kwset_t kwset, unsigned char delta[], bool reverse)
+{
+  struct trie *last;
+  for (struct trie *curr = last = kwset->trie; curr; curr = curr->next)
+    {
+      enqueue (curr->links, &last);
+      treedelta (curr->links, curr->depth, delta);
+      treefails (curr->links, curr->fail, kwset->trie, reverse);
+
+      if (reverse)
+        {
+          curr->shift = kwset->mind;
+          curr->maxshift = kwset->mind;
+
+          for (struct trie *fail = curr->fail; fail; fail = fail->fail)
+            {
+              if (!hasevery (fail->links, curr->links))
+                if (curr->depth - fail->depth < fail->shift)
+                  fail->shift = curr->depth - fail->depth;
+
+              if (curr->accepting && fail->maxshift > curr->depth - fail->depth)
+                fail->maxshift = curr->depth - fail->depth;
+            }
+        }
+    }
+
+  if (reverse)
+    {
+      for (struct trie *curr = kwset->trie->next; curr; curr = curr->next)
+        {
+          if (curr->maxshift > curr->parent->maxshift)
+            curr->maxshift = curr->parent->maxshift;
+          if (curr->shift > curr->maxshift)
+            curr->shift = curr->maxshift;
+        }
+    }
+}
+
+/* Build the root next[] transition vector and compute GC1 / GC1HELP.  */
+static void
+kwsprep_root_next_and_gc1 (kwset_t kwset)
+{
+  char const *trans = kwset->trans;
+  struct trie *nextbuf[NCHAR];
+  struct trie **next = trans ? nextbuf : kwset->next;
+  memset (next, 0, sizeof nextbuf);
+  treenext (kwset->trie->links, next);
+
+  int gc1 = -2;
+  int gc1help = -1;
+  for (int i = 0; i < NCHAR; i++)
+    {
+      int ti = i;
+      if (trans)
+        {
+          ti = U(trans[i]);
+          kwset->next[i] = next[ti];
+        }
+      if (kwset->next[i])
+        {
+          if (gc1 < -1)
+            {
+              gc1 = ti;
+              gc1help = i;
+            }
+          else if (gc1 == ti)
+            gc1help = gc1help == ti ? i : -1;
+          else if (i == ti && gc1 == gc1help)
+            gc1help = i;
+          else
+            gc1 = -1;
+        }
+    }
+  kwset->gc1 = gc1;
+  kwset->gc1help = gc1help;
+}
+
+/* Extract the target string, delta2 shift table, and penultimate byte GC2
+   for single-pattern Boyer-Moore search.  */
+static void
+kwsprep_bm_tables (kwset_t kwset)
+{
+  kwset->target = obstack_alloc (&kwset->obstack, kwset->mind);
+  struct trie *curr = kwset->trie;
+  for (idx_t i = kwset->mind; 0 < i; i--)
+    {
+      kwset->target[i - 1] = curr->links->label;
+      curr = curr->next;
+    }
+
+  if (kwset->mind > 1)
+    {
+      kwset->shift
+        = obstack_alloc (&kwset->obstack,
+                         sizeof *kwset->shift * (kwset->mind - 1));
+      curr = kwset->trie->next;
+      for (idx_t i = 0; i < kwset->mind - 1; i++)
+        {
+          kwset->shift[i] = curr->shift;
+          curr = curr->next;
+        }
+
+      kwset->gc2 = tr (kwset->trans, kwset->target[kwset->mind - 2]);
+    }
+}
+
+#if defined __AVX2__
+static void
+kwsprep_simd_pair (kwset_t kwset)
+{
+  idx_t len = kwset->mind;
+  uint8_t c0 = (uint8_t) kwset->target[0];
+  uint8_t c1 = (uint8_t) kwset->target[len - 1];
+
+  if (compute_simd_byte_mask (kwset->trans, c0,
+                              &kwset->simd_first_mask, &kwset->simd_first_val)
+      && compute_simd_byte_mask (kwset->trans, c1,
+                                 &kwset->simd_last_mask, &kwset->simd_last_val))
+    {
+      kwset->simd_last_offset = len - 1;
+      kwset->simd_pair_ready = true;
+    }
+}
+
+static void
+kwsprep_teddy (kwset_t kwset)
+{
+  char const *trans = kwset->trans;
+  struct prefix_collector coll = {0};
+  collect_prefixes_l0 (kwset->trie->links, &coll);
+  if (coll.count <= 0)
+    return;
+
+  uint8_t t0_lo[16] = {0};
+  uint8_t t0_hi[16] = {0};
+  uint8_t t1_lo[16] = {0};
+  uint8_t t1_hi[16] = {0};
+
+  for (int p = 0; p < coll.count; p++)
+    {
+      int bit = 1 << (p % 8);
+      unsigned char b0 = coll.b0[p];
+      unsigned char b1 = coll.b1[p];
+
+      for (int b = 0; b < NCHAR; b++)
+        {
+          unsigned char tb = trans ? U(trans[b]) : (unsigned char) b;
+          if (tb == b0)
+            {
+              t0_lo[b & 0x0F] |= bit;
+              t0_hi[(b >> 4) & 0x0F] |= bit;
+            }
+          if (tb == b1)
+            {
+              t1_lo[b & 0x0F] |= bit;
+              t1_hi[(b >> 4) & 0x0F] |= bit;
+            }
+        }
+    }
+
+  memcpy (kwset->teddy_t0_lo, t0_lo, 16);
+  memcpy (kwset->teddy_t0_lo + 16, t0_lo, 16);
+  memcpy (kwset->teddy_t0_hi, t0_hi, 16);
+  memcpy (kwset->teddy_t0_hi + 16, t0_hi, 16);
+  memcpy (kwset->teddy_t1_lo, t1_lo, 16);
+  memcpy (kwset->teddy_t1_lo + 16, t1_lo, 16);
+  memcpy (kwset->teddy_t1_hi, t1_hi, 16);
+  memcpy (kwset->teddy_t1_hi + 16, t1_hi, 16);
+  kwset->teddy_active = true;
+}
+#endif
+
 void
 kwsprep (kwset_t kwset)
 {
@@ -785,159 +995,18 @@ kwsprep (kwset_t kwset)
   bool reverse = kwset->words == 1;
 
   if (reverse)
-    {
-      /* Enqueue the immediate descendants in the level order queue.  */
-      {
-        struct trie *last;
-        for (struct trie *curr = last = kwset->trie; curr; curr = curr->next)
-          enqueue (curr->links, &last);
-      }
-
-      /* Looking for just one string.  Extract it from the trie.  */
-      kwset->target = obstack_alloc (&kwset->obstack, kwset->mind);
-      struct trie *curr = kwset->trie;
-      for (idx_t i = 0; i < kwset->mind; i++)
-        {
-          kwset->target[i] = curr->links->label;
-          curr = curr->next;
-        }
-
-      kwset_t new_kwset = kwsalloc (kwset->trans);
-      new_kwset->kwsexec = bmexec;
-      kwsincr (new_kwset, kwset->target, kwset->mind);
-      obstack_free (&kwset->obstack, nullptr);
-      *kwset = *new_kwset;
-      free (new_kwset);
-    }
+    kwsprep_reverse_single (kwset);
 
   /* Initial values for the delta table; will be changed later.  The
      delta entry for a given character is the smallest depth of any
      node at which an outgoing edge is labeled by that character.  */
   memset (delta, MIN (kwset->mind, UCHAR_MAX), sizeof deltabuf);
 
-  /* Traverse the nodes of the trie in level order, simultaneously
-     computing the delta table, failure function, and shift function.  */
-  {
-    struct trie *last;
-    for (struct trie *curr = last = kwset->trie; curr; curr = curr->next)
-      {
-        /* Enqueue the immediate descendants in the level order queue.  */
-        enqueue (curr->links, &last);
-
-        /* Update the delta table for the descendants of this node.  */
-        treedelta (curr->links, curr->depth, delta);
-
-        /* Compute the failure function for the descendants of this node.  */
-        treefails (curr->links, curr->fail, kwset->trie, reverse);
-
-        if (reverse)
-          {
-            curr->shift = kwset->mind;
-            curr->maxshift = kwset->mind;
-
-            /* Update the shifts at each node in the current node's chain
-               of fails back to the root.  */
-            for (struct trie *fail = curr->fail; fail; fail = fail->fail)
-              {
-                /* If the current node has some outgoing edge that the fail
-                   doesn't, then the shift at the fail should be no larger
-                   than the difference of their depths.  */
-                if (!hasevery (fail->links, curr->links))
-                  if (curr->depth - fail->depth < fail->shift)
-                    fail->shift = curr->depth - fail->depth;
-
-                /* If the current node is accepting then the shift at the
-                   fail and its descendants should be no larger than the
-                   difference of their depths.  */
-                if (curr->accepting && fail->maxshift > curr->depth - fail->depth)
-                  fail->maxshift = curr->depth - fail->depth;
-              }
-          }
-      }
-  }
+  kwsprep_bfs_shifts (kwset, delta, reverse);
+  kwsprep_root_next_and_gc1 (kwset);
 
   if (reverse)
-    {
-      /* Traverse the trie in level order again, fixing up all nodes whose
-         shift exceeds their inherited maxshift.  */
-      for (struct trie *curr = kwset->trie->next; curr; curr = curr->next)
-        {
-          if (curr->maxshift > curr->parent->maxshift)
-            curr->maxshift = curr->parent->maxshift;
-          if (curr->shift > curr->maxshift)
-            curr->shift = curr->maxshift;
-        }
-    }
-
-  /* Create a vector, indexed by character code, of the outgoing links
-     from the root node.  Accumulate GC1 and GC1HELP.  */
-  {
-    struct trie *nextbuf[NCHAR];
-    struct trie **next = trans ? nextbuf : kwset->next;
-    memset (next, 0, sizeof nextbuf);
-    treenext (kwset->trie->links, next);
-    int gc1 = -2;
-    int gc1help = -1;
-    for (int i = 0; i < NCHAR; i++)
-      {
-        int ti = i;
-        if (trans)
-          {
-            ti = U(trans[i]);
-            kwset->next[i] = next[ti];
-          }
-        if (kwset->next[i])
-          {
-            if (gc1 < -1)
-              {
-                gc1 = ti;
-                gc1help = i;
-              }
-            else if (gc1 == ti)
-              gc1help = gc1help == ti ? i : -1;
-            else if (i == ti && gc1 == gc1help)
-              gc1help = i;
-            else
-              gc1 = -1;
-          }
-      }
-    kwset->gc1 = gc1;
-    kwset->gc1help = gc1help;
-  }
-
-  if (reverse)
-    {
-      /* Looking for just one string.  Extract it from the trie.  */
-      kwset->target = obstack_alloc (&kwset->obstack, kwset->mind);
-      {
-        struct trie *curr = kwset->trie;
-        for (idx_t i = kwset->mind; 0 < i; i--)
-          {
-            kwset->target[i - 1] = curr->links->label;
-            curr = curr->next;
-          }
-      }
-
-      if (kwset->mind > 1)
-        {
-          /* Looking for the delta2 shift that might be made after a
-             backwards match has failed.  Extract it from the trie.  */
-          kwset->shift
-            = obstack_alloc (&kwset->obstack,
-                             sizeof *kwset->shift * (kwset->mind - 1));
-          {
-            struct trie *curr = kwset->trie->next;
-            for (idx_t i = 0; i < kwset->mind - 1; i++)
-              {
-                kwset->shift[i] = curr->shift;
-                curr = curr->next;
-              }
-          }
-
-          /* The penultimate byte.  */
-          kwset->gc2 = tr (trans, kwset->target[kwset->mind - 2]);
-        }
-    }
+    kwsprep_bm_tables (kwset);
 
   /* Fix things up for any translation table.  */
   if (trans)
@@ -946,62 +1015,9 @@ kwsprep (kwset_t kwset)
 
 #if defined __AVX2__
   if (reverse && kwset->mind >= 2)
-    {
-      idx_t len = kwset->mind;
-      uint8_t c0 = (uint8_t) kwset->target[0];
-      uint8_t c1 = (uint8_t) kwset->target[len - 1];
-
-      if (compute_simd_byte_mask (trans, c0, &kwset->simd_first_mask, &kwset->simd_first_val)
-          && compute_simd_byte_mask (trans, c1, &kwset->simd_last_mask, &kwset->simd_last_val))
-        {
-          kwset->simd_last_offset = len - 1;
-          kwset->simd_pair_ready = true;
-        }
-    }
+    kwsprep_simd_pair (kwset);
   else if (!reverse && kwset->words <= 32 && kwset->mind >= 2)
-    {
-      struct prefix_collector coll = {0};
-      collect_prefixes_l0 (kwset->trie->links, &coll);
-      if (coll.count > 0)
-        {
-          uint8_t t0_lo[16] = {0};
-          uint8_t t0_hi[16] = {0};
-          uint8_t t1_lo[16] = {0};
-          uint8_t t1_hi[16] = {0};
-
-          for (int p = 0; p < coll.count; p++)
-            {
-              int bit = 1 << (p % 8);
-              unsigned char b0 = coll.b0[p];
-              unsigned char b1 = coll.b1[p];
-
-              for (int b = 0; b < NCHAR; b++)
-                {
-                  unsigned char tb = trans ? U(trans[b]) : (unsigned char) b;
-                  if (tb == b0)
-                    {
-                      t0_lo[b & 0x0F] |= bit;
-                      t0_hi[(b >> 4) & 0x0F] |= bit;
-                    }
-                  if (tb == b1)
-                    {
-                      t1_lo[b & 0x0F] |= bit;
-                      t1_hi[(b >> 4) & 0x0F] |= bit;
-                    }
-                }
-            }
-
-          memcpy (kwset->teddy_t0_lo, t0_lo, 16);
-          memcpy (kwset->teddy_t0_lo + 16, t0_lo, 16);
-          memcpy (kwset->teddy_t0_hi, t0_hi, 16);
-          memcpy (kwset->teddy_t0_hi + 16, t0_hi, 16);
-          memcpy (kwset->teddy_t1_lo, t1_lo, 16);
-          memcpy (kwset->teddy_t1_lo + 16, t1_lo, 16);
-          memcpy (kwset->teddy_t1_hi, t1_hi, 16);
-          memcpy (kwset->teddy_t1_hi + 16, t1_hi, 16);
-          kwset->teddy_active = true;
-        }
-    }
+    kwsprep_teddy (kwset);
 #endif
 
   /* For two or more keywords, search with a dense automaton, behind a
@@ -1175,6 +1191,38 @@ bmexec_trans_scalar (kwset_t kwset, char const *text, idx_t size)
   return -1;
 }
 
+#if defined __AVX2__
+/* Verify candidate offsets encoded in MASK relative to BASE against
+   TARGET[0..LEN-1] (under optional translation table TRANS).  Return the
+   matching candidate pointer, or nullptr if none match.  */
+static inline _GL_ATTRIBUTE_ALWAYS_INLINE char const * _GL_ATTRIBUTE_PURE
+bm_verify_simd_mask (uint32_t mask, char const *base, char const *target,
+                     idx_t len, char const *trans)
+{
+  while (mask)
+    {
+      int idx = __builtin_ctz (mask);
+      char const *cand = base + idx;
+      bool match = true;
+      if (trans)
+        {
+          for (idx_t j = 0; j < len; j++)
+            if (tr (trans, cand[j]) != target[j])
+              {
+                match = false;
+                break;
+              }
+        }
+      else if (memcmp (cand, target, len) != 0)
+        match = false;
+      if (match)
+        return cand;
+      mask &= mask - 1;
+    }
+  return nullptr;
+}
+#endif
+
 /* Fast Boyer-Moore search (inlinable version with AVX2 fast path).  */
 static inline ptrdiff_t _GL_ATTRIBUTE_PURE
 bmexec_trans (kwset_t kwset, char const *text, idx_t size)
@@ -1226,47 +1274,12 @@ bmexec_trans (kwset_t kwset, char const *text, idx_t size)
               continue;
             }
 
-          while (mask0)
-            {
-              int idx = __builtin_ctz (mask0);
-              char const *cand = p + idx;
-              bool match = true;
-              if (trans)
-                {
-                  for (idx_t j = 0; j < len; j++)
-                    if (tr (trans, cand[j]) != target[j])
-                      { match = false; break; }
-                }
-              else
-                {
-                  if (memcmp (cand, target, len) != 0)
-                    match = false;
-                }
-              if (match)
-                return cand - text;
-              mask0 &= mask0 - 1;
-            }
-
-          while (mask1)
-            {
-              int idx = __builtin_ctz (mask1);
-              char const *cand = p + 32 + idx;
-              bool match = true;
-              if (trans)
-                {
-                  for (idx_t j = 0; j < len; j++)
-                    if (tr (trans, cand[j]) != target[j])
-                      { match = false; break; }
-                }
-              else
-                {
-                  if (memcmp (cand, target, len) != 0)
-                    match = false;
-                }
-              if (match)
-                return cand - text;
-              mask1 &= mask1 - 1;
-            }
+          char const *cand = bm_verify_simd_mask (mask0, p, target, len, trans);
+          if (cand)
+            return cand - text;
+          cand = bm_verify_simd_mask (mask1, p + 32, target, len, trans);
+          if (cand)
+            return cand - text;
 
           p += 64;
         }

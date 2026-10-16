@@ -1164,32 +1164,15 @@ regex_compile (struct dfa_comp *dc, char const *p, idx_t len,
   return false;
 }
 
-/* Compile PATTERN, containing SIZE bytes that are followed by '\n'.
-   SYNTAX_BITS specifies whether PATTERN uses style -G, -E, or -A.
-   Return a description of the compiled pattern.  */
-
-void *
-GEAcompile (char *pattern, idx_t size, reg_syntax_t syntax_bits,
-            bool exact)
+/* Split PATTERN[0..SIZE-1] into lines, compiling each line with GNU regex
+   (either for syntax checking or backreference execution) and accumulating
+   backreference-free lines into *BUF_OUT.  Return false if any pattern line
+   fails to compile.  */
+static bool
+compile_pattern_lines (struct dfa_comp *dc, char *pattern, idx_t size,
+                       reg_syntax_t syntax_bits, bool bs_safe,
+                       char **buf_out, idx_t *buflen_out, idx_t *bufalloc_out)
 {
-  char *motif;
-  struct dfa_comp *dc = xcalloc (1, sizeof (*dc));
-
-  dc->dfa = dfaalloc ();
-
-  if (match_icase)
-    syntax_bits |= RE_ICASE;
-  int dfaopts = (DFA_CONFUSING_BRACKETS_ERROR | DFA_STRAY_BACKSLASH_WARN
-                 | DFA_PLUS_WARN
-                 | (syntax_bits & RE_CONTEXT_INDEP_OPS ? DFA_STAR_WARN : 0)
-                 | (eolbyte ? 0 : DFA_EOL_NUL));
-  dfasyntax (dc->dfa, &localeinfo, syntax_bits, dfaopts);
-  bool bs_safe = !localeinfo.multibyte | localeinfo.using_utf8;
-
-  /* For GNU regex, pass the patterns separately to detect errors like
-     "[\nallo\n]\n", where the patterns are "[", "allo" and "]", and
-     this should be a syntax error.  The same for backref, where the
-     backref should be local to each pattern.  */
   char const *p = pattern;
   char const *patlim = pattern + size;
   bool compilation_failed = false;
@@ -1202,19 +1185,15 @@ GEAcompile (char *pattern, idx_t size, reg_syntax_t syntax_bits,
   idx_t palloc = 1;
 
   char const *prev = pattern;
-
-  /* Buffer containing back-reference-free patterns.  */
   char *buf = nullptr;
   idx_t buflen = 0;
   idx_t bufalloc = 0;
-
   idx_t lineno = 0;
 
   do
     {
       char const *sep = rawmemchr (p, '\n');
       idx_t len = sep - p;
-
       bool backref = possible_backrefs_in_pattern (p, len, bs_safe);
 
       if (backref && prev < p)
@@ -1233,8 +1212,8 @@ GEAcompile (char *pattern, idx_t size, reg_syntax_t syntax_bits,
       ptrdiff_t shortage = dc->pcount - palloc + 2;
       if (0 < shortage)
         {
-          dc->patterns_alloc = xpalloc (dc->patterns_alloc, &palloc, shortage, -1,
-                                        sizeof *dc->patterns);
+          dc->patterns_alloc = xpalloc (dc->patterns_alloc, &palloc, shortage,
+                                        -1, sizeof *dc->patterns);
           dc->patterns = dc->patterns_alloc + 1;
           dc->bref_filters_alloc = xrealloc (dc->bref_filters_alloc,
                                              palloc * sizeof *dc->bref_filters);
@@ -1275,8 +1254,7 @@ GEAcompile (char *pattern, idx_t size, reg_syntax_t syntax_bits,
   if (compilation_failed)
     {
       free (buf);
-      EGfree (dc);
-      exit (EXIT_TROUBLE);
+      return false;
     }
 
   if (patlim < prev)
@@ -1294,41 +1272,51 @@ GEAcompile (char *pattern, idx_t size, reg_syntax_t syntax_bits,
       buflen = size;
     }
 
-  char const *raw_pat = pattern;
-  idx_t raw_size = size;
+  *buf_out = buf;
+  *buflen_out = buflen;
+  *bufalloc_out = bufalloc;
+  return true;
+}
 
-  /* In the match_words and match_lines cases, we use a different pattern
-     for the DFA matcher that will quickly throw out cases that won't work.
-     Then if DFA succeeds we do some hairy stuff using the regex matcher
-     to decide whether the match should really count. */
-  if (match_words || match_lines)
-    {
-      static char const line_beg_no_bk[] = "^(";
-      static char const line_end_no_bk[] = ")$";
-      static char const word_beg_no_bk[] = "(^|[^[:alnum:]_])(";
-      static char const word_end_no_bk[] = ")([^[:alnum:]_]|$)";
-      static char const line_beg_bk[] = "^\\(";
-      static char const line_end_bk[] = "\\)$";
-      static char const word_beg_bk[] = "\\(^\\|[^[:alnum:]_]\\)\\(";
-      static char const word_end_bk[] = "\\)\\([^[:alnum:]_]\\|$\\)";
-      int bk = !(syntax_bits & RE_NO_BK_PARENS);
-      idx_t bracket_bytes = sizeof word_beg_bk - 1 + sizeof word_end_bk;
-      char *n = ximalloc (size + bracket_bytes);
+/* Wrap PATTERN[0..SIZE-1] in word-boundary or line-boundary regex anchors
+   for the DFA matcher when -w or -x is active.  Store the new length in
+   *SIZE_OUT and return the newly allocated motif buffer.  */
+static char *
+wrap_word_or_line_motif (char const *pattern, idx_t size,
+                         reg_syntax_t syntax_bits, idx_t *size_out)
+{
+  static char const line_beg_no_bk[] = "^(";
+  static char const line_end_no_bk[] = ")$";
+  static char const word_beg_no_bk[] = "(^|[^[:alnum:]_])(";
+  static char const word_end_no_bk[] = ")([^[:alnum:]_]|$)";
+  static char const line_beg_bk[] = "^\\(";
+  static char const line_end_bk[] = "\\)$";
+  static char const word_beg_bk[] = "\\(^\\|[^[:alnum:]_]\\)\\(";
+  static char const word_end_bk[] = "\\)\\([^[:alnum:]_]\\|$\\)";
 
-      strcpy (n, match_lines ? (bk ? line_beg_bk : line_beg_no_bk)
-                             : (bk ? word_beg_bk : word_beg_no_bk));
-      idx_t total = strlen (n);
-      memcpy (n + total, pattern, size);
-      total += size;
-      strcpy (n + total, match_lines ? (bk ? line_end_bk : line_end_no_bk)
-                                     : (bk ? word_end_bk : word_end_no_bk));
-      total += strlen (n + total);
-      pattern = motif = n;
-      size = total;
-    }
-  else
-    motif = nullptr;
+  int bk = !(syntax_bits & RE_NO_BK_PARENS);
+  idx_t bracket_bytes = sizeof word_beg_bk - 1 + sizeof word_end_bk;
+  char *n = ximalloc (size + bracket_bytes);
 
+  strcpy (n, match_lines ? (bk ? line_beg_bk : line_beg_no_bk)
+                         : (bk ? word_beg_bk : word_beg_no_bk));
+  idx_t total = strlen (n);
+  memcpy (n + total, pattern, size);
+  total += size;
+  strcpy (n + total, match_lines ? (bk ? line_end_bk : line_end_no_bk)
+                                 : (bk ? word_end_bk : word_end_no_bk));
+  total += strlen (n + total);
+  *size_out = total;
+  return n;
+}
+
+/* Attach the shared must-literal kwset to DC (populating dfa_kwset_cache on
+   first compilation) and compile or defer DC->dfa.  */
+static void
+setup_shared_dfa_and_kwset (struct dfa_comp *dc, char const *pattern,
+                            idx_t size, char const *raw_pat, idx_t raw_size,
+                            reg_syntax_t syntax_bits, bool exact)
+{
   struct shared_dfa_kwset *sk = dfa_kwset_cache;
   if (sk && sk->size == size && memcmp (sk->pattern, pattern, size) == 0
       && sk->match_icase == match_icase && sk->match_words == match_words
@@ -1356,41 +1344,84 @@ GEAcompile (char *pattern, idx_t size, reg_syntax_t syntax_bits,
           dfacomp (nullptr, 0, dc->dfa, 1);
           dc->dfa_compiled = true;
         }
+      return;
     }
-  else
-    {
-      dfaparse (pattern, size, dc->dfa);
-      kwsmusts (dc, raw_pat, raw_size, syntax_bits);
-      dfacomp (nullptr, 0, dc->dfa, 1);
-      dc->dfa_compiled = true;
 
-      if (!dfa_kwset_cache)
-        {
-          sk = xmalloc (sizeof *sk);
-          sk->kwset = dc->kwset;
-          sk->kwset_exact_matches = dc->kwset_exact_matches;
-          sk->begline = dc->begline;
-          sk->must2_len = dc->must2_len;
-          if (dc->must2_len)
-            memcpy (sk->must2, dc->must2, dc->must2_len);
-          sk->pattern = ximemdup (pattern, size);
-          sk->size = size;
-          sk->match_icase = match_icase;
-          sk->match_words = match_words;
-          sk->match_lines = match_lines;
-          sk->exact = exact;
-          sk->eolbyte = eolbyte;
-          sk->syntax_bits = syntax_bits;
-          sk->dfa_supported = dfasupported (dc->dfa);
-          atomic_init (&sk->refs, 1);
-          dfa_kwset_cache = sk;
-          dc->shared_kwset = sk;
-        }
+  dfaparse (pattern, size, dc->dfa);
+  kwsmusts (dc, raw_pat, raw_size, syntax_bits);
+  dfacomp (nullptr, 0, dc->dfa, 1);
+  dc->dfa_compiled = true;
+
+  if (!dfa_kwset_cache)
+    {
+      sk = xmalloc (sizeof *sk);
+      sk->kwset = dc->kwset;
+      sk->kwset_exact_matches = dc->kwset_exact_matches;
+      sk->begline = dc->begline;
+      sk->must2_len = dc->must2_len;
+      if (dc->must2_len)
+        memcpy (sk->must2, dc->must2, dc->must2_len);
+      sk->pattern = ximemdup (pattern, size);
+      sk->size = size;
+      sk->match_icase = match_icase;
+      sk->match_words = match_words;
+      sk->match_lines = match_lines;
+      sk->exact = exact;
+      sk->eolbyte = eolbyte;
+      sk->syntax_bits = syntax_bits;
+      sk->dfa_supported = dfasupported (dc->dfa);
+      atomic_init (&sk->refs, 1);
+      dfa_kwset_cache = sk;
+      dc->shared_kwset = sk;
     }
+}
+
+/* Compile PATTERN, containing SIZE bytes that are followed by '\n'.
+   SYNTAX_BITS specifies whether PATTERN uses style -G, -E, or -A.
+   Return a description of the compiled pattern.  */
+
+void *
+GEAcompile (char *pattern, idx_t size, reg_syntax_t syntax_bits,
+            bool exact)
+{
+  struct dfa_comp *dc = xcalloc (1, sizeof (*dc));
+  dc->dfa = dfaalloc ();
+
+  if (match_icase)
+    syntax_bits |= RE_ICASE;
+  int dfaopts = (DFA_CONFUSING_BRACKETS_ERROR | DFA_STRAY_BACKSLASH_WARN
+                 | DFA_PLUS_WARN
+                 | (syntax_bits & RE_CONTEXT_INDEP_OPS ? DFA_STAR_WARN : 0)
+                 | (eolbyte ? 0 : DFA_EOL_NUL));
+  dfasyntax (dc->dfa, &localeinfo, syntax_bits, dfaopts);
+  bool bs_safe = !localeinfo.multibyte | localeinfo.using_utf8;
+
+  char *buf = nullptr;
+  idx_t buflen = 0;
+  idx_t bufalloc = 0;
+  if (!compile_pattern_lines (dc, pattern, size, syntax_bits, bs_safe,
+                              &buf, &buflen, &bufalloc))
+    {
+      EGfree (dc);
+      exit (EXIT_TROUBLE);
+    }
+
+  char const *raw_pat = pattern;
+  idx_t raw_size = size;
+  char *motif = nullptr;
+  if (match_words || match_lines)
+    pattern = motif = wrap_word_or_line_motif (pattern, size, syntax_bits,
+                                               &size);
+
+  setup_shared_dfa_and_kwset (dc, pattern, size, raw_pat, raw_size,
+                              syntax_bits, exact);
 
   if (buf)
     {
-      if (exact || !(dc->shared_kwset ? dc->shared_kwset->dfa_supported : dfasupported (dc->dfa)))
+      bool dfa_ok = (dc->shared_kwset
+                     ? dc->shared_kwset->dfa_supported
+                     : dfasupported (dc->dfa));
+      if (exact || !dfa_ok)
         {
           dc->patterns--;
           dc->bref_filters--;
@@ -1406,7 +1437,6 @@ GEAcompile (char *pattern, idx_t size, reg_syntax_t syntax_bits,
     }
 
   free (motif);
-
   return dc;
 }
 
@@ -1425,15 +1455,189 @@ safe_dfaexec (struct dfa *d, char const *begin, char *end,
   return dfaexec (d, begin, end - 1, 0, count, backref);
 }
 
+enum dfa_narrow_status
+{
+  DFA_NARROW_NO_MATCH,
+  DFA_NARROW_NEXT_LINE,
+  DFA_NARROW_EXACT_LINE,
+  DFA_NARROW_NEEDS_REGEX
+};
+
+/* Narrow the search range [*BEG_INOUT, BUFLIM) to a single candidate line
+   [*BEG_INOUT, *END_INOUT) using the 3-stage pipeline:
+   (1) kwset must-literal pre-filter + optional must2 check,
+   (2) superset DFA fast scan, and
+   (3) full DFA scan.  */
+static inline _GL_ATTRIBUTE_ALWAYS_INLINE enum dfa_narrow_status
+dfa_narrow_candidate_line (struct dfa_comp *dc, char const *buf,
+                           char const *buflim, char const **beg_inout,
+                           char const **end_inout, char const **mb_start_inout)
+{
+  char eol = eolbyte;
+  char const *beg = *beg_inout;
+  char const *end = *end_inout;
+  char const *dfa_beg = beg;
+  idx_t count = 0;
+  bool exact_kwset_match = false;
+  bool backref = false;
+
+  if (dc->kwset)
+    {
+      struct kwsmatch kwsm;
+      ptrdiff_t offset = kwsexec (dc->kwset, beg - dc->begline,
+                                  buflim - beg + dc->begline, &kwsm, true);
+      if (offset < 0)
+        return DFA_NARROW_NO_MATCH;
+      char const *match = beg + offset;
+
+      beg = memrchr (buf, eol, match - buf);
+      beg = beg ? beg + 1 : buf;
+      dfa_beg = beg;
+      end = rawmemchr (match, eol);
+      end++;
+
+      exact_kwset_match = kwsm.index < dc->kwset_exact_matches;
+      if (exact_kwset_match)
+        {
+          if (!localeinfo.multibyte | localeinfo.using_utf8)
+            {
+              *beg_inout = beg;
+              *end_inout = end;
+              return DFA_NARROW_EXACT_LINE;
+            }
+          if (*mb_start_inout < beg)
+            *mb_start_inout = beg;
+          if (mb_goback (mb_start_inout, nullptr, match, buflim) == 0)
+            {
+              *beg_inout = beg;
+              *end_inout = end;
+              return DFA_NARROW_EXACT_LINE;
+            }
+          dfa_beg = *mb_start_inout;
+        }
+      else if (dc->must2_len
+               && !memmem (beg, end - 1 - beg, dc->must2, dc->must2_len))
+        {
+          *beg_inout = beg;
+          *end_inout = end;
+          return DFA_NARROW_NEXT_LINE;
+        }
+    }
+
+  if (!dc->dfa_compiled)
+    {
+      suppress_dfawarn = true;
+      dfaparse (dc->dfa_pattern, dc->dfa_pattern_size, dc->dfa);
+      dfacomp (nullptr, 0, dc->dfa, 1);
+      suppress_dfawarn = false;
+      dc->dfa_compiled = true;
+    }
+
+  struct dfa *superset = dfasuperset (dc->dfa);
+  if (superset && !exact_kwset_match)
+    {
+      char const *next_beg = safe_dfaexec (superset, dfa_beg, (char *) end,
+                                           buflim, &count, nullptr);
+      if (!next_beg)
+        {
+          *beg_inout = beg;
+          *end_inout = end;
+          return DFA_NARROW_NEXT_LINE;
+        }
+      if (count != 0)
+        {
+          beg = memrchr (buf, eol, next_beg - buf);
+          beg++;
+          dfa_beg = beg;
+        }
+      end = rawmemchr (next_beg, eol);
+      end++;
+      count = 0;
+    }
+
+  char const *next_beg = safe_dfaexec (dc->dfa, dfa_beg, (char *) end, buflim,
+                                       &count, &backref);
+  if (!next_beg)
+    {
+      *beg_inout = beg;
+      *end_inout = end;
+      return DFA_NARROW_NEXT_LINE;
+    }
+  if (count != 0)
+    {
+      beg = memrchr (buf, eol, next_beg - buf);
+      beg++;
+    }
+  end = rawmemchr (next_beg, eol);
+  end++;
+
+  *beg_inout = beg;
+  *end_inout = end;
+  return backref ? DFA_NARROW_NEEDS_REGEX : DFA_NARROW_EXACT_LINE;
+}
+
+/* Refine a GNU regex match [*MATCH_INOUT, *MATCH_INOUT + *LEN_INOUT) within
+   line [BEG, END - 1) until it aligns with -w word boundaries.  Return true
+   if a word-bounded match is found at or before BEST_MATCH.  */
+static inline _GL_ATTRIBUTE_ALWAYS_INLINE bool
+regex_shrink_to_word_boundaries (struct dfa_comp *dc, idx_t pat_idx,
+                                 char const *beg, char const *end,
+                                 char const *ptr, char const *best_match,
+                                 char const **match_inout, idx_t *len_inout)
+{
+  char const *match = *match_inout;
+  idx_t len = *len_inout;
+
+  while (match <= best_match)
+    {
+      regoff_t shorter_len = 0;
+      if (!wordchar_next (match + len, end - 1)
+          && !wordchar_prev (beg, match, end - 1))
+        {
+          *match_inout = match;
+          *len_inout = len;
+          return true;
+        }
+      if (len > 0)
+        {
+          --len;
+          dc->patterns[pat_idx].not_eol = 1;
+          shorter_len = re_match (&dc->patterns[pat_idx], beg,
+                                  match + len - ptr, match - beg, &dc->regs);
+          if (shorter_len < -1)
+            xalloc_die ();
+        }
+      if (0 < shorter_len)
+        len = shorter_len;
+      else
+        {
+          if (match == end - 1)
+            break;
+          match++;
+          dc->patterns[pat_idx].not_eol = 0;
+          regoff_t start = re_search (&dc->patterns[pat_idx], beg,
+                                      end - beg - 1, match - beg,
+                                      end - match - 1, &dc->regs);
+          if (start < 0)
+            {
+              if (start < -1)
+                xalloc_die ();
+              break;
+            }
+          len = dc->regs.end[0] - start;
+          match = beg + start;
+        }
+    }
+  return false;
+}
+
 ptrdiff_t
 EGexecute (void *vdc, char const *buf, idx_t size, idx_t *match_size,
            char const *start_ptr)
 {
   char const *buflim, *beg, *end, *ptr, *match, *best_match, *mb_start;
-  char eol = eolbyte;
   regoff_t start;
   idx_t len, best_len;
-  struct kwsmatch kwsm;
   idx_t i;
   struct dfa_comp *dc = vdc;
 
@@ -1446,111 +1650,19 @@ EGexecute (void *vdc, char const *buf, idx_t size, idx_t *match_size,
 
       if (!start_ptr)
         {
-          char const *next_beg, *dfa_beg = beg;
-          idx_t count = 0;
-          bool exact_kwset_match = false;
-          bool backref = false;
-
-          /* Try matching with KWset, if it's defined.  */
-          if (dc->kwset)
-            {
-              /* Find a possible match using the KWset matcher.  */
-              ptrdiff_t offset = kwsexec (dc->kwset, beg - dc->begline,
-                                          buflim - beg + dc->begline,
-                                          &kwsm, true);
-              if (offset < 0)
-                return offset;
-              match = beg + offset;
-
-              /* Narrow down to the line containing the possible match.  */
-              beg = memrchr (buf, eol, match - buf);
-              beg = beg ? beg + 1 : buf;
-              dfa_beg = beg;
-              end = rawmemchr (match, eol);
-              end++;
-
-              exact_kwset_match = kwsm.index < dc->kwset_exact_matches;
-              if (exact_kwset_match)
-                {
-                  if (!localeinfo.multibyte | localeinfo.using_utf8)
-                    goto success;
-                  if (mb_start < beg)
-                    mb_start = beg;
-                  if (mb_goback (&mb_start, nullptr, match, buflim) == 0)
-                    goto success;
-                  /* The matched line starts in the middle of a multibyte
-                     character.  Perform the DFA search starting from the
-                     beginning of the next character.  */
-                  dfa_beg = mb_start;
-                }
-              else if (dc->must2_len
-                       && !memmem (beg, end - 1 - beg, dc->must2, dc->must2_len))
-                continue;
-            }
-
-          if (!dc->dfa_compiled)
-            {
-              suppress_dfawarn = true;
-              dfaparse (dc->dfa_pattern, dc->dfa_pattern_size, dc->dfa);
-              dfacomp (nullptr, 0, dc->dfa, 1);
-              suppress_dfawarn = false;
-              dc->dfa_compiled = true;
-            }
-          struct dfa *superset = dfasuperset (dc->dfa);
-
-          /* Try matching with the superset of DFA, if it's defined.  */
-          if (superset && !exact_kwset_match)
-            {
-              /* Keep using the superset while it reports multiline
-                 potential matches; this is more likely to be fast
-                 than falling back to KWset would be.  */
-              next_beg = safe_dfaexec (superset, dfa_beg, (char *) end,
-                                       buflim, &count, nullptr);
-              if (!next_beg)
-                continue;
-
-              /* Narrow down to the line we've found.  */
-              if (count != 0)
-                {
-                  beg = memrchr (buf, eol, next_beg - buf);
-                  beg++;
-                  dfa_beg = beg;
-                }
-              end = rawmemchr (next_beg, eol);
-              end++;
-
-              count = 0;
-            }
-
-          /* Try matching with DFA.  */
-          next_beg = safe_dfaexec (dc->dfa, dfa_beg, (char *) end, buflim,
-                                   &count, &backref);
-
-          /* If there's no match, or if we've matched the sentinel,
-             we're done.  */
-          if (!next_beg)
+          enum dfa_narrow_status status
+            = dfa_narrow_candidate_line (dc, buf, buflim, &beg, &end,
+                                         &mb_start);
+          if (status == DFA_NARROW_NO_MATCH)
+            return -1;
+          if (status == DFA_NARROW_NEXT_LINE)
             continue;
-
-          /* Narrow down to the line we've found.  */
-          if (count != 0)
-            {
-              beg = memrchr (buf, eol, next_beg - buf);
-              beg++;
-            }
-          end = rawmemchr (next_beg, eol);
-          end++;
-
-          /* Successful, no back-references encountered! */
-          if (!backref)
+          if (status == DFA_NARROW_EXACT_LINE)
             goto success;
           ptr = beg;
         }
       else
-        {
-          /* We are looking for the leftmost (then longest) exact match.
-             We will go through the outer loop only once.  */
-          ptr = start_ptr;
-        }
+        ptr = start_ptr;
 
       /* If the "line" is longer than the maximum regexp offset,
          die as if we've run out of memory.  */
@@ -1563,7 +1675,8 @@ EGexecute (void *vdc, char const *buf, idx_t size, idx_t *match_size,
       for (i = 0; i < dc->pcount; i++)
         {
           if (dc->bref_filters && dc->bref_filters[i].enabled
-              && !backref_line_can_match (&dc->bref_filters[i], beg, end - beg - 1))
+              && !backref_line_can_match (&dc->bref_filters[i], beg,
+                                          end - beg - 1))
             continue;
 
           dc->patterns[i].not_eol = 0;
@@ -1589,78 +1702,30 @@ EGexecute (void *vdc, char const *buf, idx_t size, idx_t *match_size,
                   len = end - ptr;
                   goto assess_pattern_match;
                 }
-              /* If -w and not -x, check whether the match aligns with
-                 word boundaries.  Do this iteratively because:
-                 (a) the line may contain more than one occurrence of the
-                 pattern, and
-                 (b) Several alternatives in the pattern might be valid at a
-                 given point, and we may need to consider a shorter one to
-                 find a word boundary.  */
-              if (!match_lines && match_words)
-                while (match <= best_match)
-                  {
-                    regoff_t shorter_len = 0;
-                    if (! wordchar_next (match + len, end - 1)
-                        && ! wordchar_prev (beg, match, end - 1))
-                      goto assess_pattern_match;
-                    if (len > 0)
-                      {
-                        /* Try a shorter length anchored at the same place. */
-                        --len;
-                        dc->patterns[i].not_eol = 1;
-                        shorter_len = re_match (&dc->patterns[i], beg,
-                                                match + len - ptr, match - beg,
-                                                &dc->regs);
-                        if (shorter_len < -1)
-                          xalloc_die ();
-                      }
-                    if (0 < shorter_len)
-                      len = shorter_len;
-                    else
-                      {
-                        /* Try looking further on. */
-                        if (match == end - 1)
-                          break;
-                        match++;
-                        dc->patterns[i].not_eol = 0;
-                        start = re_search (&dc->patterns[i], beg, end - beg - 1,
-                                           match - beg, end - match - 1,
-                                           &dc->regs);
-                        if (start < 0)
-                          {
-                            if (start < -1)
-                              xalloc_die ();
-                            break;
-                          }
-                        len = dc->regs.end[0] - start;
-                        match = beg + start;
-                      }
-                  } /* while (match <= best_match) */
+              if (!match_lines && match_words
+                  && regex_shrink_to_word_boundaries (dc, i, beg, end, ptr,
+                                                      best_match, &match,
+                                                      &len))
+                goto assess_pattern_match;
               continue;
+
             assess_pattern_match:
               if (!start_ptr)
-                {
-                  /* Good enough for a non-exact match.
-                     No need to look at further patterns, if any.  */
-                  goto success;
-                }
+                goto success;
               if (match < best_match || (match == best_match && len > best_len))
                 {
-                  /* Best exact match:  leftmost, then longest.  */
                   best_match = match;
                   best_len = len;
                 }
-            } /* if re_search >= 0 */
-        } /* for Regex patterns.  */
-        if (best_match < end)
-          {
-            /* We have found an exact match.  We were just
-               waiting for the best one (leftmost then longest).  */
-            beg = best_match;
-            len = best_len;
-            goto success_in_len;
-          }
-    } /* for (beg = end ..) */
+            }
+        }
+      if (best_match < end)
+        {
+          beg = best_match;
+          len = best_len;
+          goto success_in_len;
+        }
+    }
 
   return -1;
 

@@ -2173,6 +2173,96 @@ grepbuf (char *beg, char const *lim)
 static void walk_maybe_recruit (void);
 static bool walk_bin_scan (char const *map, size_t size, size_t scan_offset);
 
+/* Record that a quiet match in the current file satisfied the search,
+   exiting immediately when unbuffered -q is active.  */
+static inline _GL_ATTRIBUTE_ALWAYS_INLINE void
+grep_mark_quiet_match_used (void)
+{
+  if (list_files == LISTFILES_NONE)
+    {
+      file_used = true;
+      if (!buffering_enabled)
+        global_used = true;
+      task_had_prtext = true;
+      if (exit_on_match && !buffering_enabled)
+        {
+          atomic_store (&skip_clean_up_stdout, true);
+          exit (EXIT_SUCCESS);
+        }
+    }
+}
+
+/* Complete a single-buffer file scan when the deferred-nulls pre-scan
+   found a match at DEFER_OFF and the buffer contains no NUL bytes.  */
+static inline _GL_ATTRIBUTE_ALWAYS_INLINE void
+grep_finish_defer_nulls (ptrdiff_t defer_off, intmax_t *nlines_inout,
+                         bool *ineof_out)
+{
+  if (list_files == LISTFILES_MATCHING
+      || (done_on_match && out_quiet && !count_matches))
+    {
+      grep_mark_quiet_match_used ();
+      *nlines_inout = 1;
+      *ineof_out = true;
+      return;
+    }
+
+  lastnl = bufbeg;
+  if (lastout)
+    lastout = bufbeg;
+  char *beg = (out_before <= 0) ? bufbeg + defer_off : bufbeg;
+  char *lim = buflim;
+  if (outleft)
+    *nlines_inout += grepbuf (beg, lim);
+  if (pending)
+    prpending (lim);
+  *ineof_out = true;
+}
+
+/* When scanning a large regular file in quiet/done_on_match mode (-q or
+   binary match probing) where NUL zapping does not affect literal -F
+   matches, mmap and scan the remainder of FD directly.  Return true if
+   the mmap scan completed the file.  */
+static inline _GL_ATTRIBUTE_ALWAYS_INLINE bool
+grep_try_fast_binary_mmap (int fd, struct stat *st, idx_t residue,
+                           intmax_t *nlines_inout)
+{
+  if (st->st_size < 0)
+    fstat (fd, st);
+  if (!S_ISREG (st->st_mode) || st->st_size < 2 * 1024 * 1024)
+    return false;
+
+  if (walk_cur_task)
+    walk_split_rest ();
+  size_t scan_start = (size_t) bufoffset - (size_t) residue;
+  char const *map = mmap (nullptr, st->st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (map == MAP_FAILED)
+    return false;
+
+#ifdef MADV_SEQUENTIAL
+  madvise ((void *) map, st->st_size, MADV_SEQUENTIAL);
+#elif defined POSIX_MADV_SEQUENTIAL
+  posix_madvise ((void *) map, st->st_size, POSIX_MADV_SEQUENTIAL);
+#endif
+  if (walk_cur_task && st->st_size >= 16 * 1024 * 1024 && pool_target > 1)
+    {
+      if (walk_bin_scan (map, st->st_size, scan_start))
+        *nlines_inout = 1;
+    }
+  else if (scan_start < (size_t) st->st_size)
+    {
+      idx_t msize = 0;
+      ptrdiff_t off = execute (compiled_pattern, map + scan_start,
+                               st->st_size - scan_start, &msize, nullptr);
+      if (off >= 0)
+        *nlines_inout = 1;
+    }
+  munmap ((void *) map, st->st_size);
+  if (*nlines_inout > 0)
+    grep_mark_quiet_match_used ();
+  return true;
+}
+
 /* Search a given (non-directory) file.  Return a count of lines printed.
    Set *INEOF to true if end-of-file reached.  */
 static intmax_t
@@ -2255,36 +2345,7 @@ grep (int fd, struct stat *st, bool *ineof)
 
       if (defer_off >= 0 && nlines_first_null < 0)
         {
-          if (list_files == LISTFILES_MATCHING
-              || (done_on_match && out_quiet && !count_matches))
-            {
-              if (list_files == LISTFILES_NONE)
-                {
-                  file_used = true;
-                  if (!buffering_enabled)
-                    global_used = true;
-                  task_had_prtext = true;
-                  if (exit_on_match && !buffering_enabled)
-                    {
-                      atomic_store (&skip_clean_up_stdout, true);
-                      exit (EXIT_SUCCESS);
-                    }
-                }
-              nlines = 1;
-              *ineof = true;
-              goto finish_grep;
-            }
-          lastnl = bufbeg;
-          if (lastout)
-            lastout = bufbeg;
-          char *beg = (out_before <= 0) ? bufbeg + defer_off : bufbeg;
-          char *lim = buflim;
-          residue = 0;
-          if (outleft)
-            nlines += grepbuf (beg, lim);
-          if (pending)
-            prpending (lim);
-          *ineof = true;
+          grep_finish_defer_nulls (defer_off, &nlines, ineof);
           goto finish_grep;
         }
 
@@ -2331,53 +2392,9 @@ grep (int fd, struct stat *st, bool *ineof)
             goto finish_grep;
         }
 
-      if (can_fast_mmap && firsttime && !eof_known)
-        {
-          if (st->st_size < 0)
-            fstat (fd, st);
-          if (S_ISREG (st->st_mode) && st->st_size >= 2 * 1024 * 1024)
-            {
-              if (walk_cur_task)
-                walk_split_rest ();
-              size_t scan_start = (size_t) bufoffset - (size_t) residue;
-              char const *map = mmap (nullptr, st->st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-              if (map != MAP_FAILED)
-                {
-#ifdef MADV_SEQUENTIAL
-                  madvise ((void *) map, st->st_size, MADV_SEQUENTIAL);
-#elif defined POSIX_MADV_SEQUENTIAL
-                  posix_madvise ((void *) map, st->st_size, POSIX_MADV_SEQUENTIAL);
-#endif
-                  if (walk_cur_task && st->st_size >= 16 * 1024 * 1024 && pool_target > 1)
-                    {
-                      if (walk_bin_scan (map, st->st_size, scan_start))
-                        nlines = 1;
-                    }
-                  else if (scan_start < (size_t) st->st_size)
-                    {
-                      idx_t msize = 0;
-                      ptrdiff_t off = execute (compiled_pattern, map + scan_start,
-                                               st->st_size - scan_start, &msize, nullptr);
-                      if (off >= 0)
-                        nlines = 1;
-                    }
-                  munmap ((void *) map, st->st_size);
-                  if (nlines > 0 && list_files == LISTFILES_NONE)
-                    {
-                      file_used = true;
-                      if (!buffering_enabled)
-                        global_used = true;
-                      task_had_prtext = true;
-                      if (exit_on_match && !buffering_enabled)
-                        {
-                          atomic_store (&skip_clean_up_stdout, true);
-                          exit (EXIT_SUCCESS);
-                        }
-                    }
-                  goto finish_grep;
-                }
-            }
-        }
+      if (can_fast_mmap && firsttime && !eof_known
+          && grep_try_fast_binary_mmap (fd, st, residue, &nlines))
+        goto finish_grep;
 
       /* The last OUT_BEFORE lines at the end of the buffer will be needed as
          leading context if there is a matching line at the begin of the
@@ -4656,6 +4673,82 @@ worker_run_file_chunk (struct work_task const *task, bool *status_out,
   filename = nullptr;
 }
 
+/* Populate ROB slot for TASK with the current worker's TLS output and
+   status, then attempt to commit completed ROB slots in order.
+   POOL_MUTEX must be held.  */
+static inline _GL_ATTRIBUTE_ALWAYS_INLINE void
+rob_complete_worker_slot_locked (struct work_task const *task, bool status,
+                                 intmax_t chunk_matched_cnt, bool enc_error,
+                                 char *copy_out)
+{
+  if (task->chunk_free_data)
+    free_slice_buf_locked ((char *) (task->chunk_data - 1));
+
+  struct rob_slot *slot = &rob[task->seq % ROB_CAP];
+  slot->status = status;
+  slot->errseen = tls_errseen;
+  slot->had_prtext = task_had_prtext;
+  slot->sep = task_sep;
+  slot->chunk_count = chunk_matched_cnt;
+  slot->enc_error = enc_error;
+  if (tls_big.len)
+    {
+      slot->big = ximemdup (tls_big.data, tls_big.len);
+      slot->nbig = tls_big.len / (2 * sizeof (size_t));
+    }
+  if (task->type == TASK_TYPE_CHUNK || task->type == TASK_TYPE_STREAM_CHUNK)
+    {
+      slot->is_chunk = true;
+      slot->is_last_chunk = task->is_last_chunk;
+      slot->is_stream_chunk = task->type == TASK_TYPE_STREAM_CHUNK;
+    }
+
+  if (tls_out.len > 0)
+    {
+      if (tls_out.len <= sizeof slot->inline_out)
+        {
+          memcpy (slot->inline_out, tls_out.data, tls_out.len);
+          slot->stdout_buf = nullptr;
+          slot->stdout_len = tls_out.len;
+          slot->stdout_cap = sizeof slot->inline_out;
+          tls_out.len = 0;
+        }
+      else if (copy_out)
+        {
+          slot->stdout_buf = copy_out;
+          slot->stdout_len = tls_out.len;
+          slot->stdout_cap = tls_out.len;
+          tls_out.len = 0;
+        }
+      else
+        {
+          slot->stdout_buf = tls_out.data;
+          slot->stdout_len = tls_out.len;
+          slot->stdout_cap = tls_out.cap;
+          tls_out.data = nullptr;
+          tls_out.len = 0;
+          tls_out.cap = 0;
+          membuf_init (&tls_out, 64 * 1024);
+        }
+    }
+
+  if (tls_err.len > 0)
+    {
+      slot->stderr_buf = tls_err.data;
+      slot->stderr_len = tls_err.len;
+      slot->stderr_cap = tls_err.cap;
+      tls_err.data = nullptr;
+      tls_err.len = 0;
+      tls_err.cap = 0;
+      membuf_init (&tls_err, 4096);
+    }
+
+  slot->state = ROB_SLOT_DONE;
+  if (task->type == TASK_TYPE_CHUNK && task->mode != CHUNK_MODE_LINE_NUMBER)
+    chunk_slot_done_locked (task->shared_state);
+  rob_try_commit_locked ();
+}
+
 static void *
 worker_thread_func (void *arg)
 {
@@ -4733,73 +4826,8 @@ worker_thread_func (void *arg)
         }
 
       pthread_mutex_lock (&pool_mutex);
-
-      if (task.chunk_free_data)
-        free_slice_buf_locked ((char *) (task.chunk_data - 1));
-
-      struct rob_slot *slot = &rob[task.seq % ROB_CAP];
-      slot->status = status;
-      slot->errseen = tls_errseen;
-      slot->had_prtext = task_had_prtext;
-      slot->sep = task_sep;
-      slot->chunk_count = chunk_matched_cnt;
-      slot->enc_error = enc_error;
-      if (tls_big.len)
-        {
-          slot->big = ximemdup (tls_big.data, tls_big.len);
-          slot->nbig = tls_big.len / (2 * sizeof (size_t));
-        }
-      if (task.type == TASK_TYPE_CHUNK || task.type == TASK_TYPE_STREAM_CHUNK)
-        {
-          slot->is_chunk = true;
-          slot->is_last_chunk = task.is_last_chunk;
-          slot->is_stream_chunk = task.type == TASK_TYPE_STREAM_CHUNK;
-        }
-
-      if (tls_out.len > 0)
-        {
-          if (tls_out.len <= sizeof slot->inline_out)
-            {
-              memcpy (slot->inline_out, tls_out.data, tls_out.len);
-              slot->stdout_buf = nullptr;
-              slot->stdout_len = tls_out.len;
-              slot->stdout_cap = sizeof slot->inline_out;
-              tls_out.len = 0;
-            }
-          else if (copy_out)
-            {
-              slot->stdout_buf = copy_out;
-              slot->stdout_len = tls_out.len;
-              slot->stdout_cap = tls_out.len;
-              tls_out.len = 0;
-            }
-          else
-            {
-              slot->stdout_buf = tls_out.data;
-              slot->stdout_len = tls_out.len;
-              slot->stdout_cap = tls_out.cap;
-              tls_out.data = nullptr;
-              tls_out.len = 0;
-              tls_out.cap = 0;
-              membuf_init (&tls_out, 64 * 1024);
-            }
-        }
-
-      if (tls_err.len > 0)
-        {
-          slot->stderr_buf = tls_err.data;
-          slot->stderr_len = tls_err.len;
-          slot->stderr_cap = tls_err.cap;
-          tls_err.data = nullptr;
-          tls_err.len = 0;
-          tls_err.cap = 0;
-          membuf_init (&tls_err, 4096);
-        }
-
-      slot->state = ROB_SLOT_DONE;
-      if (task.type == TASK_TYPE_CHUNK && task.mode != CHUNK_MODE_LINE_NUMBER)
-        chunk_slot_done_locked (task.shared_state);
-      rob_try_commit_locked ();
+      rob_complete_worker_slot_locked (&task, status, chunk_matched_cnt,
+                                       enc_error, copy_out);
     }
 
   membuf_free (&tls_out);
@@ -5380,59 +5408,56 @@ enqueue_single_pass_chunks (struct chunk_file_state *state,
 
 static void stream_slicer_stdin (void);
 
+/* Before starting the worker pool, try a quick 64 KiB pread on FD for
+   uninverted -q so an immediate match at the start of a large file can
+   exit in < 1 ms without spinning up worker threads.  */
 static void
-chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st_in)
+chunk_try_early_quiet_match (int fd, char const *fname, struct stat *st)
 {
-  producer_flush_batch ();
-  struct stat st = *st_in;
-
-  if (exit_on_match && !out_invert && !pool_started)
+  char const *saved_filename = filename;
+  filename = fname;
+  char prebuf[GOOD_READSIZE_MIN + 2 + sizeof (uword)];
+  prebuf[0] = eolbyte;
+  ssize_t n;
+  do
+    n = pread (fd, prebuf + 1, GOOD_READSIZE_MIN, 0);
+  while (n < 0 && errno == EINTR);
+  if (n > 0
+      && (!eolbyte || binary_files == TEXT_BINARY_FILES
+          || (!patterns_have_nul
+              && memchr (prebuf + 1, '\0', n) == nullptr
+              && (binary_files != WITHOUT_MATCH_BINARY_FILES
+                  || !file_must_have_nulls (n, fd, st)))))
     {
-      char const *saved_filename = filename;
-      filename = fname;
-      char prebuf[GOOD_READSIZE_MIN + 2 + sizeof (uword)];
-      prebuf[0] = eolbyte;
-      ssize_t n;
-      do
-        n = pread (fd, prebuf + 1, GOOD_READSIZE_MIN, 0);
-      while (n < 0 && errno == EINTR);
-      if (n > 0
-          && (!eolbyte || binary_files == TEXT_BINARY_FILES
-              || (!patterns_have_nul
-                  && memchr (prebuf + 1, '\0', n) == nullptr
-                  && (binary_files != WITHOUT_MATCH_BINARY_FILES
-                      || !file_must_have_nulls (n, fd, &st)))))
+      char *lim = memrchr (prebuf + 1, eolbyte, n);
+      if (lim)
         {
-          char *lim = memrchr (prebuf + 1, eolbyte, n);
-          if (lim)
+          idx_t scan_len = (lim + 1) - (prebuf + 1);
+          memset (lim + 1, 0, uword_size);
+          idx_t msize = 0;
+          ptrdiff_t off = execute (compiled_pattern, prebuf + 1, scan_len,
+                                   &msize, nullptr);
+          if (off >= 0 && off < scan_len)
             {
-              idx_t scan_len = (lim + 1) - (prebuf + 1);
-              memset (lim + 1, 0, uword_size);
-              idx_t msize = 0;
-              ptrdiff_t off = execute (compiled_pattern, prebuf + 1, scan_len,
-                                       &msize, nullptr);
-              if (off >= 0 && off < scan_len)
-                {
-                  atomic_store (&skip_clean_up_stdout, true);
-                  exit (EXIT_SUCCESS);
-                }
+              atomic_store (&skip_clean_up_stdout, true);
+              exit (EXIT_SUCCESS);
             }
         }
-      filename = saved_filename;
     }
-  ensure_pool ();
+  filename = saved_filename;
+}
 
-  if (!out_quiet && list_files == LISTFILES_NONE && 1 < max_count
-      && S_ISREG (st.st_mode) && SAME_INODE (st, out_stat))
-    {
-      if (close_fd)
-        close (fd);
-      producer_enqueue_msg (0, _("%s: input file is also the output"), fname);
-      producer_enqueue_errseen ();
-      return;
-    }
-
-  size_t file_size = (size_t) st.st_size;
+/* Map FD into memory with one anonymous guard page before and after the
+   file mapping so data[-1] and data[effective_size] can hold eolbyte
+   sentinels.  Return false (and fall back to sequential queueing) if
+   mmap fails or if the file contains NUL bytes.  */
+static bool
+chunk_mmap_file_with_sentinels (int fd, bool close_fd, char const *fname,
+                                struct stat *st, char **base_out,
+                                size_t *total_alloc_out, char **data_out,
+                                size_t *effective_size_out)
+{
+  size_t file_size = (size_t) st->st_size;
   size_t ps = (size_t) pagesize;
   size_t aligned_file_size = (file_size % ps == 0
                               ? file_size
@@ -5443,7 +5468,7 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
   if (base == MAP_FAILED)
     {
       chunked_fallback_enqueue (fd, close_fd, fname);
-      return;
+      return false;
     }
 
   char *data = mmap (base + pagesize, file_size, PROT_READ | PROT_WRITE,
@@ -5452,7 +5477,7 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
     {
       munmap (base, total_alloc);
       chunked_fallback_enqueue (fd, close_fd, fname);
-      return;
+      return false;
     }
 
   data[-1] = eolbyte;
@@ -5463,13 +5488,13 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
   filename = fname;
   bool has_nulls = (eolbyte && binary_files != TEXT_BINARY_FILES
                     && (memchr (data, '\0', MIN (file_size, GOOD_READSIZE_MIN)) != nullptr
-                        || file_must_have_nulls (0, fd, &st)));
+                        || file_must_have_nulls (0, fd, st)));
   filename = saved_filename;
   if (has_nulls)
     {
       munmap (base, total_alloc);
       chunked_fallback_enqueue (fd, close_fd, fname);
-      return;
+      return false;
     }
 
   size_t effective_size = file_size
@@ -5477,9 +5502,21 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
   if (data[effective_size] != eolbyte)
     data[effective_size] = eolbyte;
 
-  size_t num_chunks = pool_nthreads * 2;
-  if (num_chunks > 64)
-    num_chunks = 64;
+  *base_out = base;
+  *total_alloc_out = total_alloc;
+  *data_out = data;
+  *effective_size_out = effective_size;
+  return true;
+}
+
+/* Partition DATA[0..EFFECTIVE_SIZE) into line-aligned chunks and allocate
+   its shared chunk_file_state descriptor.  */
+static struct chunk_file_state *
+chunk_create_state (int fd, bool close_fd, char const *fname,
+                    struct stat const *st, char *base, size_t total_alloc,
+                    char *data, size_t effective_size)
+{
+  size_t num_chunks = MIN ((size_t) pool_nthreads * 2, 64);
   size_t min_chunk_size = 2 * 1024 * 1024;
   if (effective_size / num_chunks < min_chunk_size)
     num_chunks = effective_size / min_chunk_size;
@@ -5511,14 +5548,14 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
   state->base_size = total_alloc;
   state->mmap_data = data;
   state->mmap_size = effective_size;
-  state->file_size = file_size;
+  state->file_size = (size_t) st->st_size;
   state->file_desc = fd;
   state->close_fd = close_fd;
   state->fname = xstrdup (fname);
   state->fname_allocated = true;
   state->num_chunks = num_chunks;
   state->bounds = bounds;
-  state->offset_width = compute_offset_width (&st);
+  state->offset_width = compute_offset_width (st);
   atomic_init (&state->chunks_completed, 0);
   atomic_init (&state->total_count, 0);
   atomic_init (&state->has_match, false);
@@ -5526,31 +5563,27 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
   pthread_mutex_init (&state->done_mutex, NULL);
   pthread_cond_init (&state->done_cv, NULL);
   pthread_mutex_init (&state->match_mutex, NULL);
+  return state;
+}
 
-  /* Case 1: Count / Early Stop / List Files */
-  if (count_matches || exit_on_match || list_files != LISTFILES_NONE)
-    {
-      enqueue_single_pass_chunks (state, fname, CHUNK_MODE_COUNT);
-      return;
-    }
+/* Dispatch Pass-1 TASK_TYPE_MMAP_SCAN tasks for all chunks in STATE, wait
+   for completion, and compute the per-chunk newline prefix sums.  */
+static void
+chunk_run_mmap_scan_pass1 (struct chunk_file_state *state)
+{
+  size_t num_chunks = state->num_chunks;
+  size_t const *bounds = state->bounds;
+  char *data = state->mmap_data;
 
-  /* Case 2: Mode 2: Independent Chunks (!out_line && out_before < 0 && out_after < 0 && max_count == INTMAX_MAX) */
-  if (!out_line && out_before < 0 && out_after < 0 && max_count == INTMAX_MAX)
-    {
-      enqueue_single_pass_chunks (state, fname, CHUNK_MODE_STATELESS);
-      return;
-    }
-
-  /* Case 3: Mode 3 (Line numbers and/or context) */
   state->chunk_nls = xnmalloc (num_chunks, sizeof *state->chunk_nls);
   state->prefix_nls = xnmalloc (num_chunks + 1, sizeof *state->prefix_nls);
-  state->chunk_has_matches = xnmalloc (num_chunks, sizeof *state->chunk_has_matches);
+  state->chunk_has_matches = xnmalloc (num_chunks,
+                                       sizeof *state->chunk_has_matches);
   state->match_cap = (0 <= out_before || 0 <= out_after) ? 65536 : 4096;
   state->matches = xnmalloc (state->match_cap, sizeof *state->matches);
   state->match_count = 0;
   atomic_init (&state->match_overflow, false);
 
-  /* Pass 1: MMAP Scan tasks */
   pthread_mutex_lock (&pool_mutex);
   if (work_queue_wait_space_locked (num_chunks))
     {
@@ -5571,33 +5604,26 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
     }
   pthread_mutex_unlock (&pool_mutex);
 
-  /* Wait for Pass 1 to finish */
   pthread_mutex_lock (&state->done_mutex);
   while (atomic_load (&state->chunks_completed) < num_chunks)
     pthread_cond_wait (&state->done_cv, &state->done_mutex);
   pthread_mutex_unlock (&state->done_mutex);
 
-  if (atomic_load (&state->has_nul))
-    {
-      chunk_sequential_to_rob (fname, state);
-      return;
-    }
-
-  /* Prefix sum of newlines */
   state->prefix_nls[0] = 0;
   for (size_t k = 0; k < num_chunks; ++k)
     state->prefix_nls[k + 1] = state->prefix_nls[k] + state->chunk_nls[k];
+}
 
-  /* Sparse match fast-path (context lines or rare matches with line numbers/byte offsets) */
-  if ((0 <= out_before || 0 <= out_after)
-      || (!out_invert && !count_matches && list_files == LISTFILES_NONE
-          && !atomic_load (&state->match_overflow) && state->match_count < state->match_cap))
-    {
-      format_context_matches_to_rob (fname, state);
-      return;
-    }
+/* Dispatch Pass-2 CHUNK_MODE_LINE_NUMBER tasks for chunks that matched
+   during Pass 1, marking non-matching chunks immediately done in the ROB.  */
+static void
+chunk_enqueue_line_number_pass2 (struct chunk_file_state *state,
+                                 char const *fname)
+{
+  size_t num_chunks = state->num_chunks;
+  size_t const *bounds = state->bounds;
+  char *data = state->mmap_data;
 
-  /* Mode 3A: Line numbers without context */
   pthread_mutex_lock (&pool_mutex);
   if (work_queue_wait_space_locked (num_chunks))
     {
@@ -5647,6 +5673,71 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
 }
 
 static void
+chunked_grep_fd (int fd, bool close_fd, char const *fname,
+                 struct stat const *st_in)
+{
+  producer_flush_batch ();
+  struct stat st = *st_in;
+
+  if (exit_on_match && !out_invert && !pool_started)
+    chunk_try_early_quiet_match (fd, fname, &st);
+  ensure_pool ();
+
+  if (!out_quiet && list_files == LISTFILES_NONE && 1 < max_count
+      && S_ISREG (st.st_mode) && SAME_INODE (st, out_stat))
+    {
+      if (close_fd)
+        close (fd);
+      producer_enqueue_msg (0, _("%s: input file is also the output"), fname);
+      producer_enqueue_errseen ();
+      return;
+    }
+
+  char *base = nullptr;
+  char *data = nullptr;
+  size_t total_alloc = 0;
+  size_t effective_size = 0;
+  if (!chunk_mmap_file_with_sentinels (fd, close_fd, fname, &st,
+                                       &base, &total_alloc,
+                                       &data, &effective_size))
+    return;
+
+  struct chunk_file_state *state
+    = chunk_create_state (fd, close_fd, fname, &st, base, total_alloc,
+                          data, effective_size);
+
+  if (count_matches || exit_on_match || list_files != LISTFILES_NONE)
+    {
+      enqueue_single_pass_chunks (state, fname, CHUNK_MODE_COUNT);
+      return;
+    }
+
+  if (!out_line && out_before < 0 && out_after < 0 && max_count == INTMAX_MAX)
+    {
+      enqueue_single_pass_chunks (state, fname, CHUNK_MODE_STATELESS);
+      return;
+    }
+
+  chunk_run_mmap_scan_pass1 (state);
+  if (atomic_load (&state->has_nul))
+    {
+      chunk_sequential_to_rob (fname, state);
+      return;
+    }
+
+  if ((0 <= out_before || 0 <= out_after)
+      || (!out_invert && !count_matches && list_files == LISTFILES_NONE
+          && !atomic_load (&state->match_overflow)
+          && state->match_count < state->match_cap))
+    {
+      format_context_matches_to_rob (fname, state);
+      return;
+    }
+
+  chunk_enqueue_line_number_pass2 (state, fname);
+}
+
+static void
 chunked_grep_file (char const *fname, struct stat const *st_in)
 {
   producer_flush_batch ();
@@ -5662,6 +5753,128 @@ chunked_grep_file (char const *fname, struct stat const *st_in)
       return;
     }
   chunked_grep_fd (fd, true, fname, st_in);
+}
+
+/* Allocate a slice buffer, prepend RESIDUE_BUF[0..RESIDUE_LEN), and read
+   from STDIN_FILENO until at least one complete line is buffered or EOF/error
+   is reached.  */
+static inline _GL_ATTRIBUTE_ALWAYS_INLINE char *
+stream_read_next_slice (char const *residue_buf, size_t residue_len,
+                        size_t *total_in_buf_out, bool *is_eof_out,
+                        int *read_err_out)
+{
+  pthread_mutex_lock (&pool_mutex);
+  char *chunk_alloc = alloc_slice_buf_locked ();
+  pthread_mutex_unlock (&pool_mutex);
+
+  chunk_alloc[0] = eolbyte;
+  char *chunk_data = chunk_alloc + 1;
+
+  if (residue_len > 0)
+    memcpy (chunk_data, residue_buf, residue_len);
+
+  size_t total_in_buf = residue_len;
+  size_t slice_cap = SLICE_BUF_SIZE;
+  bool is_eof = false;
+  int read_err = 0;
+
+  while (total_in_buf < slice_cap)
+    {
+      ssize_t nread = safe_read (STDIN_FILENO, chunk_data + total_in_buf,
+                                 slice_cap - total_in_buf);
+      if (nread <= 0)
+        {
+          if (nread < 0)
+            read_err = errno;
+          is_eof = true;
+          break;
+        }
+      total_in_buf += nread;
+    }
+
+  while (!is_eof && memrchr (chunk_data, eolbyte, total_in_buf) == nullptr)
+    {
+      slice_cap *= 2;
+      chunk_alloc = grow_slice_buf (chunk_alloc, total_in_buf, slice_cap);
+      chunk_data = chunk_alloc + 1;
+      while (total_in_buf < slice_cap)
+        {
+          ssize_t nread = safe_read (STDIN_FILENO, chunk_data + total_in_buf,
+                                     slice_cap - total_in_buf);
+          if (nread <= 0)
+            {
+              if (nread < 0)
+                read_err = errno;
+              is_eof = true;
+              break;
+            }
+          size_t old_pos = total_in_buf;
+          total_in_buf += nread;
+          if (memchr (chunk_data + old_pos, eolbyte, (size_t) nread) != nullptr)
+            break;
+        }
+    }
+
+  *total_in_buf_out = total_in_buf;
+  *is_eof_out = is_eof;
+  *read_err_out = read_err;
+  return chunk_alloc;
+}
+
+/* Enqueue a line-aligned stdin slice [CHUNK_DATA, CHUNK_DATA + CHUNK_LEN)
+   into the ROB and worker queue.  Return false if the pool terminated
+   while waiting for queue space.  */
+static inline _GL_ATTRIBUTE_ALWAYS_INLINE bool
+stream_enqueue_slice_task (char *chunk_alloc, char *chunk_data,
+                           size_t chunk_len, intmax_t stream_totalcc,
+                           bool chunk_is_last)
+{
+  chunk_data[chunk_len] = eolbyte;
+  memset (chunk_data + chunk_len + 1, 0, uword_size);
+
+  pthread_mutex_lock (&pool_mutex);
+
+  while (next_seq - commit_seq >= 56 && !pool_terminate)
+    {
+      rob_try_commit_locked ();
+      if (next_seq - commit_seq < 56)
+        break;
+      rob_space_waiters++;
+      pthread_cond_wait (&rob_space_cv, &pool_mutex);
+      rob_space_waiters--;
+    }
+
+  uint64_t seq = producer_alloc_slot_locked ();
+  struct rob_slot *slot = &rob[seq % ROB_CAP];
+  slot->is_chunk = true;
+  slot->is_last_chunk = chunk_is_last;
+  if (chunk_is_last)
+    slot->filename = label ? xstrdup (label) : nullptr;
+
+  if (!work_queue_wait_space_locked (1))
+    {
+      free_slice_buf_locked (chunk_alloc);
+      pthread_mutex_unlock (&pool_mutex);
+      return false;
+    }
+
+  struct work_task t = {
+    .type = TASK_TYPE_STREAM_CHUNK,
+    .seq = seq,
+    .filename = nullptr,
+    .chunk_data = chunk_data,
+    .chunk_len = chunk_len,
+    .chunk_totalcc = stream_totalcc,
+    .chunk_lineno_offset = 0,
+    .chunk_free_data = true,
+    .is_last_chunk = chunk_is_last,
+    .shared_state = nullptr
+  };
+  work_queue_push_locked (&t);
+
+  pthread_cond_signal (&q_not_empty_cv);
+  pthread_mutex_unlock (&pool_mutex);
+  return true;
 }
 
 static void
@@ -5689,58 +5902,13 @@ stream_slicer_stdin (void)
 
   while (true)
     {
-      pthread_mutex_lock (&pool_mutex);
-      char *chunk_alloc = alloc_slice_buf_locked ();
-      pthread_mutex_unlock (&pool_mutex);
-
-      chunk_alloc[0] = eolbyte;
-      char *chunk_data = chunk_alloc + 1;
-
-      if (residue_len > 0)
-        memcpy (chunk_data, residue_buf, residue_len);
-
-      size_t total_in_buf = residue_len;
-      size_t slice_cap = SLICE_BUF_SIZE;
+      size_t total_in_buf = 0;
       bool is_eof = false;
       int read_err = 0;
-
-      while (total_in_buf < slice_cap)
-        {
-          ssize_t nread = safe_read (STDIN_FILENO, chunk_data + total_in_buf,
-                                     slice_cap - total_in_buf);
-          if (nread <= 0)
-            {
-              if (nread < 0)
-                read_err = errno;
-              is_eof = true;
-              break;
-            }
-          total_in_buf += nread;
-        }
-
-      while (!is_eof && memrchr (chunk_data, eolbyte, total_in_buf) == nullptr)
-        {
-          slice_cap *= 2;
-          chunk_alloc = grow_slice_buf (chunk_alloc, total_in_buf, slice_cap);
-          chunk_data = chunk_alloc + 1;
-          while (total_in_buf < slice_cap)
-            {
-              ssize_t nread = safe_read (STDIN_FILENO, chunk_data + total_in_buf,
-                                         slice_cap - total_in_buf);
-              if (nread <= 0)
-                {
-                  if (nread < 0)
-                    read_err = errno;
-                  is_eof = true;
-                  break;
-                }
-              size_t old_pos = total_in_buf;
-              total_in_buf += nread;
-              if (memchr (chunk_data + old_pos, eolbyte, (size_t) nread) != nullptr)
-                break;
-            }
-        }
-
+      char *chunk_alloc = stream_read_next_slice (residue_buf, residue_len,
+                                                  &total_in_buf, &is_eof,
+                                                  &read_err);
+      char *chunk_data = chunk_alloc + 1;
       size_t chunk_len = 0;
       size_t next_residue = 0;
 
@@ -5791,52 +5959,9 @@ stream_slicer_stdin (void)
       if (chunk_len > 0)
         {
           bool chunk_is_last = (is_eof && read_err == 0);
-          chunk_data[chunk_len] = eolbyte;
-          memset (chunk_data + chunk_len + 1, 0, uword_size);
-
-          pthread_mutex_lock (&pool_mutex);
-
-          while (next_seq - commit_seq >= 56 && !pool_terminate)
-            {
-              rob_try_commit_locked ();
-              if (next_seq - commit_seq < 56)
-                break;
-              rob_space_waiters++;
-              pthread_cond_wait (&rob_space_cv, &pool_mutex);
-              rob_space_waiters--;
-            }
-
-          uint64_t seq = producer_alloc_slot_locked ();
-          struct rob_slot *slot = &rob[seq % ROB_CAP];
-          slot->is_chunk = true;
-          slot->is_last_chunk = chunk_is_last;
-          if (chunk_is_last)
-            slot->filename = label ? xstrdup (label) : nullptr;
-
-          if (!work_queue_wait_space_locked (1))
-            {
-              free_slice_buf_locked (chunk_alloc);
-              pthread_mutex_unlock (&pool_mutex);
-              break;
-            }
-
-          struct work_task t = {
-            .type = TASK_TYPE_STREAM_CHUNK,
-            .seq = seq,
-            .filename = nullptr,
-            .chunk_data = chunk_data,
-            .chunk_len = chunk_len,
-            .chunk_totalcc = stream_totalcc,
-            .chunk_lineno_offset = 0,
-            .chunk_free_data = true,
-            .is_last_chunk = chunk_is_last,
-            .shared_state = nullptr
-          };
-          work_queue_push_locked (&t);
-
-          pthread_cond_signal (&q_not_empty_cv);
-          pthread_mutex_unlock (&pool_mutex);
-
+          if (!stream_enqueue_slice_task (chunk_alloc, chunk_data, chunk_len,
+                                          stream_totalcc, chunk_is_last))
+            break;
           stream_totalcc += chunk_len;
         }
       else
@@ -6804,6 +6929,112 @@ static struct walk_task * walk_push_dir (struct walk_dir *d, int fd);
 static void walk_search_files (struct walk_task *t);
 static void walk_commit (void);
 
+/* Open directory entry E of parent directory P (with full path PATH),
+   handling logical/physical symlink rules, exclusion checks, and directory
+   loop detection.  Store the directory's stat in *ST_OUT and return its
+   file descriptor, or -1 if the entry was skipped, failed, or searched
+   as a non-directory file.  */
+static inline _GL_ATTRIBUTE_ALWAYS_INLINE int
+walk_open_dir_entry (struct walk_dir *p, struct walk_ent *e, char const *path,
+                     struct stat *st_out)
+{
+  bool root = !p->parent;
+  int fd;
+
+  if (walk.logical)
+    {
+      if (!root)
+        {
+          if (stat (path, st_out) != 0)
+            {
+              int err = errno;
+              if (err == ENOENT && lstat (path, st_out) == 0)
+                goto search_as_file;
+              walk_ent_stat_error (p, e, err);
+              return -1;
+            }
+          if (!S_ISDIR (st_out->st_mode))
+            goto search_as_file;
+          if (skipped_file (e->name, false, true))
+            return -1;
+          if (walk_is_loop (p, st_out->st_dev, st_out->st_ino))
+            {
+              walk_ent_loop (p, e);
+              return -1;
+            }
+        }
+      fd = walk_fd_safer (open (path, WALK_DIR_FLAGS));
+      if (fd < 0)
+        {
+          walk_ent_error (p, e, errno);
+          return -1;
+        }
+    }
+  else if (root)
+    {
+      fd = walk_fd_safer (open (path, WALK_DIR_FLAGS));
+      if (fd < 0)
+        {
+          walk_ent_error (p, e, errno);
+          return -1;
+        }
+    }
+  else
+    {
+      int pfd = walk_dir_fd (p);
+      if (pfd < 0)
+        {
+          walk_ent_error (p, e, errno);
+          return -1;
+        }
+      if (skipped_file (e->name, false, true))
+        {
+          if (fstatat (pfd, e->name, st_out, AT_SYMLINK_NOFOLLOW) != 0)
+            walk_ent_stat_error (p, e, errno);
+          return -1;
+        }
+      fd = walk_fd_safer (openat (pfd, e->name, WALK_DIR_FLAGS | O_NOFOLLOW));
+      if (fd < 0)
+        {
+          int err = errno;
+          if (fstatat (pfd, e->name, st_out, AT_SYMLINK_NOFOLLOW) != 0)
+            walk_ent_stat_error (p, e, errno);
+          else if (!S_ISDIR (st_out->st_mode))
+            goto search_as_file;
+          else if (walk_is_loop (p, st_out->st_dev, st_out->st_ino))
+            walk_ent_loop (p, e);
+          else
+            walk_ent_error (p, e, err);
+          return -1;
+        }
+    }
+
+  if (fstat (fd, st_out) != 0)
+    {
+      int err = errno;
+      close (fd);
+      walk_ent_error (p, e, err);
+      return -1;
+    }
+  if (!root && !walk.logical && walk_is_loop (p, st_out->st_dev, st_out->st_ino))
+    {
+      close (fd);
+      walk_ent_loop (p, e);
+      return -1;
+    }
+  return fd;
+
+ search_as_file:
+  if (!skipped_file (e->name, false, false)
+      && !S_ISLNK (st_out->st_mode)
+      && !(skip_devices (false) && is_device_mode (st_out->st_mode)))
+    {
+      e->kind = WALK_FILE;
+      walk_search (p, walk.logical ? AT_FDCWD : walk_dir_fd (p), e, false);
+    }
+  return -1;
+}
+
 /* Read the directory named by entry PINDEX of P, as fts would when it
    reaches that entry, and record what to commit for it.  */
 static struct walk_task *
@@ -6813,91 +7044,9 @@ walk_read_dir (struct walk_dir *p, size_t pindex)
   bool root = !p->parent;
   char *path = walk_ent_path (p, e);
   struct stat st;
-  int fd;
-
-  if (walk.logical)
-    {
-      if (!root)
-        {
-          if (stat (path, &st) != 0)
-            {
-              int err = errno;
-              if (err == ENOENT && lstat (path, &st) == 0)
-                goto search_as_file;
-              walk_ent_stat_error (p, e, err);
-              return nullptr;
-            }
-          if (!S_ISDIR (st.st_mode))
-            goto search_as_file;
-          if (skipped_file (e->name, false, true))
-            return nullptr;
-          if (walk_is_loop (p, st.st_dev, st.st_ino))
-            {
-              walk_ent_loop (p, e);
-              return nullptr;
-            }
-        }
-      fd = walk_fd_safer (open (path, WALK_DIR_FLAGS));
-      if (fd < 0)
-        {
-          walk_ent_error (p, e, errno);
-          return nullptr;
-        }
-    }
-  else if (root)
-    {
-      fd = walk_fd_safer (open (path, WALK_DIR_FLAGS));
-      if (fd < 0)
-        {
-          walk_ent_error (p, e, errno);
-          return nullptr;
-        }
-    }
-  else
-    {
-      int pfd = walk_dir_fd (p);
-      if (pfd < 0)
-        {
-          walk_ent_error (p, e, errno);
-          return nullptr;
-        }
-      if (skipped_file (e->name, false, true))
-        {
-          /* fts would stat it first, and grep would treat it as a file
-             if that failed.  */
-          if (fstatat (pfd, e->name, &st, AT_SYMLINK_NOFOLLOW) != 0)
-            walk_ent_stat_error (p, e, errno);
-          return nullptr;
-        }
-      fd = walk_fd_safer (openat (pfd, e->name, WALK_DIR_FLAGS | O_NOFOLLOW));
-      if (fd < 0)
-        {
-          int err = errno;
-          if (fstatat (pfd, e->name, &st, AT_SYMLINK_NOFOLLOW) != 0)
-            walk_ent_stat_error (p, e, errno);
-          else if (!S_ISDIR (st.st_mode))
-            goto search_as_file;
-          else if (walk_is_loop (p, st.st_dev, st.st_ino))
-            walk_ent_loop (p, e);
-          else
-            walk_ent_error (p, e, err);
-          return nullptr;
-        }
-    }
-
-  if (fstat (fd, &st) != 0)
-    {
-      int err = errno;
-      close (fd);
-      walk_ent_error (p, e, err);
-      return nullptr;
-    }
-  if (!root && !walk.logical && walk_is_loop (p, st.st_dev, st.st_ino))
-    {
-      close (fd);
-      walk_ent_loop (p, e);
-      return nullptr;
-    }
+  int fd = walk_open_dir_entry (p, e, path, &st);
+  if (fd < 0)
+    return nullptr;
 
   size_t plen = strlen (path);
   if (root && 2 < plen && path[plen - 1] == '/')
@@ -6929,18 +7078,6 @@ walk_read_dir (struct walk_dir *p, size_t pindex)
   walk_classify (d, fd);
   e->sub = d;
   return walk_push_dir (d, fd);
-
- search_as_file:
-  /* The entry is no longer a directory.  Search it as grepdirent would
-     search a file of that type.  */
-  if (!skipped_file (e->name, false, false)
-      && !S_ISLNK (st.st_mode)
-      && ! (skip_devices (false) && is_device_mode (st.st_mode)))
-    {
-      e->kind = WALK_FILE;
-      walk_search (p, walk.logical ? AT_FDCWD : walk_dir_fd (p), e, false);
-    }
-  return nullptr;
 }
 
 /* Queue the tasks for the entries of the directory D, which has just
@@ -8098,70 +8235,145 @@ compute_worker_threads (char *const *files)
   return nthreads;
 }
 
-int
-main (int argc, char **argv)
+/* Append a command-line -e pattern argument ARG to *KEYS_INOUT.  */
+static void
+append_pattern_option_e (char **keys_inout, idx_t *keycc_inout,
+                         idx_t *keyalloc_inout, char const *arg)
 {
-  char *keys = nullptr;
-  idx_t keycc = 0, keyalloc = 0;
-  int matcher = -1;
-  int opt;
-  int prev_optind, last_recursive;
-  intmax_t default_context;
+  char *keys = *keys_inout;
+  idx_t keycc = *keycc_inout;
+  idx_t keyalloc = *keyalloc_inout;
+  idx_t cc = strlen (arg);
+  ptrdiff_t shortage = keycc - keyalloc + cc + 1;
+  if (0 < shortage)
+    pattern_array = keys = xpalloc (keys, &keyalloc, shortage, -1, 1);
+  char *keyend = mempcpy (keys + keycc, arg, cc);
+  *keyend = '\n';
+  *keys_inout = keys;
+  *keyalloc_inout = keyalloc;
+  *keycc_inout = update_patterns (keys, keycc, keycc + cc + 1, "");
+}
+
+/* Append patterns from file ARG (or stdin if "-") to *KEYS_INOUT.  */
+static void
+append_pattern_option_f (char **keys_inout, idx_t *keycc_inout,
+                         idx_t *keyalloc_inout, char const *arg)
+{
+  char *keys = *keys_inout;
+  idx_t keycc = *keycc_inout;
+  idx_t keyalloc = *keyalloc_inout;
   FILE *fp;
-  exit_failure = EXIT_TROUBLE;
-  initialize_main (&argc, &argv);
 
-  /* Which command-line options have been specified for filename output.
-     -1 for -h, 1 for -H, 0 for neither.  */
-  int filename_option = 0;
+  if (STREQ (arg, "-"))
+    {
+      if (binary)
+        xset_binary_mode (STDIN_FILENO, O_BINARY);
+      fp = stdin;
+    }
+  else
+    {
+      fp = fopen (arg, binary ? "rb" : "r");
+      if (!fp)
+        die (EXIT_TROUBLE, errno, "%s", arg);
+    }
 
-  eolbyte = '\n';
-  filename_mask = ~0;
+  idx_t newkeycc = keycc, cc;
+  for (;; newkeycc += cc)
+    {
+      ptrdiff_t shortage = newkeycc - keyalloc + 2;
+      if (0 < shortage)
+        pattern_array = keys = xpalloc (keys, &keyalloc, shortage, -1, 1);
+      cc = fread (keys + newkeycc, 1, keyalloc - (newkeycc + 1), fp);
+      if (cc == 0)
+        break;
+    }
 
-  max_count = INTMAX_MAX;
+  int err = errno;
+  if (!ferror (fp))
+    {
+      err = 0;
+      if (fp == stdin)
+        clearerr (fp);
+      else if (fclose (fp) != 0)
+        err = errno;
+    }
+  if (err)
+    die (EXIT_TROUBLE, err, "%s", arg);
 
-  /* The value -1 means to use DEFAULT_CONTEXT. */
-  out_after = out_before = -1;
-  /* Default before/after context: changed by -C/-NUM options */
-  default_context = -1;
-  /* Changed by -o option */
-  only_matching = false;
+  if (newkeycc != keycc && keys[newkeycc - 1] != '\n')
+    keys[newkeycc++] = '\n';
 
-  /* Internationalization. */
-#if defined HAVE_SETLOCALE
-  setlocale (LC_ALL, "");
-#endif
-#if defined ENABLE_NLS
-  bindtextdomain (PACKAGE, LOCALEDIR);
-  bindtextdomain ("gnulib", GNULIB_LOCALEDIR);
-  textdomain (PACKAGE);
-#endif
+  *keys_inout = keys;
+  *keyalloc_inout = keyalloc;
+  *keycc_inout = update_patterns (keys, keycc, newkeycc, arg);
+}
 
-  init_localeinfo (&localeinfo);
+static void
+parse_color_option (char const *arg)
+{
+  if (!arg)
+    {
+      color_option = 2;
+      return;
+    }
+  if (!c_strcasecmp (arg, "always")
+      || !c_strcasecmp (arg, "yes")
+      || !c_strcasecmp (arg, "force"))
+    color_option = 1;
+  else if (!c_strcasecmp (arg, "never")
+           || !c_strcasecmp (arg, "no")
+           || !c_strcasecmp (arg, "none"))
+    color_option = 0;
+  else if (!c_strcasecmp (arg, "auto")
+           || !c_strcasecmp (arg, "tty")
+           || !c_strcasecmp (arg, "if-tty"))
+    color_option = 2;
+  else
+    show_help = 1;
+}
 
-  /* The mbrlen and mbrtowc replacements may cache facts about the
-     locale when first called.  Call mbrlen now, so that worker threads
-     do not race to fill in the cache.  */
-  {
-    mbstate_t mbs; mbszero (&mbs);
-    mbrlen ("", 1, &mbs);
-  }
+static void
+add_file_exclude_pattern (int opt, char const *arg)
+{
+  if (opt == EXCLUDE_OPTION)
+    use_simple_includes = false;
+  else if (use_simple_includes)
+    {
+      if (arg[0] == '*' && arg[1] == '.'
+          && strpbrk (arg + 1, "*?[\\]") == nullptr
+          && num_simple_includes < 16)
+        {
+          simple_includes[num_simple_includes++] = (struct simple_include) {
+            arg + 1, strlen (arg + 1)
+          };
+        }
+      else
+        use_simple_includes = false;
+    }
 
-  atexit (clean_up_stdout);
-  c_stack_action (nullptr);
+  for (int cmd = 0; cmd < 2; cmd++)
+    {
+      if (!excluded_patterns[cmd])
+        excluded_patterns[cmd] = new_exclude ();
+      add_exclude (excluded_patterns[cmd], arg,
+                   ((opt == INCLUDE_OPTION ? EXCLUDE_INCLUDE : 0)
+                    | exclude_options (cmd)));
+    }
+}
 
-  last_recursive = 0;
-
-  pattern_table = hash_initialize (0, nullptr, hash_pattern, compare_patterns,
-                                   nullptr);
-  if (!pattern_table)
-    xalloc_die ();
-
-  use_simple_includes = true;
-  num_simple_includes = 0;
+/* Parse command-line options from ARGC/ARGV, updating pattern buffers and
+   mode flags.  */
+static void
+parse_grep_options (int argc, char **argv, char **keys_inout,
+                    idx_t *keycc_inout, idx_t *keyalloc_inout,
+                    int *matcher_inout, int *filename_option_inout,
+                    int *last_recursive_inout, intmax_t *default_context_inout)
+{
+  int opt;
+  int prev_optind;
 
   while (prev_optind = optind,
-         (opt = get_nondigit_option (argc, argv, &default_context)) != -1)
+         (opt = get_nondigit_option (argc, argv, default_context_inout)) != -1)
     switch (opt)
       {
       case 'A':
@@ -8173,9 +8385,7 @@ main (int argc, char **argv)
         break;
 
       case 'C':
-        /* Set output match context, but let any explicit leading or
-           trailing amount specified with -A or -B stand. */
-        context_length_arg (optarg, &default_context);
+        context_length_arg (optarg, default_context_inout);
         break;
 
       case 'D':
@@ -8188,27 +8398,27 @@ main (int argc, char **argv)
         break;
 
       case 'E':
-        matcher = setmatcher ("egrep", matcher);
+        *matcher_inout = setmatcher ("egrep", *matcher_inout);
         break;
 
       case 'F':
-        matcher = setmatcher ("fgrep", matcher);
+        *matcher_inout = setmatcher ("fgrep", *matcher_inout);
         break;
 
       case 'P':
-        matcher = setmatcher ("perl", matcher);
+        *matcher_inout = setmatcher ("perl", *matcher_inout);
         break;
 
       case 'G':
-        matcher = setmatcher ("grep", matcher);
+        *matcher_inout = setmatcher ("grep", *matcher_inout);
         break;
 
       case 'X': /* undocumented on purpose */
-        matcher = setmatcher (optarg, matcher);
+        *matcher_inout = setmatcher (optarg, *matcher_inout);
         break;
 
       case 'H':
-        filename_option = 1;
+        *filename_option_inout = 1;
         break;
 
       case 'I':
@@ -8244,70 +8454,25 @@ main (int argc, char **argv)
         directories = XARGMATCH ("--directories", optarg,
                                  directories_args, directories_types);
         if (directories == RECURSE_DIRECTORIES)
-          last_recursive = prev_optind;
+          *last_recursive_inout = prev_optind;
         break;
 
       case 'e':
-        {
-          idx_t cc = strlen (optarg);
-          ptrdiff_t shortage = keycc - keyalloc + cc + 1;
-          if (0 < shortage)
-            pattern_array = keys = xpalloc (keys, &keyalloc, shortage, -1, 1);
-          char *keyend = mempcpy (keys + keycc, optarg, cc);
-          *keyend = '\n';
-          keycc = update_patterns (keys, keycc, keycc + cc + 1, "");
-        }
+        append_pattern_option_e (keys_inout, keycc_inout, keyalloc_inout,
+                                 optarg);
         break;
 
       case 'f':
-        {
-          if (STREQ (optarg, "-"))
-            {
-              if (binary)
-                xset_binary_mode (STDIN_FILENO, O_BINARY);
-              fp = stdin;
-            }
-          else
-            {
-              fp = fopen (optarg, binary ? "rb" : "r");
-              if (!fp)
-                die (EXIT_TROUBLE, errno, "%s", optarg);
-            }
-          idx_t newkeycc = keycc, cc;
-          for (;; newkeycc += cc)
-            {
-              ptrdiff_t shortage = newkeycc - keyalloc + 2;
-              if (0 < shortage)
-                pattern_array = keys = xpalloc (keys, &keyalloc,
-                                                shortage, -1, 1);
-              cc = fread (keys + newkeycc, 1, keyalloc - (newkeycc + 1), fp);
-              if (cc == 0)
-                break;
-            }
-          int err = errno;
-          if (!ferror (fp))
-            {
-              err = 0;
-              if (fp == stdin)
-                clearerr (fp);
-              else if (fclose (fp) != 0)
-                err = errno;
-            }
-          if (err)
-            die (EXIT_TROUBLE, err, "%s", optarg);
-          /* Append final newline if file ended in non-newline. */
-          if (newkeycc != keycc && keys[newkeycc - 1] != '\n')
-            keys[newkeycc++] = '\n';
-          keycc = update_patterns (keys, keycc, newkeycc, optarg);
-        }
+        append_pattern_option_f (keys_inout, keycc_inout, keyalloc_inout,
+                                 optarg);
         break;
 
       case 'h':
-        filename_option = -1;
+        *filename_option_inout = -1;
         break;
 
       case 'i':
-      case 'y':			/* For old-timers . . . */
+      case 'y':
         match_icase = true;
         break;
 
@@ -8316,8 +8481,6 @@ main (int argc, char **argv)
         break;
 
       case 'L':
-        /* Like -l, except list files that don't contain matches.
-           Inspired by the same option in Hume's gre. */
         list_files = LISTFILES_NONMATCHING;
         break;
 
@@ -8354,7 +8517,7 @@ main (int argc, char **argv)
         FALLTHROUGH;
       case 'r':
         directories = RECURSE_DIRECTORIES;
-        last_recursive = prev_optind;
+        *last_recursive_inout = prev_optind;
         break;
 
       case 's':
@@ -8394,57 +8557,14 @@ main (int argc, char **argv)
         break;
 
       case COLOR_OPTION:
-        if (optarg)
-          {
-            if (!c_strcasecmp (optarg, "always")
-                || !c_strcasecmp (optarg, "yes")
-                || !c_strcasecmp (optarg, "force"))
-              color_option = 1;
-            else if (!c_strcasecmp (optarg, "never")
-                     || !c_strcasecmp (optarg, "no")
-                     || !c_strcasecmp (optarg, "none"))
-              color_option = 0;
-            else if (!c_strcasecmp (optarg, "auto")
-                     || !c_strcasecmp (optarg, "tty")
-                     || !c_strcasecmp (optarg, "if-tty"))
-              color_option = 2;
-            else
-              show_help = 1;
-          }
-        else
-          color_option = 2;
+        parse_color_option (optarg);
         break;
 
       case EXCLUDE_OPTION:
-        use_simple_includes = false;
-        goto handle_exclude;
-
       case INCLUDE_OPTION:
-        if (use_simple_includes)
-          {
-            if (optarg[0] == '*' && optarg[1] == '.'
-                && strpbrk (optarg + 1, "*?[\\]") == nullptr
-                && num_simple_includes < 16)
-              {
-                simple_includes[num_simple_includes++] = (struct simple_include) {
-                  optarg + 1, strlen (optarg + 1)
-                };
-              }
-            else
-              use_simple_includes = false;
-          }
-        goto handle_exclude;
-
-      handle_exclude:
-        for (int cmd = 0; cmd < 2; cmd++)
-          {
-            if (!excluded_patterns[cmd])
-              excluded_patterns[cmd] = new_exclude ();
-            add_exclude (excluded_patterns[cmd], optarg,
-                         ((opt == INCLUDE_OPTION ? EXCLUDE_INCLUDE : 0)
-                          | exclude_options (cmd)));
-          }
+        add_file_exclude_pattern (opt, optarg);
         break;
+
       case EXCLUDE_FROM_OPTION:
         use_simple_includes = false;
         for (int cmd = 0; cmd < 2; cmd++)
@@ -8488,11 +8608,65 @@ main (int argc, char **argv)
       default:
         usage (EXIT_TROUBLE);
         break;
-
       }
 
   if (num_simple_includes == 0)
     use_simple_includes = false;
+}
+
+int
+main (int argc, char **argv)
+{
+  char *keys = nullptr;
+  idx_t keycc = 0, keyalloc = 0;
+  int matcher = -1;
+  int last_recursive = 0;
+  intmax_t default_context = -1;
+  int filename_option = 0;
+
+  exit_failure = EXIT_TROUBLE;
+  initialize_main (&argc, &argv);
+
+  eolbyte = '\n';
+  filename_mask = ~0;
+  max_count = INTMAX_MAX;
+  out_after = out_before = -1;
+  only_matching = false;
+
+  /* Internationalization. */
+#if defined HAVE_SETLOCALE
+  setlocale (LC_ALL, "");
+#endif
+#if defined ENABLE_NLS
+  bindtextdomain (PACKAGE, LOCALEDIR);
+  bindtextdomain ("gnulib", GNULIB_LOCALEDIR);
+  textdomain (PACKAGE);
+#endif
+
+  init_localeinfo (&localeinfo);
+
+  /* The mbrlen and mbrtowc replacements may cache facts about the
+     locale when first called.  Call mbrlen now, so that worker threads
+     do not race to fill in the cache.  */
+  {
+    mbstate_t mbs;
+    mbszero (&mbs);
+    mbrlen ("", 1, &mbs);
+  }
+
+  atexit (clean_up_stdout);
+  c_stack_action (nullptr);
+
+  pattern_table = hash_initialize (0, nullptr, hash_pattern, compare_patterns,
+                                   nullptr);
+  if (!pattern_table)
+    xalloc_die ();
+
+  use_simple_includes = true;
+  num_simple_includes = 0;
+
+  parse_grep_options (argc, argv, &keys, &keycc, &keyalloc, &matcher,
+                      &filename_option, &last_recursive, &default_context);
 
   if (show_version)
     {
@@ -8571,9 +8745,7 @@ main (int argc, char **argv)
 
   char *const *files;
   if (0 < num_operands)
-    {
-      files = argv + optind;
-    }
+    files = argv + optind;
   else if (directories == RECURSE_DIRECTORIES && 0 < last_recursive)
     {
       static char *const cwd_only[] = { (char *) ".", nullptr };
