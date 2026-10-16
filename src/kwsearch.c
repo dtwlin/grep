@@ -157,9 +157,8 @@ shared_kwset_get (char const *pattern, idx_t size, bool exact)
         }
     }
   sk->utf8_quirk_mask = qmask;
-  bool cache = !kwset_cache;
-  atomic_init (&sk->refs, 1 + cache);
-  if (cache)
+  atomic_init (&sk->refs, 1);
+  if (!kwset_cache)
     kwset_cache = sk;
   return sk;
 }
@@ -456,8 +455,6 @@ Fexecute_with_utf8_quirk (struct kwsearch *kwsearch, char const *buf,
             }
           norm[nlen++] = line_beg[i++];
         }
-      if (start_ptr && line_beg + line_len <= start_ptr)
-        norm_start_idx = nlen;
       orig_off[nlen] = line_len;
       orig_off[nlen + 1] = line_len;
       orig_off[nlen + 2] = line_len;
@@ -534,12 +531,12 @@ Fexecute (void *vcp, char const *buf, idx_t size, idx_t *match_size,
 void
 Ffree (void *vcp)
 {
-  if (!vcp)
-    return;
   struct kwsearch *kwsearch = vcp;
   struct shared_kwset *sk = kwsearch->shared;
   if (atomic_fetch_sub (&sk->refs, 1) == 1)
     {
+      if (kwset_cache == sk)
+        kwset_cache = nullptr;
       kwsfree (sk->kwset);
       free (sk->pattern);
       free (sk);

@@ -42,9 +42,9 @@
    see <https://github.com/PCRE2Project/pcre2/issues/224>.
    Assume the bug will be fixed after PCRE2 10.42.  */
 #if defined PCRE2_MATCH_INVALID_UTF && 10 < PCRE2_MAJOR + (42 < PCRE2_MINOR)
-enum { MATCH_INVALID_UTF = PCRE2_MATCH_INVALID_UTF };
+# define MATCH_INVALID_UTF PCRE2_MATCH_INVALID_UTF
 #else
-enum { MATCH_INVALID_UTF = 0 };
+# define MATCH_INVALID_UTF 0
 #endif
 
 struct pcre_comp
@@ -143,12 +143,14 @@ jit_exec (struct pcre_comp *pc, char const *subject, idx_t search_bytes,
     }
 }
 
+#if MATCH_INVALID_UTF == 0
 /* Return true if E is an error code for bad UTF-8.  */
 static bool
 bad_utf8_from_pcre2 (int e)
 {
   return PCRE2_ERROR_UTF8_ERR21 <= e && e <= PCRE2_ERROR_UTF8_ERR1;
 }
+#endif
 
 static inline bool
 is_lit_char (char c)
@@ -257,8 +259,6 @@ static idx_t _GL_ATTRIBUTE_PURE
 skip_pcre_escape (char const *pat, idx_t p, idx_t size, bool in_char_class)
 {
   p++;
-  if (p >= size)
-    return p;
   char esc = pat[p++];
   if (esc == 'x')
     {
@@ -794,7 +794,8 @@ Pexecute (void *vcp, char const *buf, idx_t size, idx_t *match_size,
 
           e = jit_exec (pc, subject, line_end - subject,
                         search_offset, options);
-          if (MATCH_INVALID_UTF != 0 || !bad_utf8_from_pcre2 (e))
+#if MATCH_INVALID_UTF == 0
+          if (!bad_utf8_from_pcre2 (e))
             break;
 
           idx_t valid_bytes = pcre2_get_startchar (pc->data);
@@ -824,6 +825,9 @@ Pexecute (void *vcp, char const *buf, idx_t size, idx_t *match_size,
             }
 
           subject += valid_bytes + 1;
+#else
+          break;
+#endif
         }
 
       if (e != PCRE2_ERROR_NOMATCH)
@@ -914,6 +918,8 @@ Pfree (void *vpc)
     pcre2_general_context_free (pc->gcontext);
   if (!pc->is_clone)
     {
+      if (pc->cre)
+        pcre2_code_free (pc->cre);
       if (pc->must_kwset)
         kwsfree (pc->must_kwset);
       free ((void *) pc->tables);

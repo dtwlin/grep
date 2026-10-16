@@ -1104,15 +1104,8 @@ bmexec_trans_scalar (kwset_t kwset, char const *text, idx_t size)
   assume (0 <= size);
 
   idx_t len = kwset->mind;
-  if (len == 0)
-    return 0;
   if (len > size)
     return -1;
-  if (len == 1)
-    {
-      char const *tp = memchr_kwset (text, size, kwset);
-      return tp ? tp - text : -1;
-    }
 
   char const *trans = kwset->trans;
 

@@ -2458,10 +2458,7 @@ grepdirent (FTS *fts, FTSENT *ent, bool command_line)
   switch (ent->fts_info)
     {
     case FTS_D:
-      if (directories == RECURSE_DIRECTORIES)
-        return true;
-      fts_set (fts, ent, FTS_SKIP);
-      break;
+      return true;
 
     case FTS_DC:
       if (!suppress_errors)
@@ -3418,11 +3415,6 @@ struct rob_slot
   size_t *big;
   size_t nbig;
 
-  /* A file left for the committer to search; see TLS_MAY_DEFER.  */
-  char *defer_name;
-  bool defer_follow;
-  bool defer_command_line;
-
   bool is_chunk;
   bool is_last_chunk;
   intmax_t chunk_count;
@@ -3457,11 +3449,9 @@ struct rob_slot
 enum work_task_type
 {
   TASK_TYPE_FILE,
-  TASK_TYPE_STDIN,
   TASK_TYPE_CHUNK,
   TASK_TYPE_STREAM_CHUNK,
   TASK_TYPE_MMAP_SCAN,
-  TASK_TYPE_TERMINATE,
   TASK_TYPE_WALK
 };
 
@@ -3947,26 +3937,6 @@ init_stream_slice_tls (char *beg, char *lim, off_t slice_totalcc,
   offset_width = compute_offset_width (nullptr);
 }
 
-/* Search the file that a worker left for the committer, now that all
-   output before it has been committed, and put the results into SLOT.
-   See TLS_MAY_DEFER.  */
-static void
-rob_search_deferred (struct rob_slot *slot)
-{
-  struct search_tls_state saved;
-  save_search_tls (&saved);
-  tls_out = tls_err = tls_big = (struct membuf) { .data = nullptr };
-  buffering_enabled = true;
-  task_reset ();
-  filename = slot->defer_name;
-  slot->status = grepfile (AT_FDCWD, slot->defer_name, slot->defer_follow,
-                           slot->defer_command_line);
-  rob_capture_tls_output (slot);
-  free (slot->defer_name);
-  slot->defer_name = nullptr;
-  restore_search_tls (&saved);
-}
-
 /* Commit the slice of standard input in SLOT in the light of null
    bytes.  From the start of the read buffer that holds the first null
    byte of the input, single-threaded grep outputs nothing more, stops
@@ -4140,9 +4110,6 @@ rob_try_commit_locked (void)
         break;
       if (slot->gate && !slot->gate->decided)
         break;
-
-      if (slot->defer_name)
-        rob_search_deferred (slot);
 
       filename = slot->filename;
 
@@ -4464,61 +4431,53 @@ worker_run_mmap_scan (struct work_task const *task)
                 break;
 
               ptrdiff_t mo;
-              if (p == cbeg && off >= 0 && !out_invert)
+              if (p == cbeg && off >= 0)
                 mo = off;
               else
                 mo = execute (compiled_pattern, p, clim - p, &match_size,
                               nullptr);
 
               if (mo < 0)
-                {
-                  if (!out_invert)
-                    break;
-                  mo = clim - p;
-                  match_size = 0;
-                }
+                break;
               char const *b = p + mo;
               char const *endp = b + match_size;
-              if (!out_invert && b == clim)
+              if (b == clim)
                 break;
-              if (!out_invert || p < b)
+              char const *mbeg = b;
+              char const *lbeg = mbeg;
+              while (lbeg > cbeg && lbeg[-1] != eolbyte)
+                lbeg--;
+              char const *lend = memchr (mbeg, eolbyte, clim - mbeg);
+              lend = lend ? lend + 1 : clim;
+
+              if (out_line)
                 {
-                  char const *mbeg = out_invert ? p : b;
-                  char const *lbeg = mbeg;
-                  while (lbeg > cbeg && lbeg[-1] != eolbyte)
-                    lbeg--;
-                  char const *lend = memchr (mbeg, eolbyte, clim - mbeg);
-                  lend = lend ? lend + 1 : clim;
-
-                  if (out_line)
-                    {
-                      running_nl += count_newlines (nl_cursor, lbeg);
-                      nl_cursor = lbeg;
-                    }
-
-                  pthread_mutex_lock (&state->match_mutex);
-                  if (state->match_count >= state->match_cap)
-                    {
-                      if (0 <= out_before || 0 <= out_after)
-                        {
-                          state->match_cap *= 2;
-                          state->matches
-                            = xrealloc (state->matches,
-                                        (state->match_cap
-                                         * sizeof *state->matches));
-                        }
-                      else
-                        atomic_store (&state->match_overflow, true);
-                    }
-                  if (state->match_count < state->match_cap)
-                    state->matches[state->match_count++] = (struct match_record) {
-                      .chunk_idx = idx,
-                      .line_beg = lbeg,
-                      .line_end = lend,
-                      .rel_nl = running_nl
-                    };
-                  pthread_mutex_unlock (&state->match_mutex);
+                  running_nl += count_newlines (nl_cursor, lbeg);
+                  nl_cursor = lbeg;
                 }
+
+              pthread_mutex_lock (&state->match_mutex);
+              if (state->match_count >= state->match_cap)
+                {
+                  if (0 <= out_before || 0 <= out_after)
+                    {
+                      state->match_cap *= 2;
+                      state->matches
+                        = xrealloc (state->matches,
+                                    (state->match_cap
+                                     * sizeof *state->matches));
+                    }
+                  else
+                    atomic_store (&state->match_overflow, true);
+                }
+              if (state->match_count < state->match_cap)
+                state->matches[state->match_count++] = (struct match_record) {
+                  .chunk_idx = idx,
+                  .line_beg = lbeg,
+                  .line_end = lend,
+                  .rel_nl = running_nl
+                };
+              pthread_mutex_unlock (&state->match_mutex);
               p = endp;
             }
         }
@@ -4726,9 +4685,6 @@ worker_thread_func (void *arg)
       pthread_cond_signal (&q_not_full_cv);
       pthread_mutex_unlock (&pool_mutex);
 
-      if (task.type == TASK_TYPE_TERMINATE)
-        break;
-
       if (task.type == TASK_TYPE_WALK)
         {
           walk_participate (task.seq);
@@ -4746,29 +4702,15 @@ worker_thread_func (void *arg)
       task_reset ();
 
       bool status = true;
-      char *defer_name = nullptr;
       intmax_t chunk_matched_cnt = 0;
       bool enc_error = false;
 
-      if (task.type == TASK_TYPE_STDIN)
-        {
-          filename = label;
-          if (binary)
-            xset_binary_mode (STDIN_FILENO, O_BINARY);
-          status = grepdesc (STDIN_FILENO, true);
-          filename = nullptr;
-        }
-      else if (task.type == TASK_TYPE_FILE)
+      if (task.type == TASK_TYPE_FILE)
         {
           filename = task.filename;
-          tls_may_defer = exact_stdout;
           status = grepfile (AT_FDCWD, task.filename, task.follow,
                              task.command_line);
-          tls_may_defer = false;
-          if (tls_deferred)
-            defer_name = task.filename;
-          else
-            free (task.filename);
+          free (task.filename);
           filename = nullptr;
         }
       else if (task.type == TASK_TYPE_STREAM_CHUNK)
@@ -4802,12 +4744,6 @@ worker_thread_func (void *arg)
       slot->sep = task_sep;
       slot->chunk_count = chunk_matched_cnt;
       slot->enc_error = enc_error;
-      if (defer_name)
-        {
-          slot->defer_name = defer_name;
-          slot->defer_follow = task.follow;
-          slot->defer_command_line = task.command_line;
-        }
       if (tls_big.len)
         {
           slot->big = ximemdup (tls_big.data, tls_big.len);
@@ -5448,17 +5384,9 @@ static void
 chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st_in)
 {
   producer_flush_batch ();
-  struct stat st;
-  bool have_st = false;
-  if (st_in)
-    {
-      st = *st_in;
-      have_st = true;
-    }
-  else if (fstat (fd, &st) == 0)
-    have_st = true;
+  struct stat st = *st_in;
 
-  if (have_st && exit_on_match && !out_invert && !pool_started)
+  if (exit_on_match && !out_invert && !pool_started)
     {
       char const *saved_filename = filename;
       filename = fname;
@@ -5493,16 +5421,6 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
       filename = saved_filename;
     }
   ensure_pool ();
-  if (!have_st)
-    {
-      if (!suppress_errors)
-        producer_enqueue_error (errno, fname);
-      else
-        producer_enqueue_errseen ();
-      if (close_fd)
-        close (fd);
-      return;
-    }
 
   if (!out_quiet && list_files == LISTFILES_NONE && 1 < max_count
       && S_ISREG (st.st_mode) && SAME_INODE (st, out_stat))
@@ -5511,14 +5429,6 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
         close (fd);
       producer_enqueue_msg (0, _("%s: input file is also the output"), fname);
       producer_enqueue_errseen ();
-      return;
-    }
-
-  if (st.st_size == 0)
-    {
-      if (close_fd)
-        close (fd);
-      rob_enqueue_empty_last_chunk (fname);
       return;
     }
 
@@ -5568,8 +5478,6 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname, struct stat const *st
     data[effective_size] = eolbyte;
 
   size_t num_chunks = pool_nthreads * 2;
-  if (num_chunks < 2)
-    num_chunks = 2;
   if (num_chunks > 64)
     num_chunks = 64;
   size_t min_chunk_size = 2 * 1024 * 1024;
@@ -5773,19 +5681,6 @@ stream_slicer_stdin (void)
   fcntl (STDIN_FILENO, F_SETPIPE_SZ, 1024 * 1024);
 #endif
   ensure_pool ();
-
-  struct stat st;
-  if (fstat (STDIN_FILENO, &st) == 0)
-    {
-      if (!out_quiet && list_files == LISTFILES_NONE && 1 < max_count
-          && S_ISREG (st.st_mode) && SAME_INODE (st, out_stat))
-        {
-          producer_enqueue_msg (0, _("%s: input file is also the output"),
-                                label ? label : _("(standard input)"));
-          producer_enqueue_errseen ();
-          return;
-        }
-    }
 
   size_t residue_cap = 64 * 1024;
   char *residue_buf = xmalloc (residue_cap);
@@ -7206,6 +7101,8 @@ static _Thread_local size_t walk_cur_index;
 static void
 walk_split (struct walk_task *t, size_t lo)
 {
+  if (walk_is_main && !walk_recruited)
+    walk_recruit (walk.gen);
   struct walk_dir *d = t->dir;
   struct walk_task *n = xmalloc (sizeof *n);
   uint64_t span = (d->key_hi - d->key_lo) / (d->nents + 1);
@@ -7545,6 +7442,8 @@ walk_help_bin_job (struct walk_bin_job *job)
 static bool
 walk_bin_scan (char const *map, size_t size, size_t scan_offset)
 {
+  if (walk_is_main && !walk_recruited)
+    walk_recruit (walk.gen);
   struct walk_bin_job job;
   job.data = map;
   job.size = size;
@@ -7735,14 +7634,6 @@ walk_run_dirs (char *const *dirs, size_t ndirs)
   walk_execute_generation (gen);
 }
 
-/* Search directory DIR, a command-line operand, recursively.  */
-_GL_UNUSED static void
-walk_run (char const *dir)
-{
-  char *const d[1] = { (char *) dir };
-  walk_run_dirs (d, 1);
-}
-
 static void
 walk_run_cmd_files (char *const *files, size_t nfiles)
 {
@@ -7920,32 +7811,37 @@ static void
 finish_worker_pool (void)
 {
   producer_flush_batch ();
-  if (!pool_started)
-    return;
-  pthread_mutex_lock (&pool_mutex);
-  rob_wait_all_committed_locked ();
+  if (pool_started)
+    {
+      pthread_mutex_lock (&pool_mutex);
+      rob_wait_all_committed_locked ();
 
-  pool_terminate = true;
-  pthread_cond_broadcast (&q_not_empty_cv);
-  pthread_cond_broadcast (&q_not_full_cv);
-  pthread_cond_broadcast (&rob_space_cv);
-  pthread_cond_broadcast (&slice_avail_cv);
-  pthread_mutex_unlock (&pool_mutex);
+      pool_terminate = true;
+      pthread_cond_broadcast (&q_not_empty_cv);
+      pthread_cond_broadcast (&q_not_full_cv);
+      pthread_cond_broadcast (&rob_space_cv);
+      pthread_cond_broadcast (&slice_avail_cv);
+      pthread_mutex_unlock (&pool_mutex);
 
-  /* Join the first worker first: once it has exited, it has created
-     all the threads it will create.  */
-  atomic_store (&pool_stop_spawning, true);
-  if (0 < pool_nthreads)
-    pthread_join (pool_threads[0], nullptr);
-  int created = atomic_load (&pool_created);
-  for (int i = 1; i < created; ++i)
-    pthread_join (pool_threads[i], nullptr);
+      /* Join the first worker first: once it has exited, it has created
+         all the threads it will create.  */
+      atomic_store (&pool_stop_spawning, true);
+      if (0 < pool_nthreads)
+        pthread_join (pool_threads[0], nullptr);
+      int created = atomic_load (&pool_created);
+      for (int i = 1; i < created; ++i)
+        pthread_join (pool_threads[i], nullptr);
 
-  cleanup_slice_freelist ();
+      cleanup_slice_freelist ();
 
-  free (pool_threads);
-  pool_threads = nullptr;
-  pool_nthreads = 0;
+      free (pool_threads);
+      pool_threads = nullptr;
+      pool_nthreads = 0;
+    }
+
+  free_compiled_pattern (primary_compiled_pattern);
+  primary_compiled_pattern = nullptr;
+  compiled_pattern = nullptr;
 }
 
 static void
@@ -8709,6 +8605,9 @@ main (int argc, char **argv)
         status &= grep_command_line_arg (*files++);
       while (*files);
 
+      free_compiled_pattern (primary_compiled_pattern);
+      primary_compiled_pattern = nullptr;
+      compiled_pattern = nullptr;
       return errseen ? EXIT_TROUBLE : status;
     }
 

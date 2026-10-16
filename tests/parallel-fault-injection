@@ -1,0 +1,229 @@
+#!/bin/sh
+# Fault-injection and boundary-shrinking tests:
+# 1. WALK_FD_CAP_MAX=2 equivalent via RLIMIT_NOFILE=20 (walk_relieve_fd_pressure,
+#    walk_reopen_locked, walk_fd_safer).
+# 2. match_overflow in worker_run_mmap_scan (>4096 matches with -n, and >65536
+#    matches with -C1 triggering matches array xrealloc).
+# 3. mmap failure fallback (chunked_fallback_enqueue via LD_PRELOAD wrapper for
+#    both MAP_ANONYMOUS and MAP_FIXED, plus binary NUL fallback).
+# 4. Short pipe reads, >64 KiB slice residue, >1 MiB line grow_slice_buf,
+#    EPIPE, and ENOSPC (/dev/full).
+# 5. Patterns and lines straddling exact 64 KiB, 1 MiB, and 2 MiB boundaries.
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+
+fail=0
+
+BASE_GREP="$abs_top_srcdir/benchmarks/grep-baseline"
+if test ! -x "$BASE_GREP"; then
+  BASE_GREP=""
+fi
+
+check_both ()
+{
+  GREP_THREADS=1 grep "$@" > exp_out 2> exp_err
+  exp_rc=$?
+  GREP_THREADS=8 grep "$@" > act_out 2> act_err
+  act_rc=$?
+  test "$exp_rc" -eq "$act_rc" || {
+    echo "FAIL rc ($exp_rc vs $act_rc): grep $*" >&2
+    fail=1
+  }
+  compare exp_out act_out || {
+    echo "FAIL stdout: grep $*" >&2
+    fail=1
+  }
+  compare exp_err act_err || {
+    echo "FAIL stderr: grep $*" >&2
+    fail=1
+  }
+  if test -n "$BASE_GREP"; then
+    "$BASE_GREP" "$@" > base_out 2> base_err
+    base_rc=$?
+    test "$exp_rc" -eq "$base_rc" || fail=1
+    compare exp_out base_out || fail=1
+  fi
+}
+
+# 1. Descriptor pressure (walk.fd_cap = 2 via ulimit -n 20 & GREP_THREADS=2,
+#    plus closed stdin 0<&- to exercise walk_fd_safer):
+$PERL -e '
+  mkdir "fd_tree";
+  for my $b (1..12) {
+    my $p = sprintf("fd_tree/b%02d", $b);
+    mkdir $p;
+    for my $d (1..4) {
+      $p .= "/s$d";
+      mkdir $p;
+      open my $fh, ">", "$p/file.txt" or die;
+      print $fh "fd_pressure_match_${b}_${d}\n";
+      close $fh;
+    }
+  }
+'
+GREP_THREADS=1 grep -r 'fd_pressure_match' fd_tree > fd_exp 2> fd_err1
+(ulimit -n 20 && GREP_THREADS=2 grep -r 'fd_pressure_match' fd_tree 0<&-) > fd_act 2> fd_err2
+compare fd_exp fd_act || fail=1
+compare fd_err1 fd_err2 || fail=1
+
+# 2. match_overflow in worker_run_mmap_scan:
+# (a) >4096 matches without context (triggers match_overflow = true and Mode 3A)
+#     with multiple matches per line.
+$PERL -e '
+  open my $fh, ">", "overflow_3a.txt" or die;
+  for my $i (1..6000) {
+    print $fh "line_$i OVERFLOW_TOK first and OVERFLOW_TOK second " . ("x" x 380) . "\n";
+  }
+  close $fh;
+'
+check_both -F -n 'OVERFLOW_TOK' overflow_3a.txt
+check_both -F -n -b -o 'OVERFLOW_TOK' overflow_3a.txt
+
+# (b) >65536 matches with context -C 1 in a >= 2 MiB file (triggers state->match_cap *= 2 xrealloc):
+$PERL -e '
+  open my $fh, ">", "overflow_ctx.txt" or die;
+  for my $i (1..70000) {
+    print $fh "ctx_$i OVERFLOW_CTX_TOK tail_padding_0123456789\n";
+  }
+  close $fh;
+'
+check_both -F -C 1 'OVERFLOW_CTX_TOK' overflow_ctx.txt
+
+# 3. mmap failure fallback (chunked_fallback_enqueue):
+# Compile an LD_PRELOAD interposer if CC supports -shared -fPIC:
+cat << 'EOF' > fail_mmap.c
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+
+void *
+mmap (void *addr, size_t length, int prot, int flags, int fd, off_t offset)
+{
+  static void *(*real_mmap) (void *, size_t, int, int, int, off_t) = NULL;
+  if (!real_mmap)
+    real_mmap = dlsym (RTLD_NEXT, "mmap");
+  char const *mode = getenv ("FAIL_MMAP_MODE");
+  if (mode && length >= 2 * 1024 * 1024)
+    {
+      if (mode[0] == '1' && (flags & MAP_ANONYMOUS) && !(flags & MAP_FIXED))
+        {
+          errno = ENOMEM;
+          return MAP_FAILED;
+        }
+      if (mode[0] == '2' && (flags & MAP_FIXED) && fd >= 0)
+        {
+          errno = ENOMEM;
+          return MAP_FAILED;
+        }
+    }
+  return real_mmap (addr, length, prot, flags, fd, offset);
+}
+
+void *
+mmap64 (void *addr, size_t length, int prot, int flags, int fd, off_t offset)
+{
+  return mmap (addr, length, prot, flags, fd, offset);
+}
+EOF
+
+if ${CC:-cc} -shared -fPIC -O2 fail_mmap.c -o fail_mmap.so -ldl 2>/dev/null; then
+  # Mode 1: fail initial MAP_ANONYMOUS reservation in chunked_grep_fd
+  FAIL_MMAP_MODE=1 LD_PRELOAD=./fail_mmap.so GREP_THREADS=4 \
+    grep -F -n 'OVERFLOW_TOK' overflow_3a.txt > mmap_m1_out 2> mmap_m1_err
+  if test $? -eq 0 && test -s mmap_m1_out; then
+    GREP_THREADS=1 grep -F -n 'OVERFLOW_TOK' overflow_3a.txt > mmap_exp
+    compare mmap_exp mmap_m1_out || fail=1
+  fi
+  # Mode 2: fail second MAP_FIXED file mapping in chunked_grep_fd
+  FAIL_MMAP_MODE=2 LD_PRELOAD=./fail_mmap.so GREP_THREADS=4 \
+    grep -F -n 'OVERFLOW_TOK' overflow_3a.txt > mmap_m2_out 2> mmap_m2_err
+  if test $? -eq 0 && test -s mmap_m2_out; then
+    compare mmap_exp mmap_m2_out || fail=1
+  fi
+fi
+
+# 4. Stream slicer boundary & pipe fault injection:
+# (a) >64 KiB residue at the end of a 1 MiB pipe slice (triggers residue_buf xrealloc)
+#     AND a >1 MiB single line without newline in a pipe (triggers grow_slice_buf):
+$PERL -e '
+  # First 1 MiB slice: 960 KiB of normal lines + 80 KiB partial line straddling 1 MiB
+  my $line1k = ("a" x 1023) . "\n";
+  for (1..960) { print $line1k; }
+  print ("b" x 80000) . "_RESIDUE_MATCH_" . ("c" x 20000) . "\n";
+  # Next: a 1.5 MiB line without newline followed by _GROW_SLICE_MATCH_\n
+  print ("d" x (1536 * 1024)) . "_GROW_SLICE_MATCH_\n";
+' > pipe_stress.txt
+
+cat pipe_stress.txt | GREP_THREADS=1 grep -F -n -e '_RESIDUE_MATCH_' -e '_GROW_SLICE_MATCH_' > ps_exp
+cat pipe_stress.txt | GREP_THREADS=8 grep -F -n -e '_RESIDUE_MATCH_' -e '_GROW_SLICE_MATCH_' > ps_act
+compare ps_exp ps_act || fail=1
+
+# (b) Short trickle pipe reads with binary NUL mid-stream:
+$PERL -e '
+  $| = 1;
+  for my $i (1..20) {
+    print "trickle_line_${i}_MATCH_HERE\n";
+    select(undef, undef, undef, 0.001);
+  }
+  print "binary_mid\0_MATCH_HERE\n";
+  for my $i (21..40) {
+    print "trickle_after_${i}_MATCH_HERE\n";
+  }
+' | GREP_THREADS=8 grep -F 'MATCH_HERE' > trickle_act 2> trickle_err8
+
+$PERL -e '
+  for my $i (1..20) { print "trickle_line_${i}_MATCH_HERE\n"; }
+  print "binary_mid\0_MATCH_HERE\n";
+  for my $i (21..40) { print "trickle_after_${i}_MATCH_HERE\n"; }
+' | GREP_THREADS=1 grep -F 'MATCH_HERE' > trickle_exp 2> trickle_err1
+
+compare trickle_exp trickle_act || fail=1
+compare trickle_err1 trickle_err8 || fail=1
+
+# (c) EPIPE when reader closes pipe early:
+first_line=$(GREP_THREADS=8 grep -F 'OVERFLOW_TOK' overflow_3a.txt | head -n 1)
+case "$first_line" in
+  *OVERFLOW_TOK*) ;;
+  *) fail=1 ;;
+esac
+
+# (d) ENOSPC on /dev/full:
+if test -w /dev/full; then
+  GREP_THREADS=8 grep -F 'OVERFLOW_TOK' overflow_3a.txt > /dev/full 2> full_err
+  test $? -eq 2 || fail=1
+  GREP_THREADS=8 grep -r 'fd_pressure_match' fd_tree > /dev/full 2> full_walk_err
+  test $? -eq 2 || fail=1
+fi
+
+# 5. Exact chunk/slice boundary straddling (64 KiB, 1 MiB, 2 MiB):
+$PERL -e '
+  open my $fh, ">", "boundary_straddle.txt" or die;
+  my $pos = 0;
+  my @targets = (65536 - 5, 1048576 - 7, 2097152 - 9, 2500000);
+  my $tok = "BOUNDARY_STRADDLE_TOKEN\n";
+  for my $t (@targets) {
+    while ($pos + 128 < $t) {
+      my $s = ("p" x 127) . "\n";
+      print $fh $s;
+      $pos += length($s);
+    }
+    my $rem = $t - $pos;
+    if ($rem > 1) {
+      my $s = ("q" x ($rem - 1)) . "\n";
+      print $fh $s;
+      $pos += length($s);
+    }
+    print $fh $tok;
+    $pos += length($tok);
+  }
+  close $fh;
+'
+for flags in "-F" "-F -n -b" "-F -o -b" "-F -C 2" "-E" "-E -n -b"; do
+  check_both $flags 'BOUNDARY_STRADDLE_TOKEN' boundary_straddle.txt
+  cat boundary_straddle.txt | GREP_THREADS=1 grep $flags 'BOUNDARY_STRADDLE_TOKEN' > bs_p1
+  cat boundary_straddle.txt | GREP_THREADS=8 grep $flags 'BOUNDARY_STRADDLE_TOKEN' > bs_p8
+  compare bs_p1 bs_p8 || fail=1
+done
+
+Exit $fail

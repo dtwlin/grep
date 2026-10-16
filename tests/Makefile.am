@@ -150,7 +150,10 @@ TESTS =						\
   parallel-coverage-complete			\
   parallel-coverage-edge-cases			\
   parallel-env-limits				\
+  parallel-fault-injection			\
+  parallel-gcov-branches			\
   parallel-kwset-ac				\
+  parallel-matrix				\
   parallel-multithread-cases			\
   parallel-pcre-must				\
   parallel-refactor				\

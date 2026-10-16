@@ -1,0 +1,233 @@
+#!/bin/sh
+# Pairwise execution-mode matrix test crossing engines, input paths,
+# modifiers, and cross-file state transitions:
+#   GREP_THREADS=1 vs GREP_THREADS=8 vs benchmarks/grep-baseline.
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+
+fail=0
+
+BASE_GREP="$abs_top_srcdir/benchmarks/grep-baseline"
+if test ! -x "$BASE_GREP"; then
+  BASE_GREP=""
+fi
+
+check_cell ()
+{
+  GREP_THREADS=1 grep "$@" > exp_out 2> exp_err
+  exp_rc=$?
+  GREP_THREADS=8 grep "$@" > act_out 2> act_err
+  act_rc=$?
+  if test "$exp_rc" -ne "$act_rc"; then
+    echo "FAIL rc ($exp_rc vs $act_rc): grep $*" >&2
+    fail=1
+  fi
+  if ! compare exp_out act_out; then
+    echo "FAIL stdout (T1 vs T8): grep $*" >&2
+    fail=1
+  fi
+  if ! compare exp_err act_err; then
+    echo "FAIL stderr (T1 vs T8): grep $*" >&2
+    fail=1
+  fi
+  if test -n "$BASE_GREP"; then
+    "$BASE_GREP" "$@" > base_out 2> base_err
+    base_rc=$?
+    if test "$exp_rc" -ne "$base_rc"; then
+      echo "FAIL baseline rc ($exp_rc vs $base_rc): grep $*" >&2
+      fail=1
+    fi
+    if ! compare exp_out base_out; then
+      echo "FAIL baseline stdout: grep $*" >&2
+      fail=1
+    fi
+  fi
+}
+
+# Build test corpora for all input paths:
+# 1. Small files (1..18) for serial, ROB batch (4 files), walk_run_cmd_files (18 files),
+#    and walk_run_dirs (matrix_dir).
+mkdir -p matrix_dir/sub1 matrix_dir/sub2
+$PERL -e '
+  for my $i (1..18) {
+    my $fn = sprintf("small_%02d.txt", $i);
+    open my $fh, ">", $fn or die;
+    print $fh "header line\twith\ttabs $i\n";
+    if ($i % 2 == 1) {
+      print $fh "prefix ALPHA_TOKEN_01_ALPHA mid BETA_TOKEN_02 end\n";
+      print $fh "second ALPHA_TOKEN_01_ALPHA match line\n";
+    } else {
+      print $fh "only non-matching filler text in file $i\n";
+    }
+    print $fh "footer GAMMA_TOKEN_03 line $i\n";
+    close $fh;
+    my $sub = ($i <= 9) ? "matrix_dir/sub1" : "matrix_dir/sub2";
+    system("cp $fn $sub/$fn");
+  }
+'
+
+# 2. Large >= 2.5 MiB sparse-match file (for chunked COUNT, STATELESS, CONTEXT, MMAP_SCAN, stream_slicer_stdin):
+$PERL -e '
+  open my $fh, ">", "large_sparse.txt" or die;
+  my $filler = ("x" x 95) . "\n";
+  for my $i (1..27000) {
+    if ($i == 500 || $i == 14000 || $i == 26500) {
+      print $fh "row_$i\tALPHA_TOKEN_01_ALPHA and BETA_TOKEN_02\n";
+    } else {
+      print $fh $filler;
+    }
+  }
+  close $fh;
+'
+
+# 3. Large >= 2.5 MiB dense-match file (> 4096 matches, for chunked LINE_NUMBER Mode 3A):
+$PERL -e '
+  open my $fh, ">", "large_dense.txt" or die;
+  my $filler = ("y" x 95) . "\n";
+  for my $i (1..22000) {
+    if ($i <= 5000) {
+      print $fh "dense_$i ALPHA_TOKEN_01_ALPHA BETA_TOKEN_02\n";
+    } else {
+      print $fh $filler;
+    }
+  }
+  close $fh;
+'
+
+# 4. NUL-terminated (-z) file, binary file, and invalid-UTF-8 file:
+printf 'rec1\0ALPHA_TOKEN_01_ALPHA\0BETA_TOKEN_02\0rec4\0' > nul_data.txt
+printf 'bin_head\0ALPHA_TOKEN_01_ALPHA\nplain_tail\n' > bin_sample.bin
+printf 'utf8_bad_\200_line\nALPHA_TOKEN_01_ALPHA_ok\n' > bad_utf8.txt
+
+SMALL4="small_01.txt small_02.txt small_03.txt small_04.txt"
+SMALL18="small_01.txt small_02.txt small_03.txt small_04.txt small_05.txt small_06.txt small_07.txt small_08.txt small_09.txt small_10.txt small_11.txt small_12.txt small_13.txt small_14.txt small_15.txt small_16.txt small_17.txt small_18.txt"
+
+# Run across all 6 engines:
+for eng in kw_single kw_multi dfa_exact dfa_backref pcre_regex pcre_must; do
+  case "$eng" in
+    kw_single)
+      set -- -F -e 'ALPHA_TOKEN_01'
+      ;;
+    kw_multi)
+      set -- -F -e 'ALPHA_TOKEN_01' -e 'BETA_TOKEN_02' -e 'GAMMA_TOKEN_03'
+      ;;
+    dfa_exact)
+      set -- -E -e 'ALPHA_TOKEN_01|BETA_TOKEN_02'
+      ;;
+    dfa_backref)
+      set -- -E -e '(ALPHA)_TOKEN_01_\1'
+      ;;
+    pcre_regex)
+      test "$PCRE_WORKS" = 1 || continue
+      set -- -P -e 'ALPHA_[A-Z]{5}_0[12]'
+      ;;
+    pcre_must)
+      test "$PCRE_WORKS" = 1 || continue
+      set -- -P -e 'ALPHA_TOKEN_0[12]'
+      ;;
+  esac
+
+  # Input paths x Modifiers:
+  for mod in none -v -c -l -L -q -m1 -m2 -o --color=always -n -b -T -C2 -Z; do
+    if test "$mod" = "none"; then
+      mflags=""
+    else
+      mflags="$mod"
+    fi
+
+    # (1) Serial (1 small file)
+    check_cell $mflags "$@" small_01.txt
+    # (2) Worker ROB batch (4 small files)
+    check_cell $mflags "$@" $SMALL4
+    # (3) walk_run_dirs (-r)
+    check_cell -r $mflags "$@" matrix_dir
+    # (4) walk_run_cmd_files (18 small files)
+    check_cell $mflags "$@" $SMALL18
+    # (5..9) chunked_grep_fd (COUNT, STATELESS, MMAP_SCAN, CONTEXT)
+    if test "$mod" != "-m1" && test "$mod" != "-m2"; then
+      check_cell $mflags "$@" large_sparse.txt
+    fi
+  done
+
+  # chunked_grep_fd Mode 3A (LINE_NUMBER with >4096 matches):
+  check_cell -n "$@" large_dense.txt
+  check_cell -n -b -T "$@" large_dense.txt
+
+  # stream_slicer_stdin (pipe input):
+  for mod in none -v -c -o --color=always -n -b -T; do
+    if test "$mod" = "none"; then
+      mflags=""
+    else
+      mflags="$mod"
+    fi
+    cat large_sparse.txt | GREP_THREADS=1 grep $mflags "$@" > s_exp 2> s_err1
+    rc1=$?
+    cat large_sparse.txt | GREP_THREADS=8 grep $mflags "$@" > s_act 2> s_err8
+    rc8=$?
+    test "$rc1" -eq "$rc8" || fail=1
+    compare s_exp s_act || fail=1
+    compare s_err1 s_err8 || fail=1
+    if test -n "$BASE_GREP"; then
+      cat large_sparse.txt | "$BASE_GREP" $mflags "$@" > s_base 2> /dev/null
+      rcb=$?
+      test "$rc1" -eq "$rcb" || fail=1
+      compare s_exp s_base || fail=1
+    fi
+  done
+
+  # Modifiers -z, -a, -I, binary default:
+  check_cell -z "$@" nul_data.txt
+  check_cell -z -n -b "$@" nul_data.txt
+  check_cell -a "$@" bin_sample.bin
+  check_cell -I "$@" bin_sample.bin
+  check_cell "$@" bin_sample.bin
+
+  # Deferred exact_stdout in walk_run_dirs:
+  rm -rf defer_dir
+  cp -R matrix_dir defer_dir
+  echo "initial ALPHA_TOKEN_01_ALPHA line" > defer_dir/sub2/z_out.txt
+  GREP_THREADS=1 grep -r -m 1 "$@" defer_dir >> defer_dir/sub2/z_out.txt 2> def_err1
+  cp defer_dir/sub2/z_out.txt def_out1
+
+  rm -rf defer_dir
+  cp -R matrix_dir defer_dir
+  echo "initial ALPHA_TOKEN_01_ALPHA line" > defer_dir/sub2/z_out.txt
+  GREP_THREADS=8 grep -r -m 1 "$@" defer_dir >> defer_dir/sub2/z_out.txt 2> def_err8
+  cp defer_dir/sub2/z_out.txt def_out8
+
+  compare def_out1 def_out8 || fail=1
+  compare def_err1 def_err8 || fail=1
+
+  # Cross-file transitions:
+  # (A) chunked -> small
+  check_cell -n "$@" large_sparse.txt small_01.txt
+  check_cell -C 2 "$@" large_sparse.txt small_01.txt
+  # (B) stream -> file
+  cat small_01.txt | GREP_THREADS=1 grep -H -n "$@" - small_02.txt > tr_b1 2> /dev/null
+  cat small_01.txt | GREP_THREADS=8 grep -H -n "$@" - small_02.txt > tr_b8 2> /dev/null
+  compare tr_b1 tr_b8 || fail=1
+  # (C) encoding-error file -> clean file (in UTF-8 locale if available)
+  if test "$(locale -a 2>/dev/null | grep -i 'en_US\.utf-\?8' | head -n 1)" != ""; then
+    utf8_loc=$(locale -a 2>/dev/null | grep -i 'en_US\.utf-\?8' | head -n 1)
+    LC_ALL="$utf8_loc" check_cell "$@" bad_utf8.txt small_01.txt
+  fi
+done
+
+# (D) Cross-file transition: binary NUL in chunk k>0 after match in chunk 0 -> clean file:
+$PERL -e '
+  open my $fh, ">", "chunk_nul_trans.bin" or die;
+  my $filler = ("z" x 99) . "\n";
+  print $fh "ALPHA_TOKEN_01_ALPHA first chunk match\n";
+  for (1..15000) { print $fh $filler; }
+  print $fh "binary\0nul_in_second_chunk\n";
+  for (1..10000) { print $fh $filler; }
+  print $fh "ALPHA_TOKEN_01_ALPHA after nul\n";
+  close $fh;
+'
+for eng_flag in "-F" "-E" "-G"; do
+  check_cell $eng_flag -e 'ALPHA_TOKEN_01' chunk_nul_trans.bin small_01.txt
+  check_cell $eng_flag -n -e 'ALPHA_TOKEN_01' chunk_nul_trans.bin small_01.txt
+  check_cell $eng_flag -C 1 -e 'ALPHA_TOKEN_01' chunk_nul_trans.bin small_01.txt
+  check_cell $eng_flag -c -e 'ALPHA_TOKEN_01' chunk_nul_trans.bin small_01.txt
+done
+
+Exit $fail

@@ -1,0 +1,424 @@
+#!/bin/sh
+# Exercise specific branch and state-transition paths across lib/kwset.c,
+# src/kwsearch.c, src/dfasearch.c, src/pcresearch.c, and src/grep.c.
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+
+fail=0
+
+BASE_GREP="$abs_top_srcdir/benchmarks/grep-baseline"
+if test ! -x "$BASE_GREP"; then
+  BASE_GREP=""
+fi
+
+check_vs_serial ()
+{
+  GREP_THREADS=1 grep "$@" > exp_out 2> exp_err
+  exp_rc=$?
+  GREP_THREADS=8 grep "$@" > act_out 2> act_err
+  act_rc=$?
+  test "$exp_rc" -eq "$act_rc" || {
+    echo "FAIL rc ($exp_rc vs $act_rc): grep $*" >&2
+    fail=1
+  }
+  compare exp_out act_out || {
+    echo "FAIL stdout: grep $*" >&2
+    fail=1
+  }
+  compare exp_err act_err || {
+    echo "FAIL stderr: grep $*" >&2
+    fail=1
+  }
+  if test -n "$BASE_GREP"; then
+    "$BASE_GREP" "$@" > base_out 2> base_err
+    base_rc=$?
+    test "$exp_rc" -eq "$base_rc" || {
+      echo "FAIL baseline rc ($exp_rc vs $base_rc): grep $*" >&2
+      fail=1
+    }
+    compare exp_out base_out || {
+      echo "FAIL baseline stdout: grep $*" >&2
+      fail=1
+    }
+  fi
+}
+
+# 1. lib/kwset.c:
+# (a) >32 patterns with -F -i and length >= 4 (exercises qf_fold_byte,
+#     qf_fold, qf_init fold check, kwsprep_dfa fold, qf_probe fold,
+#     acexec_dfa fold, and acexec_dfa_fold tail < 4 bytes).
+awk 'BEGIN { for (i = 1; i <= 40; i++) printf "pat_keyword_%02d\n", i }' > pat40.txt
+cat << 'EOF' > kw_in.txt
+nothing_here_at_all_1234567890
+prefix_PAT_KEYWORD_25_suffix
+short_tail_ab
+EOF
+check_vs_serial -F -i -f pat40.txt kw_in.txt
+
+# (b) >32 patterns with -F where one pattern is < 4 bytes (qf_init mind < 4).
+cat pat40.txt > pat41_short.txt
+echo "ab" >> pat41_short.txt
+check_vs_serial -F -f pat41_short.txt kw_in.txt
+check_vs_serial -F -i -f pat41_short.txt kw_in.txt
+
+# (c) <=32 patterns with 1-char pattern + 4-char pattern (acexec_trans
+#     accept1->accepting < 0, Teddy false positive, failure transition).
+printf 'z\nxyzw\n' > pat_ac2.txt
+printf 'xyab xyzx xyzw z\n' > ac2_in.txt
+check_vs_serial -F -f pat_ac2.txt ac2_in.txt
+check_vs_serial -F -o -f pat_ac2.txt ac2_in.txt
+
+# (d) bmexec_trans_scalar skip loop (len12 < size with single-byte trans).
+awk 'BEGIN {
+  for (i = 0; i < 40; i++) printf "0123456789abcdef_no_match_here_";
+  printf "ABCDEFGHIJKL_end\n";
+}' > bm_in.txt
+check_vs_serial -F -i 'abcdefghijkl' bm_in.txt
+
+# 2. src/kwsearch.c:
+# (a) find_turkish_special_chars scalar tail (32-byte total input starting
+#     with UTF-8 >= 0x80 searched with -F -i in UTF-8 locale).
+if test "$(locale -a 2>/dev/null | grep -i 'en_US\.utf-\?8' | head -n 1)" != ""; then
+  utf8_loc=$(locale -a 2>/dev/null | grep -i 'en_US\.utf-\?8' | head -n 1)
+  printf '\303\251xxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n' > turk_tail.txt
+  LC_ALL="$utf8_loc" check_vs_serial -F -i 'item' turk_tail.txt
+  # (b) Fexecute_with_utf8_quirk exact && beg > buf:
+  printf 'x\304\261y\n' > turk_quirk.txt
+  LC_ALL="$utf8_loc" check_vs_serial -F -i -o 'ıy' turk_quirk.txt
+fi
+
+# 3. src/dfasearch.c:
+printf 'a)\nbar\nfoo+bar\nfoobar\n-\na{1,2-a{1,2\nabcd-ab\nabcd-abcd\nq\n' > dfa_in.txt
+check_vs_serial -E 'a)|bar' dfa_in.txt
+check_vs_serial 'foo\+bar\|baz' dfa_in.txt
+check_vs_serial -E 'foo*bar|baz' dfa_in.txt
+check_vs_serial -E '()-\1' dfa_in.txt
+check_vs_serial -E '(a{1,2)-\1' dfa_in.txt
+check_vs_serial -E '([a-z]{4})-\1' dfa_in.txt
+
+# dfawarn with pattern file name and line number:
+printf 'valid_line\n\\q\n' > stray_pat.txt
+GREP_THREADS=1 grep -f stray_pat.txt dfa_in.txt > warn_out1 2> warn_err1
+GREP_THREADS=4 grep -f stray_pat.txt dfa_in.txt > warn_out4 2> warn_err4
+compare warn_out1 warn_out4 || fail=1
+compare warn_err1 warn_err4 || fail=1
+
+# 4. src/pcresearch.c:
+if test "$PCRE_WORKS" = 1; then
+  # (a) jit_exec PCRE2_ERROR_JIT_STACKLIMIT stack growth:
+  awk 'BEGIN { for (i = 0; i < 2000; i++) printf "a"; printf "\n" }' > pcre_deep.txt
+  check_vs_serial -P '^(a(?1)?)$' pcre_deep.txt
+
+  # (b) find_must_literal group headers, quantifiers, escapes, and \Q...\E:
+  printf 'xxbar_literal\nAABAAbar_literal\n]bar_literal\n' > pcre_lit.txt
+  check_vs_serial -P '(?!foo)bar_literal' pcre_lit.txt
+  check_vs_serial -P '(?<!foo)bar_literal' pcre_lit.txt
+  check_vs_serial -P '(?<=xx)bar_literal' pcre_lit.txt
+  check_vs_serial -P '(?>xx)bar_literal' pcre_lit.txt
+  check_vs_serial -P '(?i)bar_literal' pcre_lit.txt
+  check_vs_serial -P 'x{2,4}bar_literal' pcre_lit.txt
+  check_vs_serial -P '\x{41}\x41\o{102}\101\p{L}\N{U+0041}bar_literal' pcre_lit.txt
+  check_vs_serial -P '[\Q]\E]bar_literal' pcre_lit.txt
+fi
+
+# 5. src/grep.c:
+# (a) is_zero_page & SEEK_DATA on -z with sparse hole + NUL runs:
+$PERL -e '
+  open my $fh, ">", "sparse_z.bin" or die;
+  seek $fh, 262144, 0;
+  print $fh "needle\0" . ("\0" x 145) . "x\0" . ("\0" x 150);
+  close $fh;
+'
+check_vs_serial -a -z 'needle' sparse_z.bin
+
+# (b) fillbuf growth on a 17 MiB single line (both buffer_is_mmap -> munmap
+#     and !buffer_is_mmap -> free):
+$PERL -e '
+  open my $fh, ">", "long17m.txt" or die;
+  print $fh ("a" x (17 * 1024 * 1024)) . "needle\n";
+  close $fh;
+'
+check_vs_serial -F -c 'needle' long17m.txt
+
+# (c) grepdirent (serial fts) on unreadable subdir, FIFO, dangling symlink,
+#     and valid symlink with -D skip -r:
+mkdir -p fts_dir/sub_ok fts_dir/sub_noperm
+echo "match_in_sub" > fts_dir/sub_ok/file.txt
+echo "secret" > fts_dir/sub_noperm/file.txt
+ln -s file.txt fts_dir/sub_ok/valid_link
+ln -s nonexistent_target fts_dir/sub_ok/dangling_link
+mkfifo fts_dir/sub_ok/my_fifo 2>/dev/null || :
+chmod 000 fts_dir/sub_noperm
+GREP_THREADS=1 grep -D skip -r 'match_in_sub' fts_dir > fts_out1 2> fts_err1
+rc1=$?
+GREP_THREADS=4 grep -D skip -r 'match_in_sub' fts_dir > fts_out4 2> fts_err4
+rc4=$?
+chmod 700 fts_dir/sub_noperm
+test "$rc1" -eq "$rc4" || fail=1
+compare fts_out1 fts_out4 || fail=1
+compare fts_err1 fts_err4 || fail=1
+
+# (d) walk_before deep directory hierarchy (>40 levels, 2 entries per level):
+$PERL -e '
+  my $p = "deep_tree";
+  mkdir $p;
+  for my $lvl (1..44) {
+    open my $f, ">", "$p/a_file.txt" or die;
+    print $f "lvl_$lvl\n";
+    close $f;
+    $p .= "/d";
+    mkdir $p or die;
+  }
+  open my $f, ">", "$p/leaf.txt" or die;
+  print $f "deep_leaf_match\n";
+  close $f;
+'
+check_vs_serial -r 'deep_leaf_match' deep_tree
+
+# (e) walk_bin_scan worker participation on a 64 MiB binary file in a directory:
+mkdir -p bin_walk_dir
+$PERL -e '
+  open my $fh, ">", "bin_walk_dir/big.bin" or die;
+  print $fh "\0" . ("A" x 4095);
+  my $chunk = "B" x (1024 * 1024);
+  for (1..63) { print $fh $chunk; }
+  print $fh "WALK_BIN_TARGET\n";
+  close $fh;
+'
+check_vs_serial -r -F -l 'WALK_BIN_TARGET' bin_walk_dir
+check_vs_serial -r -F -l 'WALK_BIN_MISSING' bin_walk_dir
+
+# (f) walk_split_rest on a directory with multiple files and a 3 MiB file:
+mkdir -p split_dir
+for i in 1 2 3 4 5; do
+  echo "small_$i" > "split_dir/a_$i.txt"
+done
+$PERL -e '
+  open my $fh, ">", "split_dir/m_big.txt" or die;
+  my $line = ("x" x 99) . "\n";
+  for (1..32000) { print $fh $line; }
+  print $fh "split_match_here\n";
+  close $fh;
+'
+for i in 6 7 8 9 10; do
+  echo "small_$i" > "split_dir/z_$i.txt"
+done
+check_vs_serial -r -F 'split_match_here' split_dir
+
+# (g) chunk_sequential_to_rob & chunk_note_nul: >= 2.5 MiB file with NUL at 1.5 MiB:
+$PERL -e '
+  open my $fh, ">", "mid_nul.bin" or die;
+  my $line = ("a" x 99) . "\n";
+  for (1..1000) { print $fh $line; }
+  print $fh "early_match_line\n";
+  for (1..15000) { print $fh $line; }
+  print $fh "nul_line\0with_nul\n";
+  for (1..10000) { print $fh $line; }
+  print $fh "late_match_line\n";
+  close $fh;
+'
+check_vs_serial -F 'early_match_line' mid_nul.bin
+check_vs_serial -F -n 'early_match_line' mid_nul.bin
+check_vs_serial -F -C 1 'early_match_line' mid_nul.bin
+check_vs_serial -F 'late_match_line' mid_nul.bin
+check_vs_serial -F -n 'late_match_line' mid_nul.bin
+check_vs_serial -F -C 1 'late_match_line' mid_nul.bin
+
+# (h) chunked_grep_file openat_safer failure (producer_enqueue_error &
+#     producer_enqueue_errseen) on a >= 2 MiB chmod-000 file:
+cp mid_nul.bin unreadable_2m.bin
+chmod 000 unreadable_2m.bin
+check_vs_serial -F 'early_match_line' unreadable_2m.bin kw_in.txt
+check_vs_serial -s -F 'early_match_line' unreadable_2m.bin kw_in.txt
+chmod 600 unreadable_2m.bin
+
+# (i) chunked_fallback_enqueue on STDIN_FILENO (producer_enqueue_stdin):
+GREP_THREADS=1 grep -F 'early_match_line' - kw_in.txt < mid_nul.bin > stdin_fb1 2> stdin_err1
+rc1=$?
+GREP_THREADS=4 grep -F 'early_match_line' - kw_in.txt < mid_nul.bin > stdin_fb4 2> stdin_err4
+rc4=$?
+test "$rc1" -eq "$rc4" || fail=1
+compare stdin_fb1 stdin_fb4 || fail=1
+compare stdin_err1 stdin_err4 || fail=1
+
+# (j) retained_mmaps eviction (>8 invocations of >= 16 MiB file in one command):
+check_vs_serial -F 'needle' \
+  long17m.txt long17m.txt long17m.txt long17m.txt long17m.txt \
+  long17m.txt long17m.txt long17m.txt long17m.txt
+
+# (k) slot->big in worker_thread_func (-m 1 on a 5000-byte matching line):
+$PERL -e '
+  open my $fh, ">", "big_line.txt" or die;
+  print $fh ("M" x 5000) . "_BIG_MATCH\n";
+  close $fh;
+'
+check_vs_serial -F -m 1 '_BIG_MATCH' big_line.txt kw_in.txt
+
+# ---------------------------------------------------------------------------
+# 6. Round 2 coverage additions (dfasearch.c & grep.c deep branches)
+# ---------------------------------------------------------------------------
+# dfasearch.c: escaped literal followed by {m,n}, BRE \?, BRE top-level \| in backref,
+# leading quantifier in branch, unmatched ) in ERE branch, [\1] bracket non-group,
+# and invalid BRE backref in -f file (lineno >= 0):
+check_vs_serial -E 'foo\+{1,2}bar|baz' dfa_in.txt
+check_vs_serial 'foo\?bar\|baz' dfa_in.txt
+check_vs_serial '\+aaaa\|bbbb' dfa_in.txt
+check_vs_serial -E '*aaaa|bbbb' dfa_in.txt
+check_vs_serial -E ')aaaa|bbbb' dfa_in.txt
+check_vs_serial -E '[\1]' dfa_in.txt
+check_vs_serial '\(a\)\|b\1' dfa_in.txt
+printf 'abcd--ab--ab\nabcd--abcd\n' > bref_rem.txt
+check_vs_serial -E '([a-z]{4})--\1' bref_rem.txt
+printf '\\([a-z]\\)\\2\n' > bad_bre_file.txt
+returns_ 2 env GREP_THREADS=1 grep -f bad_bre_file.txt dfa_in.txt 2>/dev/null || fail=1
+
+# CLI flags in main(): -D read, -U (--binary), -f nonexistent, and missing pattern usage():
+check_vs_serial -D read -F 'PAT_KEYWORD_25' kw_in.txt
+GREP_THREADS=1 grep -U -F 'PAT_KEYWORD_25' < kw_in.txt > bin_u1 || fail=1
+GREP_THREADS=4 grep -U -F 'PAT_KEYWORD_25' < kw_in.txt > bin_u4 || fail=1
+compare bin_u1 bin_u4 || fail=1
+returns_ 2 grep -f no_such_pattern_file.txt kw_in.txt 2>/dev/null || fail=1
+returns_ 2 grep 2>/dev/null || fail=1
+
+# is_zero_page: non-zero byte at offset 100 (within 32B loop) and offset 4090 (tail scalar loop):
+$PERL -e '
+  open my $fh, ">", "zpage.bin" or die;
+  my $p1 = ("\0" x 100) . "x" . ("\0" x (4096 - 101));
+  my $p2 = ("\0" x 4090) . "y" . ("\0" x 5);
+  print $fh $p1 . $p2 . "match_zpage\n";
+  close $fh;
+'
+check_vs_serial -F 'match_zpage' zpage.bin
+
+# grepdirent in serial mode (GREP_THREADS=1): FTS_SL, FTS_NSOK + -D skip, -d skip,
+# -d recurse (implicit "."), and non-existent path with -r (out_file < 0):
+mkdir -p ser_dir/sub
+printf 'ser_match\n' > ser_dir/sub/f.txt
+ln -s f.txt ser_dir/sub/sym_file
+ln -s sub ser_dir/sym_dir
+check_vs_serial -r 'ser_match' ser_dir
+check_vs_serial -R -D skip 'ser_match' ser_dir
+check_vs_serial -d skip 'ser_match' ser_dir
+(cd ser_dir && GREP_THREADS=1 grep -d recurse -F 'ser_match' > ../rec_d1) || fail=1
+(cd ser_dir && GREP_THREADS=4 grep -d recurse -F 'ser_match' > ../rec_d4) || fail=1
+compare rec_d1 rec_d4 || fail=1
+returns_ 2 env GREP_THREADS=1 grep -r 'ser_match' no_such_dir_path 2>/dev/null || fail=1
+returns_ 2 env GREP_THREADS=4 grep -r 'ser_match' no_such_dir_path 2>/dev/null || fail=1
+
+# get_num_threads without GREP_THREADS in environment:
+env -u GREP_THREADS grep -F 'PAT_KEYWORD_25' kw_in.txt dfa_in.txt > /dev/null || fail=1
+
+# rob_try_commit_locked with --line-buffered:
+check_vs_serial --line-buffered -F 'PAT_KEYWORD_25' kw_in.txt dfa_in.txt
+
+# stream_commit_binary when stream_binary was set in slice 1 and slice 2 has no NUL byte:
+$PERL -e '
+  print "bin_match_s1 \0 nul\n";
+  print (("padding_line_" . ("x" x 80) . "\n") x 15000);
+  print "col_offset_match_s2\n";
+' | GREP_THREADS=4 grep -F 'col_offset_match_s2' > sbin4
+$PERL -e '
+  print "bin_match_s1 \0 nul\n";
+  print (("padding_line_" . ("x" x 80) . "\n") x 15000);
+  print "col_offset_match_s2\n";
+' | GREP_THREADS=1 grep -F 'col_offset_match_s2' > sbin1
+compare sbin1 sbin4 || fail=1
+
+# worker_run_mmap_scan & worker_run_stream_chunk: match at column > 0 on very first line:
+$PERL -e '
+  open my $fh, ">", "col_first.txt" or die;
+  print $fh "prefix_before_match_FIRST_LINE_COL_MATCH\n";
+  for (1..60000) {
+    print $fh "0123456789abcdefghijklmnopqrstuvwxyz0123456789\n";
+  }
+  close $fh;
+'
+check_vs_serial -F 'FIRST_LINE_COL_MATCH' col_first.txt
+GREP_THREADS=4 grep -F 'FIRST_LINE_COL_MATCH' < col_first.txt > col_s4
+GREP_THREADS=1 grep -F 'FIRST_LINE_COL_MATCH' < col_first.txt > col_s1
+compare col_s1 col_s4 || fail=1
+
+# worker_run_file_chunk early_stop + -I, chunked_grep_fd -q -I, and
+# format_context_matches_to_rob encoding_error_output:
+$PERL -e '
+  open my $fh, ">", "multi_chunk_match.txt" or die;
+  for my $c (1..12) {
+    print $fh "chunk_${c}_MANY_MATCH_TOK_\x80\n";
+    print $fh (("filler_line_" . ("a" x 70) . "\n") x 7000);
+  }
+  close $fh;
+'
+check_vs_serial -I -l -F 'MANY_MATCH_TOK_' multi_chunk_match.txt
+check_vs_serial -q -I -F 'MANY_MATCH_TOK_' multi_chunk_match.txt
+if test "$(LC_ALL=en_US.UTF-8 locale charmap 2>/dev/null)" = UTF-8; then
+  LC_ALL=en_US.UTF-8 check_vs_serial -C 1 -F 'MANY_MATCH_TOK_' multi_chunk_match.txt
+fi
+
+# walk_split_rest via -T -r on a directory with a >= 64 KiB file:
+mkdir -p split_dir
+$PERL -e '
+  open my $fh, ">", "split_dir/big80k.txt" or die;
+  print $fh (("line_in_80k_" . ("b" x 60) . "\n") x 1200);
+  print $fh "split_rest_match\n";
+  close $fh;
+'
+cp kw_in.txt split_dir/small.txt
+check_vs_serial -T -r -F 'split_rest_match' split_dir
+check_vs_serial --line-buffered -r -F 'split_rest_match' split_dir
+check_vs_serial -C 1 -m 1 -r -F 'PAT_KEYWORD_25' split_dir
+
+# walk_read_dir with -R (walk.logical) and -r: loop symlink, excluded symlink dir,
+# unreadable subdir, dangling symlink, and trailing slashes on root dir:
+mkdir -p wlog_dir/real_sub wlog_dir/excl_sub wlog_dir/no_perm_sub
+printf 'wlog_hit\n' > wlog_dir/real_sub/hit.txt
+printf 'wlog_hit\n' > wlog_dir/excl_sub/hit.txt
+printf 'wlog_hit\n' > wlog_dir/no_perm_sub/hit.txt
+ln -s .. wlog_dir/real_sub/loop_up
+ln -s excl_sub wlog_dir/sym_excl
+ln -s no_perm_sub wlog_dir/sym_noperm
+ln -s nowhere_target wlog_dir/dangling_link
+ln -s self_loop wlog_dir/self_loop
+chmod 000 wlog_dir/no_perm_sub
+check_vs_serial -R --exclude-dir='sym_excl' --exclude-dir='excl_sub' -F 'wlog_hit' wlog_dir///
+check_vs_serial -r --exclude-dir='excl_sub' -F 'wlog_hit' wlog_dir///
+chmod 700 wlog_dir/no_perm_sub
+
+# walk_before key collision (span == 0) and >64 tasks in walk_push_dir:
+# 25 levels deep with 5 sibling files per level ((5+2)^25 > 2^64, so span == 0 at leaf),
+# plus multiple subdirectories at depth 25 and 26 so walk.reads heap compares equal keys
+# across same-depth and different-depth directories:
+$PERL -e '
+  my $cur = "deep_span";
+  mkdir $cur;
+  for my $d (1..25) {
+    for my $f (1..5) {
+      open my $fh, ">", "$cur/f_$f.txt" or die;
+      print $fh "deep_match_${d}_${f}\n";
+      close $fh;
+    }
+    $cur = "$cur/d";
+    mkdir $cur or die;
+  }
+  for my $s (1..4) {
+    mkdir "$cur/sub_$s" or die;
+    open my $sf, ">", "$cur/sub_$s/s.txt" or die;
+    print $sf "deep_match_sub_$s\n";
+    close $sf;
+    for my $c (1..3) {
+      mkdir "$cur/sub_$s/child_$c" or die;
+      open my $fh, ">", "$cur/sub_$s/child_$c/leaf.txt" or die;
+      print $fh "deep_match_leaf_${s}_${c}\n";
+      close $fh;
+    }
+  }
+  mkdir "many_subdirs";
+  for my $i (1..70) {
+    mkdir "many_subdirs/sd_$i" or die;
+    open my $fh, ">", "many_subdirs/sd_$i/a.txt" or die;
+    print $fh "many_sd_match_$i\n";
+    close $fh;
+  }
+'
+check_vs_serial -r -F 'deep_match_' deep_span
+check_vs_serial -r -F 'many_sd_match_' many_subdirs
+
+Exit $fail
