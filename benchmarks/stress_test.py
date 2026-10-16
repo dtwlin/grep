@@ -34,6 +34,8 @@ def generate_workload(tmpdir, cycle):
         "tree",
         "chunked",
         "chunked_tricky",
+        "chunk_context_enc",
+        "mixed_operands",
         "small",
         "giant_line",
         "binary",
@@ -103,6 +105,37 @@ def generate_workload(tmpdir, cycle):
                 fp.write(b"nul\x00at_70k\n")
                 fp.write((b"y" * 69 + b"\n") * 32000)
         file_operands = [fpath]
+
+    elif workload_type == "chunk_context_enc":
+        # >=2.2 MiB file with invalid UTF-8 bytes and matches followed by a second file
+        f1 = os.path.join(work_path, "enc_chunk1.bin")
+        f2 = os.path.join(work_path, "enc_chunk2.txt")
+        target = "ENC_CTX_TARGET"
+        targets.append(target)
+        with open(f1, "wb") as fp:
+            fp.write(f"ctx_before\n{target} hit 1\nctx_after\n".encode())
+            fp.write((b"ascii_padding_line_0123456789\n") * 85000)
+            fp.write(b"bad_utf8_\xff_" + target.encode() + b"\ntrailing_line\n")
+        with open(f2, "wb") as fp:
+            fp.write(f"second_before\n{target} hit 2\nsecond_after\n".encode())
+        file_operands = [f1, f2]
+
+    elif workload_type == "mixed_operands":
+        # Cross-subsystem mix: small file + >2 MiB chunked file + stdin stream + trailing slash dir
+        f_small = os.path.join(work_path, "mix_small.txt")
+        f_big = os.path.join(work_path, "mix_big.txt")
+        target = "MIX_CROSS_TARGET"
+        targets.append(target)
+        with open(f_small, "wb") as fp:
+            fp.write(f"small_before\n{target} in small\nsmall_after\n".encode())
+        with open(f_big, "wb") as fp:
+            fp.write((b"big_filler_line_0123456789abcdef\n") * 70000)
+            fp.write(f"big_ctx\n{target} in big\nbig_end\n".encode())
+        stdin_data = (
+            f"stdin_ctx0\n{target} in stdin\nstdin_ctx1\n".encode()
+            + (b"stdin_filler_0123456789abcdef\n") * 75000
+        )
+        file_operands = [f_small, "-", f_big]
 
     elif workload_type == "nul_pattern":
         fpath = os.path.join(work_path, "nul_in.bin")

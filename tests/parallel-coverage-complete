@@ -703,6 +703,162 @@ for th, out_f, err_f in [("1", "exp_sparse_out", "exp_sparse_err"), ("4", "out_s
         exp_dfawarn_out out_dfawarn_out exp_dfawarn_err out_dfawarn_err \
         exp_sparse_out out_sparse_out exp_sparse_err out_sparse_err \
         exp_nt_stdin out_nt_stdin exp_c0_enc_out out_c0_enc_out exp_c0_enc_err out_c0_enc_err || framework_failure_
+
+  # 12. Concurrency, multithreaded & cross-mode transition regressions (Bugs 12-19:
+  #     /proc seq_file multi-read under walk, unreadable root dir trailing slashes,
+  #     concurrent >=16 MiB walk_bin_scan, stream_slicer_stdin ECONNRESET read error
+  #     ordering & incomplete line truncation, chunked context + encoding error + -m1
+  #     state restoration across files, stream slicer --group-separator across files,
+  #     open-pipe -q/-l/-L/--line-buffered non-blocking, and multi-stdin offset preservation)
+  if test -d "/proc/$$/task"; then
+    check_threads proc_smaps_walk grep -r --include=smaps '^Private_Hugetlb:' "/proc/$$/task"
+  fi
+
+  mkdir -p unread_slash_dir || framework_failure_
+  chmod 000 unread_slash_dir || framework_failure_
+  if ! test -r unread_slash_dir; then
+    returns_ 2 env GREP_THREADS=1 grep -r pat unread_slash_dir/// > exp_urs_out 2> exp_urs_err || fail=1
+    returns_ 2 env GREP_THREADS=4 grep -r pat unread_slash_dir/// > out_urs_out 2> out_urs_err || fail=1
+    compare exp_urs_out out_urs_out || fail=1
+    compare exp_urs_err out_urs_err || fail=1
+  fi
+  chmod 755 unread_slash_dir || framework_failure_
+  rm -rf unread_slash_dir exp_urs_out out_urs_out exp_urs_err out_urs_err || framework_failure_
+
+  python3 -c '
+import os, subprocess, tempfile, socket, struct, select
+
+with tempfile.TemporaryDirectory() as td:
+    # 12a. Concurrent walk_bin_scan on multiple >=16 MiB files in a directory tree
+    bdir = os.path.join(td, "bdir")
+    os.mkdir(bdir)
+    for i in range(3):
+        p = os.path.join(bdir, f"big_{i}.txt")
+        with open(p, "wb") as f:
+            f.write(b"aaaa_no_match_line\n" * 900000)
+            if i == 1:
+                f.write(b"WALK_CONC_16M_HIT\n")
+            f.write(b"bbbb_no_match_line\n" * 50000)
+    for flag in ["-l", "-L", "-q", "-c"]:
+        outs = []
+        for th in ["1", "4"]:
+            env = os.environ.copy()
+            env["GREP_THREADS"] = th
+            r = subprocess.run(["grep", "-r", flag, "WALK_CONC_16M_HIT", bdir], capture_output=True, env=env)
+            outs.append((r.stdout, r.stderr, r.returncode))
+        assert outs[0] == outs[1], f"walk_bin_scan mismatch for {flag}: {outs}"
+
+    # 12b. Chunked >2 MiB file with context (-C1), invalid UTF-8 byte, and -m1 followed by second file
+    f_enc1 = os.path.join(td, "enc1.txt")
+    f_enc2 = os.path.join(td, "enc2.txt")
+    with open(f_enc1, "wb") as f:
+        f.write(b"line_0\nmatch_target\nline_2\n")
+        f.write(b"padding_line_ascii_only\n" * 100000)
+        f.write(b"bad_utf8_\xff_match_target\nafter_bad\n")
+    with open(f_enc2, "wb") as f:
+        f.write(b"before2\nmatch_target\nafter2\n")
+    for flags in [["-C1", "-m1"], ["-C1", "-n"]]:
+        outs = []
+        for th in ["1", "4"]:
+            env = os.environ.copy()
+            env["GREP_THREADS"] = th
+            r = subprocess.run(["grep"] + flags + ["match_target", f_enc1, f_enc2], capture_output=True, env=env)
+            outs.append((r.stdout, r.stderr, r.returncode))
+        assert outs[0] == outs[1], f"chunk_context_enc mismatch for {flags}: {outs}"
+
+    # 12c. Stream slicer >2 MiB pipe followed by second file with -C1 (group separator)
+    f_pipe = os.path.join(td, "pipe_src.txt")
+    with open(f_pipe, "wb") as f:
+        f.write(b"ctx0\nmatch_target\nctx1\n")
+        f.write(b"filler_line_0123456789\n" * 120000)
+    with open(f_pipe, "rb") as fp:
+        pipe_bytes = fp.read()
+    for flags in [["-C1"], ["-C1", "-n"], ["-C1", "-H", "--label=STDIN_LBL"]]:
+        outs = []
+        for th in ["1", "4"]:
+            env = os.environ.copy()
+            env["GREP_THREADS"] = th
+            r = subprocess.run(["grep"] + flags + ["match_target", "-", f_enc2], input=pipe_bytes, capture_output=True, env=env)
+            outs.append((r.stdout, r.stderr, r.returncode))
+        assert outs[0] == outs[1], f"stream_sep mismatch for {flags}: {outs}"
+
+    # 12d. TCP RST on stdin in stream_slicer_stdin and producer_enqueue_stdin
+    f1 = os.path.join(td, "f1.txt")
+    f2 = os.path.join(td, "f2.txt")
+    with open(f1, "wb") as f:
+        f.write(b"before_match_target\n")
+    with open(f2, "wb") as f:
+        f.write(b"after_match_target\n")
+    for flags in [["-a"], ["-a", "-c"], ["-a", "-l"], ["-a", "-L"], ["-a", "--label=SOCK_IN", "-H", "-n"]]:
+        outs = []
+        for th in ["1", "4"]:
+            env = os.environ.copy()
+            env["GREP_THREADS"] = th
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(1)
+            cli = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            cli.connect(srv.getsockname())
+            conn, _ = srv.accept()
+            srv.close()
+            conn.sendall(b"first_match_target\nincomplete_match_target")
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            conn.close()
+            r = subprocess.run(["grep"] + flags + ["match_target", f1, "-", f2], stdin=cli.fileno(), capture_output=True, env=env)
+            cli.close()
+            outs.append((r.stdout, r.stderr, r.returncode))
+        assert outs[0] == outs[1], f"TCP RST mismatch for {flags}: {outs}"
+
+    # 12e. Open pipe with -q, -l, -L, and --line-buffered (must not block waiting for 2 MiB)
+    for flags in [["-q"], ["-l"], ["-L"]]:
+        for extra in [[], [f2, "-", f1]]:
+            outs = []
+            for th in ["1", "4"]:
+                env = os.environ.copy()
+                env["GREP_THREADS"] = th
+                rfd, wfd = os.pipe()
+                os.write(wfd, b"match_target\n")
+                p = subprocess.Popen(["grep"] + flags + ["match_target"] + extra, stdin=rfd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True, env=env)
+                os.close(rfd)
+                out, err = p.communicate(timeout=5.0)
+                os.close(wfd)
+                outs.append((out, err, p.returncode))
+            assert outs[0] == outs[1], f"Open pipe mismatch for {flags} {extra}: {outs}"
+
+    rfd, wfd = os.pipe()
+    os.write(wfd, b"match_target_1\n")
+    env = os.environ.copy()
+    env["GREP_THREADS"] = "4"
+    p = subprocess.Popen(["grep", "--line-buffered", "match_target"], stdin=rfd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True, env=env)
+    os.close(rfd)
+    rlist, _, _ = select.select([p.stdout], [], [], 5.0)
+    assert rlist, "--line-buffered hung on open pipe"
+    assert p.stdout.readline() == b"match_target_1\n"
+    os.write(wfd, b"match_target_2\n")
+    rlist, _, _ = select.select([p.stdout], [], [], 5.0)
+    assert rlist, "--line-buffered hung on 2nd line"
+    assert p.stdout.readline() == b"match_target_2\n"
+    os.close(wfd)
+    p.communicate(timeout=5.0)
+
+    # 12f. Multiple stdin operands ("-" "-") and stdin file offset preservation on >=3 MiB file
+    big_in = os.path.join(td, "big_in.txt")
+    with open(big_in, "wb") as f:
+        f.write(b"match_target\n")
+        f.write(b"filler_line_0123456789\n" * 150000)
+        f.write(b"match_target\n")
+    for flags in [[], ["-c"], ["-l"], ["-L"], ["-q"], ["-m1"]]:
+        for extra in [[], ["-", "-"]]:
+            outs = []
+            for th in ["1", "4"]:
+                env = os.environ.copy()
+                env["GREP_THREADS"] = th
+                with open(big_in, "rb") as fp:
+                    r = subprocess.run(["grep"] + flags + ["match_target"] + extra, stdin=fp, capture_output=True, env=env)
+                    pos = os.lseek(fp.fileno(), 0, os.SEEK_CUR)
+                    outs.append((r.stdout, r.stderr, r.returncode, pos))
+            assert outs[0] == outs[1], f"Multi-stdin/offset mismatch for {flags} {extra}: {outs}"
+' || fail=1
 fi
 
 Exit $fail

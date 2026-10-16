@@ -704,23 +704,59 @@ def run_edge_case_conformance():
     checks.append(("UTF-8 -F -i -w -o s/!s quirk", ["-F", "-i", "-w", "-o", "-e", "s", "-e", "!s", utf8_quirk_w_file], {"LC_ALL": "en_US.UTF-8"}, None))
     checks.append(("UTF-8 -F -i -w --color i/!i", ["-F", "-i", "-w", "--color=always", "-e", "i", "-e", "!i", utf8_quirk_w_file], {"LC_ALL": "en_US.UTF-8"}, None))
 
+    # 33. Round 6 concurrency, multithreaded & cross-mode transition regressions (Bugs 12-19)
+    unread_slash_dir = os.path.join(BENCH_DIR, "regress_unread_slash")
+    os.makedirs(unread_slash_dir, exist_ok=True)
+    os.chmod(unread_slash_dir, 0)
+
+    chunk_ctx_enc1 = os.path.join(BENCH_DIR, "regress_chunk_ctx_enc1.bin")
+    with open(chunk_ctx_enc1, "wb") as f:
+        f.write(b"line_0\nmatch_target\nline_2\n")
+        f.write(b"padding_line_ascii_only\n" * 100000)
+        f.write(b"bad_utf8_\xff_match_target\nafter_bad\n")
+
+    chunk_ctx_enc2 = os.path.join(BENCH_DIR, "regress_chunk_ctx_enc2.txt")
+    with open(chunk_ctx_enc2, "wb") as f:
+        f.write(b"before2\nmatch_target\nafter2\n")
+
+    pipe_2m_sep = os.path.join(BENCH_DIR, "regress_pipe_2m_sep.txt")
+    with open(pipe_2m_sep, "wb") as f:
+        f.write(b"ctx0\nmatch_target\nctx1\n")
+        f.write(b"filler_line_0123456789\n" * 120000)
+
+    if os.path.exists(f"/proc/{os.getpid()}/task"):
+        checks.append(("Procfs seq_file smaps walk", ["-r", "--include=smaps", "^Private_Hugetlb:", f"/proc/{os.getpid()}/task"], None, None))
+    if not os.access(unread_slash_dir, os.R_OK):
+        checks.append(("Unreadable root dir /// diag", ["-r", "pat", unread_slash_dir + "///"], None, None))
+    checks.append(("Chunked -C1 -m1 enc_err + file2", ["-C", "1", "-m", "1", "match_target", chunk_ctx_enc1, chunk_ctx_enc2], {"LC_ALL": "en_US.UTF-8"}, None))
+    checks.append(("Chunked -C1 -n enc_err + file2", ["-C", "1", "-n", "match_target", chunk_ctx_enc1, chunk_ctx_enc2], {"LC_ALL": "en_US.UTF-8"}, None))
+    checks.append(("Stream >2MB -C1 group-sep + file2", ["-C", "1", "match_target", "-", chunk_ctx_enc2], None, f"pipe:{pipe_2m_sep}"))
+    checks.append(("Stream >2MB -C1 --label + file2", ["-C", "1", "-H", "--label=STDIN_LBL", "match_target", "-", chunk_ctx_enc2], None, f"pipe:{pipe_2m_sep}"))
+    checks.append(("Multi-stdin -l on >=2MB file", ["-l", "match_target", "-", "-"], None, "redirect"))
+    checks.append(("Multi-stdin -L on >=2MB file", ["-L", "match_target", "-", "-"], None, "redirect"))
+
     passed = 0
     total = len(checks)
-    for name, args, env_vars, preexec in checks:
-        b_env = dict(env_vars) if env_vars else {}
-        if BASELINE_BIN == CURRENT_BIN:
-            b_env["GREP_THREADS"] = "1"
-        p_mode = preexec if isinstance(preexec, str) and preexec.startswith("pipe:") else None
-        p_fn = None if p_mode else preexec
-        _, b_rc, b_out, b_err, _ = run_once(BASELINE_BIN, args, env_vars=b_env, pipe_mode=p_mode, preexec_fn=None)
-        _, c_rc, c_out, c_err, c_len = run_once(CURRENT_BIN, args, env_vars=env_vars, pipe_mode=p_mode, preexec_fn=p_fn)
+    try:
+        for name, args, env_vars, preexec in checks:
+            b_env = dict(env_vars) if env_vars else {}
+            if BASELINE_BIN == CURRENT_BIN:
+                b_env["GREP_THREADS"] = "1"
+            p_mode = preexec if isinstance(preexec, str) and (preexec.startswith("pipe:") or preexec == "redirect") else None
+            p_fn = None if p_mode else preexec
+            _, b_rc, b_out, b_err, _ = run_once(BASELINE_BIN, args, env_vars=b_env, pipe_mode=p_mode, preexec_fn=None)
+            _, c_rc, c_out, c_err, c_len = run_once(CURRENT_BIN, args, env_vars=env_vars, pipe_mode=p_mode, preexec_fn=p_fn)
 
-        if b_rc == c_rc and b_out == c_out and b_err == c_err:
-            passed += 1
-            print(f"  [PASS] {name:<36} (rc={c_rc}, out_len={c_len:,} B)")
-        else:
-            print(f"  [FAIL] {name:<36} (rc: {b_rc} vs {c_rc}, stdout_match: {b_out == c_out}, stderr_match: {b_err == c_err})")
-            sys.exit(1)
+            if b_rc == c_rc and b_out == c_out and b_err == c_err:
+                passed += 1
+                print(f"  [PASS] {name:<36} (rc={c_rc}, out_len={c_len:,} B)")
+            else:
+                print(f"  [FAIL] {name:<36} (rc: {b_rc} vs {c_rc}, stdout_match: {b_out == c_out}, stderr_match: {b_err == c_err})")
+                sys.exit(1)
+    finally:
+        if os.path.exists(unread_slash_dir):
+            os.chmod(unread_slash_dir, 0o755)
+            shutil.rmtree(unread_slash_dir, ignore_errors=True)
 
     print(f"\nAll {passed}/{total} edge-case conformance checks PASSED 100% byte-for-byte!\n")
 
