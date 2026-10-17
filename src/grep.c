@@ -86,6 +86,19 @@
 #include "xbinary-io.h"
 #include "xstrtol.h"
 
+/* Test hooks.  A build with -DGREP_TEST_HOOKS sleeps at the named
+   points where threads hand data over to each other, as requested by
+   the environment variable GREP_DELAY_AT="SITE:USEC[,SITE:USEC]...",
+   where SITE "*" matches every point.  This widens race windows so
+   that tests can catch races deterministically.  Other builds compile
+   the hooks away.  */
+#ifdef GREP_TEST_HOOKS
+static void grep_test_delay (char const *site);
+# define GREP_TEST_DELAY(site) grep_test_delay (site)
+#else
+# define GREP_TEST_DELAY(site) ((void) 0)
+#endif
+
 enum { SEP_CHAR_SELECTED = ':' };
 enum { SEP_CHAR_REJECTED = '-' };
 static char const SEP_STR_GROUP[] = "--";
@@ -530,7 +543,21 @@ static _Thread_local bool tls_deferred;
    it lets other threads search the rest of the batch; see
    walk_split_rest.  WALK_CUR_TASK is the batch that the current thread
    is searching, if any.  */
-enum { WALK_SPLIT_SIZE = 2 * 1024 * 1024 };
+#ifndef GREP_WALK_SPLIT_SIZE
+# define GREP_WALK_SPLIT_SIZE (2 * 1024 * 1024)
+#endif
+enum { WALK_SPLIT_SIZE = GREP_WALK_SPLIT_SIZE };
+/* A recursive search scans a binary file of at least WALK_BIN_SCAN_MIN
+   bytes with -q in slices of WALK_BIN_SLICE bytes that any thread may
+   search; see walk_bin_scan.  */
+#ifndef GREP_WALK_BIN_SCAN_MIN
+# define GREP_WALK_BIN_SCAN_MIN (16 * 1024 * 1024)
+#endif
+#ifndef GREP_WALK_BIN_SLICE
+# define GREP_WALK_BIN_SLICE (4 * 1024 * 1024)
+#endif
+enum { WALK_BIN_SCAN_MIN = GREP_WALK_BIN_SCAN_MIN };
+enum { WALK_BIN_SLICE = GREP_WALK_BIN_SLICE };
 struct walk_task;
 static _Thread_local struct walk_task *walk_cur_task;
 static void walk_split_rest (void);
@@ -2164,6 +2191,7 @@ grepbuf (char *beg, char const *lim)
                 {
                   if (!buffering_enabled)
                     {
+                      GREP_TEST_DELAY ("quiet_exit");
                       atomic_store (&skip_clean_up_stdout, true);
                       exit (EXIT_SUCCESS);
                     }
@@ -2193,6 +2221,7 @@ grep_mark_quiet_match_used (void)
       task_had_prtext = true;
       if (exit_on_match && !buffering_enabled)
         {
+          GREP_TEST_DELAY ("quiet_exit");
           atomic_store (&skip_clean_up_stdout, true);
           exit (EXIT_SUCCESS);
         }
@@ -2251,7 +2280,7 @@ grep_try_fast_binary_mmap (int fd, struct stat *st, idx_t residue,
 #elif defined POSIX_MADV_SEQUENTIAL
   posix_madvise ((void *) map, st->st_size, POSIX_MADV_SEQUENTIAL);
 #endif
-  if (walk_cur_task && st->st_size >= 16 * 1024 * 1024 && pool_target > 1)
+  if (walk_cur_task && st->st_size >= WALK_BIN_SCAN_MIN && pool_target > 1)
     {
       if (walk_bin_scan (map, st->st_size, scan_start))
         *nlines_inout = 1;
@@ -3562,8 +3591,39 @@ struct chunk_file_state
   int offset_width;
 };
 
-enum { WORK_QUEUE_CAP = 256 };
-enum { ROB_CAP = 1024 };
+/* Capacities of the work queue and of the reorder buffer (ROB).  Tests
+   build grep with much smaller values (see src/Makefile.am), so that
+   every path that waits for space runs often.  */
+#ifndef GREP_WORK_QUEUE_CAP
+# define GREP_WORK_QUEUE_CAP 256
+#endif
+#ifndef GREP_ROB_CAP
+# define GREP_ROB_CAP 1024
+#endif
+enum { WORK_QUEUE_CAP = GREP_WORK_QUEUE_CAP };
+enum { ROB_CAP = GREP_ROB_CAP };
+
+/* A file is searched in at most this many chunks.  All chunks of a file
+   must fit in the work queue at once, and their ROB slots, which may
+   not be committed before all chunks are searched, must leave room for
+   the slots of other inputs.  */
+enum { MAX_FILE_CHUNKS = MIN (64, MIN (WORK_QUEUE_CAP, ROB_CAP / 2)) };
+static_assert (2 <= MAX_FILE_CHUNKS);
+
+/* The stream slicer keeps at most this many slices in flight.  */
+enum { STREAM_MAX_INFLIGHT = MIN (56, ROB_CAP / 2) };
+static_assert (1 <= STREAM_MAX_INFLIGHT);
+
+/* Regular files of at least CHUNK_FILE_MIN bytes are searched in
+   chunks of at least CHUNK_MIN_SIZE bytes each.  */
+#ifndef GREP_CHUNK_FILE_MIN
+# define GREP_CHUNK_FILE_MIN (2 * 1024 * 1024)
+#endif
+#ifndef GREP_CHUNK_MIN_SIZE
+# define GREP_CHUNK_MIN_SIZE (2 * 1024 * 1024)
+#endif
+enum { CHUNK_FILE_MIN = GREP_CHUNK_FILE_MIN };
+enum { CHUNK_MIN_SIZE = GREP_CHUNK_MIN_SIZE };
 
 static struct rob_slot rob[ROB_CAP];
 static uint64_t next_seq;
@@ -3586,8 +3646,14 @@ static size_t rob_done_waiters = 0;
 static bool pool_terminate;
 static void rob_try_commit_locked (void);
 
-enum { SLICE_BUF_SIZE = 1024 * 1024 };
-enum { SLICE_POOL_CAP = 64 };
+#ifndef GREP_SLICE_BUF_SIZE
+# define GREP_SLICE_BUF_SIZE (1024 * 1024)
+#endif
+#ifndef GREP_SLICE_POOL_CAP
+# define GREP_SLICE_POOL_CAP 64
+#endif
+enum { SLICE_BUF_SIZE = GREP_SLICE_BUF_SIZE };
+enum { SLICE_POOL_CAP = GREP_SLICE_POOL_CAP };
 static char *slice_freelist[SLICE_POOL_CAP];
 static int slice_freelist_cnt = 0;
 static pthread_cond_t slice_avail_cv = PTHREAD_COND_INITIALIZER;
@@ -4215,6 +4281,7 @@ rob_try_commit_locked (void)
             fflush_errno ();
           if (stdout_errno)
             die_write_error ();
+          GREP_TEST_DELAY ("quiet_exit");
           atomic_store (&skip_clean_up_stdout, true);
           exit (EXIT_SUCCESS);
         }
@@ -4258,7 +4325,10 @@ static void walk_free_thread_buffers (void);
 /* Chunk tasks search in pieces of about this many bytes, so that the
    check for null bytes reads each piece while the search has left it in
    cache.  */
-enum { CHUNK_PIECE = 128 * 1024 };
+#ifndef GREP_CHUNK_PIECE
+# define GREP_CHUNK_PIECE (128 * 1024)
+#endif
+enum { CHUNK_PIECE = GREP_CHUNK_PIECE };
 
 static void chunk_slot_done_locked (struct chunk_file_state *state);
 
@@ -4520,6 +4590,7 @@ worker_run_mmap_scan (struct work_task const *task)
   if (atomic_fetch_add (&state->chunks_completed, 1) == state->num_chunks - 1)
     pthread_cond_signal (&state->done_cv);
   pthread_mutex_unlock (&state->done_mutex);
+  GREP_TEST_DELAY ("mmap_scan_done");
 }
 
 /* Execute a TASK_TYPE_STREAM_CHUNK task.  Return true if the ROB slot
@@ -4791,6 +4862,7 @@ worker_thread_func (void *arg)
       q_count--;
       pthread_cond_signal (&q_not_full_cv);
       pthread_mutex_unlock (&pool_mutex);
+      GREP_TEST_DELAY ("worker_dequeued");
 
       if (task.type == TASK_TYPE_WALK)
         {
@@ -4839,6 +4911,7 @@ worker_thread_func (void *arg)
           memcpy (copy_out, tls_out.data, tls_out.len);
         }
 
+      GREP_TEST_DELAY ("worker_complete");
       pthread_mutex_lock (&pool_mutex);
       rob_complete_worker_slot_locked (&task, status, chunk_matched_cnt,
                                        enc_error, copy_out);
@@ -4857,7 +4930,10 @@ worker_thread_func (void *arg)
   return NULL;
 }
 
-enum { PRODUCER_BATCH_SIZE = 32 };
+#ifndef GREP_PRODUCER_BATCH_SIZE
+# define GREP_PRODUCER_BATCH_SIZE 32
+#endif
+enum { PRODUCER_BATCH_SIZE = GREP_PRODUCER_BATCH_SIZE };
 
 struct producer_batch_item
 {
@@ -4941,6 +5017,7 @@ producer_enqueue_stdin (void)
   overall_status &= status;
   if (exit_on_match && !status)
     {
+      GREP_TEST_DELAY ("quiet_exit");
       atomic_store (&skip_clean_up_stdout, true);
       exit (EXIT_SUCCESS);
     }
@@ -5379,6 +5456,7 @@ enqueue_single_pass_chunks (struct chunk_file_state *state,
       size_t c_end = bounds[k + 1];
       bool is_last = (k == num_chunks - 1);
 
+      GREP_TEST_DELAY ("chunk_enqueue");
       pthread_mutex_lock (&pool_mutex);
       uint64_t seq = producer_alloc_slot_locked ();
       struct rob_slot *slot = &rob[seq % ROB_CAP];
@@ -5530,8 +5608,8 @@ chunk_create_state (int fd, bool close_fd, char const *fname,
                     struct stat const *st, char *base, size_t total_alloc,
                     char *data, size_t effective_size)
 {
-  size_t num_chunks = MIN ((size_t) pool_nthreads * 2, 64);
-  size_t min_chunk_size = 2 * 1024 * 1024;
+  size_t num_chunks = MIN ((size_t) pool_nthreads * 2, MAX_FILE_CHUNKS);
+  size_t min_chunk_size = CHUNK_MIN_SIZE;
   if (effective_size / num_chunks < min_chunk_size)
     num_chunks = effective_size / min_chunk_size;
   if (num_chunks < 2)
@@ -5846,12 +5924,13 @@ stream_enqueue_slice_task (char *chunk_alloc, char *chunk_data,
   chunk_data[chunk_len] = eolbyte;
   memset (chunk_data + chunk_len + 1, 0, uword_size);
 
+  GREP_TEST_DELAY ("slice_enqueue");
   pthread_mutex_lock (&pool_mutex);
 
-  while (next_seq - commit_seq >= 56 && !pool_terminate)
+  while (next_seq - commit_seq >= STREAM_MAX_INFLIGHT && !pool_terminate)
     {
       rob_try_commit_locked ();
-      if (next_seq - commit_seq < 56)
+      if (next_seq - commit_seq < STREAM_MAX_INFLIGHT)
         break;
       rob_space_waiters++;
       pthread_cond_wait (&rob_space_cv, &pool_mutex);
@@ -6030,13 +6109,22 @@ stream_slicer_stdin (void)
      checks for exclusion patterns, devices and symbolic links.  */
 
 /* Maximum number of files searched by one task.  */
-enum { WALK_BATCH = 32 };
+#ifndef GREP_WALK_BATCH
+# define GREP_WALK_BATCH 32
+#endif
+enum { WALK_BATCH = GREP_WALK_BATCH };
 
 /* gnulib fts reads at most this many entries of a directory at a time,
    and sorts a batch by inode number if it has more than
    WALK_INODE_SORT_MIN entries.  */
-enum { WALK_READDIR_BATCH = 100000 };
-enum { WALK_INODE_SORT_MIN = 10000 };
+#ifndef GREP_WALK_READDIR_BATCH
+# define GREP_WALK_READDIR_BATCH 100000
+#endif
+#ifndef GREP_WALK_INODE_SORT_MIN
+# define GREP_WALK_INODE_SORT_MIN 10000
+#endif
+enum { WALK_READDIR_BATCH = GREP_WALK_READDIR_BATCH };
+enum { WALK_INODE_SORT_MIN = GREP_WALK_INODE_SORT_MIN };
 
 enum walk_kind
 {
@@ -6130,7 +6218,10 @@ struct walk_bin_job
   size_t slice_size;
 };
 
-enum { WALK_BUF_CAP = 256 * 1024 * 1024 };
+#ifndef GREP_WALK_BUF_CAP
+# define GREP_WALK_BUF_CAP (256 * 1024 * 1024)
+#endif
+enum { WALK_BUF_CAP = GREP_WALK_BUF_CAP };
 
 static struct
 {
@@ -6421,6 +6512,7 @@ walk_free_out (struct walk_out *o)
 static void
 walk_unref (struct walk_dir *d)
 {
+  GREP_TEST_DELAY ("walk_unref");
   if (atomic_fetch_sub (&d->refs, 1) == 1)
     {
       for (size_t i = 0; i < d->nents; i++)
@@ -6475,6 +6567,7 @@ walk_close_fd_locked (struct walk_dir *d)
 static void
 walk_fd_release (struct walk_dir *d)
 {
+  GREP_TEST_DELAY ("walk_fd_release");
   if (!walk.logical && atomic_fetch_sub (&d->fd_users, 1) == 1)
     {
       if (!d->in_fd_list)
@@ -7205,6 +7298,7 @@ walk_recruit (unsigned int gen)
 {
   walk_recruited = true;
   ensure_pool ();
+  GREP_TEST_DELAY ("walk_recruit");
   pthread_mutex_lock (&pool_mutex);
   for (int i = 0; i < pool_nthreads; i++)
     {
@@ -7246,7 +7340,10 @@ walk_maybe_recruit (void)
 #ifndef WALK_SPLIT_FILE_NS
 # define WALK_SPLIT_FILE_NS (500 * 1000)
 #endif
-enum { WALK_SPLIT_MIN_REM = 8 };
+#ifndef GREP_WALK_SPLIT_MIN_REM
+# define GREP_WALK_SPLIT_MIN_REM 8
+#endif
+enum { WALK_SPLIT_MIN_REM = GREP_WALK_SPLIT_MIN_REM };
 
 /* The entry of WALK_CUR_TASK whose file the current thread searches.  */
 static _Thread_local size_t walk_cur_index;
@@ -7282,6 +7379,7 @@ walk_split (struct walk_task *t, size_t lo)
       pthread_mutex_unlock (&walk.fd_mu);
     }
 
+  GREP_TEST_DELAY ("walk_split");
   pthread_mutex_lock (&walk.mu);
   walk_heap_push (&walk.files, n);
   if (walk.idle)
@@ -7466,6 +7564,7 @@ walk_commit_ent (struct walk_dir *d, struct walk_ent *e)
     errseen = true;
   if (exit_on_match && !e->status)
     {
+      GREP_TEST_DELAY ("quiet_exit");
       atomic_store (&skip_clean_up_stdout, true);
       exit (EXIT_SUCCESS);
     }
@@ -7530,6 +7629,7 @@ walk_commit_locked (void)
 static void
 walk_commit (void)
 {
+  GREP_TEST_DELAY ("walk_commit");
   atomic_fetch_add (&walk.commit_req, 1);
   while (pthread_mutex_trylock (&walk.commit_mu) == 0)
     {
@@ -7621,13 +7721,14 @@ walk_bin_scan (char const *map, size_t size, size_t scan_offset)
   atomic_init (&job.next_offset, scan_offset);
   atomic_init (&job.found, false);
   atomic_init (&job.active_workers, 1);
-  job.slice_size = 4 * 1024 * 1024;
+  job.slice_size = WALK_BIN_SLICE;
 
   bool published = false;
   walk_help_bin_job (&job, &published);
 
   if (published)
     {
+      GREP_TEST_DELAY ("walk_bin_job");
       pthread_mutex_lock (&walk.mu);
       walk.bin_job = nullptr;
       while (atomic_load (&job.active_workers) > 1)
@@ -7674,6 +7775,7 @@ walk_participate (unsigned int gen)
         }
       walk.running++;
       pthread_mutex_unlock (&walk.mu);
+      GREP_TEST_DELAY ("walk_task");
       bool should_commit = walk_run_task (t);
       if (should_commit)
         walk_commit ();
@@ -7814,20 +7916,20 @@ walk_run_cmd_files (char *const *files, size_t nfiles)
       holder->ents[i].status = true;
     }
 
-  size_t ntasks = (nfiles + 31) / 32;
+  size_t ntasks = (nfiles + WALK_BATCH - 1) / WALK_BATCH;
   atomic_init (&holder->refs, ntasks + 1);
   atomic_init (&holder->fd_users, 0);
 
   pthread_mutex_lock (&walk.mu);
   unsigned int gen = walk_begin_generation_locked (holder);
   uint64_t span = (holder->key_hi - holder->key_lo) / (holder->nents + 1);
-  for (size_t b = 0; b < nfiles; b += 32)
+  for (size_t b = 0; b < nfiles; b += WALK_BATCH)
     {
       struct walk_task *t = xmalloc (sizeof *t);
       *t = (struct walk_task) {
         .dir = holder,
         .lo = b,
-        .hi = MIN (b + 32, nfiles),
+        .hi = MIN (b + WALK_BATCH, nfiles),
         .key = holder->key_lo + b * span,
         .read = false
       };
@@ -7864,7 +7966,7 @@ producer_run (char *const *files)
           bool stdin_is_reg = stdin_ok && S_ISREG (st.st_mode);
           if (pool_target > 1 && !isatty (STDIN_FILENO)
               && stdin_is_reg
-              && st.st_size >= 2 * 1024 * 1024
+              && st.st_size >= CHUNK_FILE_MIN
               && !SAME_INODE (st, out_stat)
               && lseek (STDIN_FILENO, 0, SEEK_CUR) == 0
               && (!out_invert || (out_before < 0 && out_after < 0))
@@ -7904,7 +8006,8 @@ producer_run (char *const *files)
                   walk_run_dirs (f, f_end - f);
                   f = f_end - 1;
                 }
-              else if (S_ISREG (st.st_mode) && st.st_size >= 2 * 1024 * 1024 && pool_target > 1
+              else if (S_ISREG (st.st_mode) && st.st_size >= CHUNK_FILE_MIN
+                       && pool_target > 1
                        && (!out_invert || (out_before < 0 && out_after < 0))
                        && max_count == INTMAX_MAX)
                 chunked_grep_file (*f, &st);
@@ -7929,6 +8032,7 @@ pool_spawner (void *arg)
   pthread_attr_setstacksize (&attr, 1024 * 1024);
   for (int i = 1; i < pool_nthreads; i++)
     {
+      GREP_TEST_DELAY ("spawn");
       if (atomic_load (&pool_stop_spawning)
           || pthread_create (&pool_threads[i], &attr, worker_thread_func,
                              nullptr) != 0)
@@ -7959,6 +8063,7 @@ start_worker_pool (int nthreads)
       pool_nthreads = 0;
     }
   pthread_attr_destroy (&attr);
+  GREP_TEST_DELAY ("pool_started");
 }
 
 /* Start the worker threads if they are not running yet.  */
@@ -7985,6 +8090,7 @@ finish_worker_pool (void)
       pthread_cond_broadcast (&slice_avail_cv);
       pthread_mutex_unlock (&pool_mutex);
 
+      GREP_TEST_DELAY ("pool_join");
       /* Join the first worker first: once it has exited, it has created
          all the threads it will create.  */
       atomic_store (&pool_stop_spawning, true);
@@ -8180,7 +8286,7 @@ compute_worker_threads (char *const *files)
       bool stdin_ok = fstat (STDIN_FILENO, &in_st) == 0;
       bool stdin_is_reg = stdin_ok && S_ISREG (in_st.st_mode);
       bool stdin_is_large_reg = (stdin_is_reg
-                                 && in_st.st_size >= 2 * 1024 * 1024
+                                 && in_st.st_size >= CHUNK_FILE_MIN
                                  && !SAME_INODE (in_st, out_stat)
                                  && lseek (STDIN_FILENO, 0, SEEK_CUR) == 0
                                  && list_files == LISTFILES_NONE
@@ -8202,7 +8308,7 @@ compute_worker_threads (char *const *files)
       && !skipped_file (*files, true, S_ISDIR (tmp_st.st_mode) != 0))
     {
       is_single_large_file = (S_ISREG (tmp_st.st_mode)
-                              && tmp_st.st_size >= 2 * 1024 * 1024
+                              && tmp_st.st_size >= CHUNK_FILE_MIN
                               && (!out_invert
                                   || (out_before < 0 && out_after < 0)));
       is_dir_recurse = (directories == RECURSE_DIRECTORIES
@@ -8635,6 +8741,50 @@ parse_grep_options (int argc, char **argv, char **keys_inout,
     use_simple_includes = false;
 }
 
+#ifdef GREP_TEST_HOOKS
+/* The delays requested by GREP_DELAY_AT; see GREP_TEST_DELAY.  */
+static struct { char site[32]; unsigned int usec; } test_delays[32];
+static int n_test_delays;
+
+/* Parse GREP_DELAY_AT.  Call this before starting threads.  */
+static void
+init_test_delays (void)
+{
+  char const *env = getenv ("GREP_DELAY_AT");
+  if (!env)
+    return;
+  if (STREQ (env, "probe"))
+    {
+      puts ("grep-test-hooks");
+      exit (EXIT_SUCCESS);
+    }
+  for (char const *p = env; *p && n_test_delays < 32; )
+    {
+      char const *colon = strchr (p, ':');
+      if (!colon)
+        break;
+      size_t len = MIN ((size_t) (colon - p), sizeof test_delays[0].site - 1);
+      memcpy (test_delays[n_test_delays].site, p, len);
+      test_delays[n_test_delays].site[len] = '\0';
+      char *end;
+      test_delays[n_test_delays].usec = strtoul (colon + 1, &end, 10);
+      n_test_delays++;
+      p = *end == ',' ? end + 1 : end;
+    }
+}
+
+static void
+grep_test_delay (char const *site)
+{
+  for (int i = 0; i < n_test_delays; i++)
+    if (STREQ (test_delays[i].site, "*") || STREQ (test_delays[i].site, site))
+      {
+        usleep (test_delays[i].usec);
+        return;
+      }
+}
+#endif
+
 int
 main (int argc, char **argv)
 {
@@ -8677,6 +8827,9 @@ main (int argc, char **argv)
 
   atexit (clean_up_stdout);
   c_stack_action (nullptr);
+#ifdef GREP_TEST_HOOKS
+  init_test_delays ();
+#endif
 
   pattern_table = hash_initialize (0, nullptr, hash_pattern, compare_patterns,
                                    nullptr);

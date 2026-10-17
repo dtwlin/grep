@@ -1,3 +1,5 @@
 /grep
 /egrep
 /fgrep
+/grep-hooks
+/grep-shrunk

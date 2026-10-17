@@ -36,6 +36,29 @@ endif
 
 noinst_HEADERS = grep.h search.h system.h
 
+# Test-only builds of grep, never installed.  grep-hooks honors
+# GREP_DELAY_AT (see GREP_TEST_DELAY in grep.c).  grep-shrunk also uses
+# tiny queues, buffers and batches, so that every path that waits for
+# space or splits work runs often, and recruits and splits eagerly.
+check_PROGRAMS = grep-hooks grep-shrunk
+grep_hooks_SOURCES = $(grep_SOURCES)
+grep_hooks_CPPFLAGS = $(AM_CPPFLAGS) -DGREP_TEST_HOOKS
+grep_hooks_LDADD = $(grep_LDADD)
+grep_shrunk_SOURCES = $(grep_SOURCES)
+grep_shrunk_CPPFLAGS = $(AM_CPPFLAGS) -DGREP_TEST_HOOKS \
+  -DGREP_ROB_CAP=8 -DGREP_WORK_QUEUE_CAP=4 \
+  -DGREP_SLICE_BUF_SIZE=4096 -DGREP_SLICE_POOL_CAP=2 \
+  -DGREP_PRODUCER_BATCH_SIZE=2 \
+  -DGREP_CHUNK_FILE_MIN=131072 -DGREP_CHUNK_MIN_SIZE=16384 \
+  -DGREP_CHUNK_PIECE=4096 \
+  -DGREP_WALK_BATCH=2 -DGREP_WALK_SPLIT_SIZE=65536 \
+  -DGREP_WALK_SPLIT_MIN_REM=2 -DGREP_WALK_READDIR_BATCH=8 \
+  -DGREP_WALK_INODE_SORT_MIN=16 -DGREP_WALK_BUF_CAP=65536 \
+  -DGREP_WALK_BIN_SCAN_MIN=262144 -DGREP_WALK_BIN_SLICE=65536 \
+  -DWALK_RECRUIT_NS=200000 -DWALK_SPLIT_NS=200000 \
+  -DWALK_SPLIT_FILE_NS=20000 -DWALK_FD_CAP_MAX=4
+grep_shrunk_LDADD = $(grep_LDADD)
+
 # Sometimes, the expansion of $(LIBINTL) includes -lc which may
 # include modules defining variables like 'optind', so libgreputils.a
 # must precede $(LIBINTL) in order to ensure we use GNU getopt.
