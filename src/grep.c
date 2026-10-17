@@ -1633,6 +1633,12 @@ static bool global_used;
 static _Thread_local bool file_used;
 static _Thread_local bool task_had_prtext;
 
+/* True if the current buffered task output a line with prline.
+   Single-threaded grep dies of an earlier write error only after
+   outputting a line (see prline), so the committer does so only after
+   committing the output of a task that output one.  */
+static _Thread_local bool task_had_prline;
+
 static idx_t _GL_ATTRIBUTE_PURE
 count_newlines (char const *beg, char const *lim)
 {
@@ -2004,6 +2010,7 @@ prline (char *beg, char *lim, char sep)
 
   if (!buffering_enabled && stdout_errno)
     die_write_error ();
+  task_had_prline = true;
 
   lastout = lim;
 }
@@ -3419,6 +3426,7 @@ struct rob_slot
   bool status;
   bool errseen;
   bool had_prtext;
+  bool had_prline;              /* see TASK_HAD_PRLINE */
   bool sep;
 
   char *stdout_buf;
@@ -3811,6 +3819,7 @@ task_reset (void)
   pending = 0;
   file_used = false;
   task_had_prtext = false;
+  task_had_prline = false;
   task_sep = false;
 }
 
@@ -3836,6 +3845,7 @@ struct search_tls_state
   int offset_width;
   bool file_used;
   bool task_had_prtext;
+  bool task_had_prline;
   bool task_sep;
   bool tls_errseen;
   struct membuf tls_out;
@@ -3864,6 +3874,7 @@ save_search_tls (struct search_tls_state *s)
   s->offset_width = offset_width;
   s->file_used = file_used;
   s->task_had_prtext = task_had_prtext;
+  s->task_had_prline = task_had_prline;
   s->task_sep = task_sep;
   s->tls_errseen = tls_errseen;
   s->tls_out = tls_out;
@@ -3892,6 +3903,7 @@ restore_search_tls (struct search_tls_state const *s)
   offset_width = s->offset_width;
   file_used = s->file_used;
   task_had_prtext = s->task_had_prtext;
+  task_had_prline = s->task_had_prline;
   task_sep = s->task_sep;
   tls_errseen = s->tls_errseen;
   tls_out = s->tls_out;
@@ -3906,6 +3918,7 @@ rob_capture_tls_output (struct rob_slot *slot)
 {
   slot->errseen = tls_errseen;
   slot->had_prtext = task_had_prtext;
+  slot->had_prline = task_had_prline;
   slot->sep = task_sep;
   if (tls_out.data && tls_out.len <= sizeof slot->inline_out)
     {
@@ -4184,7 +4197,7 @@ rob_try_commit_locked (void)
       if (line_buffered)
         fflush_errno ();
 
-      if (stdout_errno)
+      if (stdout_errno && slot->had_prline)
         die_write_error ();
 
       overall_status &= slot->status;
@@ -4688,6 +4701,7 @@ rob_complete_worker_slot_locked (struct work_task const *task, bool status,
   slot->status = status;
   slot->errseen = tls_errseen;
   slot->had_prtext = task_had_prtext;
+  slot->had_prline = task_had_prline;
   slot->sep = task_sep;
   slot->chunk_count = chunk_matched_cnt;
   slot->enc_error = enc_error;
@@ -4924,8 +4938,6 @@ producer_enqueue_stdin (void)
   file_used = false;
 
   bool status = grep_command_line_arg ("-");
-  if (stdout_errno)
-    die_write_error ();
   overall_status &= status;
   if (exit_on_match && !status)
     {
@@ -5174,7 +5186,8 @@ chunk_slot_done_locked (struct chunk_file_state *state)
           s->big = nullptr;
           s->nbig = 0;
           s->status = true;
-          s->errseen = s->had_prtext = s->sep = s->enc_error = false;
+          s->errseen = s->had_prtext = s->had_prline = false;
+          s->sep = s->enc_error = false;
           s->chunk_count = 0;
           s->is_chunk = s->is_last_chunk = false;
         }
@@ -5183,6 +5196,7 @@ chunk_slot_done_locked (struct chunk_file_state *state)
       last->status = result->status;
       last->errseen = result->errseen;
       last->had_prtext = result->had_prtext;
+      last->had_prline = result->had_prline;
       last->sep = result->sep;
       if (!result->stdout_buf && result->stdout_len > 0)
         memcpy (last->inline_out, result->inline_out, result->stdout_len);
@@ -6058,6 +6072,7 @@ struct walk_ent
   bool status;                  /* true if no lines were selected */
   bool errseen;                 /* an error was diagnosed */
   bool used;                    /* prtext was called */
+  bool had_prline;              /* see TASK_HAD_PRLINE */
   bool sep;                     /* see TASK_SEP */
   bool defer;                   /* the output file; see TLS_MAY_DEFER */
   bool post_grep;               /* emit -c/-l/-L output in walk_commit_ent */
@@ -6898,6 +6913,7 @@ walk_search (struct walk_dir *d, int dfd, struct walk_ent *e, bool may_defer)
   tls_may_defer = false;
   e->errseen = tls_errseen;
   e->used = task_had_prtext;
+  e->had_prline = task_had_prline;
   e->sep = task_sep;
   if (tls_deferred)
     {
@@ -7192,14 +7208,16 @@ walk_recruit (unsigned int gen)
   pthread_mutex_lock (&pool_mutex);
   for (int i = 0; i < pool_nthreads; i++)
     {
+      /* Wake a worker for each task now, not after the loop: if the
+         queue fills up, only workers that take tasks make room.  */
       while (q_count >= WORK_QUEUE_CAP)
         pthread_cond_wait (&q_not_full_cv, &pool_mutex);
       work_queue[q_tail] = (struct work_task) { .type = TASK_TYPE_WALK,
                                                 .seq = gen };
       q_tail = (q_tail + 1) % WORK_QUEUE_CAP;
       q_count++;
+      pthread_cond_signal (&q_not_empty_cv);
     }
-  pthread_cond_broadcast (&q_not_empty_cv);
   pthread_mutex_unlock (&pool_mutex);
 }
 
@@ -7441,7 +7459,7 @@ walk_commit_ent (struct walk_dir *d, struct walk_ent *e)
     }
   else if (sep)
     print_group_separator ();
-  if (stdout_errno)
+  if (stdout_errno && e->had_prline)
     die_write_error ();
   overall_status &= e->status;
   if (e->errseen)
@@ -7842,7 +7860,8 @@ producer_run (char *const *files)
       if (STREQ (*f, "-"))
         {
           struct stat st;
-          bool stdin_is_reg = fstat (STDIN_FILENO, &st) == 0 && S_ISREG (st.st_mode);
+          bool stdin_ok = fstat (STDIN_FILENO, &st) == 0;
+          bool stdin_is_reg = stdin_ok && S_ISREG (st.st_mode);
           if (pool_target > 1 && !isatty (STDIN_FILENO)
               && stdin_is_reg
               && st.st_size >= 2 * 1024 * 1024
@@ -7856,7 +7875,7 @@ producer_run (char *const *files)
               rob_wait_all_committed ();
             }
           else if (pool_target > 1 && !isatty (STDIN_FILENO)
-                   && !stdin_is_reg
+                   && stdin_ok && !stdin_is_reg
                    && out_before < 0 && out_after < 0 && max_count == INTMAX_MAX
                    && !done_on_match && !line_buffered && !possibly_tty
                    && binary_files != WITHOUT_MATCH_BINARY_FILES)
@@ -8155,9 +8174,11 @@ compute_worker_threads (char *const *files)
   bool can_parallelize_stdin = false;
   if (is_single_stdin && !isatty (STDIN_FILENO))
     {
+      /* If standard input cannot even be examined (e.g., it is closed),
+         let single-threaded grep diagnose it.  */
       struct stat in_st;
-      bool stdin_is_reg = (fstat (STDIN_FILENO, &in_st) == 0
-                           && S_ISREG (in_st.st_mode));
+      bool stdin_ok = fstat (STDIN_FILENO, &in_st) == 0;
+      bool stdin_is_reg = stdin_ok && S_ISREG (in_st.st_mode);
       bool stdin_is_large_reg = (stdin_is_reg
                                  && in_st.st_size >= 2 * 1024 * 1024
                                  && !SAME_INODE (in_st, out_stat)
@@ -8166,7 +8187,7 @@ compute_worker_threads (char *const *files)
                                  && !exit_on_match
                                  && (!out_invert
                                      || (out_before < 0 && out_after < 0)));
-      bool can_slice_stdin = (!stdin_is_reg
+      bool can_slice_stdin = (stdin_ok && !stdin_is_reg
                               && out_before < 0 && out_after < 0
                               && max_count == INTMAX_MAX
                               && !done_on_match && !line_buffered
