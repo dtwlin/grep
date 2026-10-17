@@ -1,0 +1,62 @@
+#! /bin/sh
+# Sleep at each point where grep's threads hand data over to each other
+# (GREP_TEST_DELAY sites in src/grep.c, honored by the test builds
+# src/grep-hooks and src/grep-shrunk), one point at a time, so that the
+# other threads run ahead into the window.  A thread that still uses an
+# object that another may free or reuse, a wakeup that can be missed,
+# or an exit that races with running workers then shows up as different
+# output, a crash, a sanitizer report, or a hang.
+#
+# Copyright (C) 2026 David Lin <dtwlin@gmail.com>
+#
+# Copying and distribution of this file, with or without modification,
+# are permitted in any medium without royalty provided the copyright
+# notice and this notice are preserved.
+
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+. "$abs_srcdir/parallel-lib.sh"
+
+pl_setup_bins
+pl_have_bin hooks || skip_ "src/grep-hooks is not built"
+pl_have_hooks=yes
+pl_have_bin shrunk && pl_have_shrunk=yes
+pl_make_corpus
+
+PL_NO_BASE=yes
+PL_TIMEOUT=${PL_TIMEOUT:-60}
+usec=${DELAY_USEC:-1500}
+
+# SITE CATEGORIES: the cases that reach each site.
+all="tree cmd pool chunk stdin pipe quiet"
+while read site cats; do
+  test -n "$site" || continue
+  PL_ONLY=$cats
+  PL_CANDS="hooks:2:delay=$site:$usec hooks:8:delay=$site:$usec"
+  PL_CANDS="$PL_CANDS shrunk:4:delay=$site:$usec"
+  pl_standard_cases
+done <<EOF
+mmap_scan_done chunk pool
+worker_dequeued pool chunk stdin pipe
+worker_complete pool chunk stdin pipe
+spawn $all
+pool_started $all
+pool_join $all
+walk_recruit tree cmd
+walk_task tree cmd
+walk_split tree cmd
+walk_commit tree cmd
+walk_fd_release tree cmd
+walk_unref tree cmd
+walk_bin_job tree
+slice_enqueue pipe
+chunk_enqueue chunk pool
+quiet_exit quiet
+EOF
+
+# Every site at once, with short random-length sleeps.
+PL_ONLY=
+PL_CANDS="hooks:6:delay=*:300 shrunk:3:delay=*:200"
+pl_standard_cases
+
+pl_summary
+Exit $pl_fail

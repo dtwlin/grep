@@ -1,0 +1,60 @@
+#! /bin/sh
+# Run every parallel input path with src/grep-shrunk, a test build whose
+# work queue holds 4 tasks, whose reorder buffer holds 8 results, whose
+# stdin slices are 4 KiB with at most 2 kept for reuse, which chunks
+# files from 128 KiB, splits directories into batches of 2 files, keeps
+# at most 64 KiB of tree output and 4 directories open, and which
+# recruits worker threads and splits batches after a fraction of a
+# millisecond.  Every path that waits for space, wraps around, splits or
+# hands work over thus runs many times per case, and a deadlock shows up
+# as a timeout.  Output must still match GREP_THREADS=1 byte for byte.
+#
+# Copyright (C) 2026 David Lin <dtwlin@gmail.com>
+#
+# Copying and distribution of this file, with or without modification,
+# are permitted in any medium without royalty provided the copyright
+# notice and this notice are preserved.
+
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+. "$abs_srcdir/parallel-lib.sh"
+
+pl_setup_bins
+pl_have_bin shrunk || skip_ "src/grep-shrunk is not built"
+pl_have_shrunk=yes
+pl_make_corpus
+pl_build_shim || echo "chaos-shim.so unusable here; skipping chaos runs" >&2
+
+# Stock grep is compared in parallel-sched-fuzz already.
+PL_NO_BASE=yes
+PL_TIMEOUT=${PL_TIMEOUT:-30}
+PL_CANDS="shrunk:2:plain shrunk:3:plain shrunk:8:plain shrunk:32:plain"
+PL_CANDS="$PL_CANDS shrunk:5:chaos7 shrunk:2:chaos8 shrunk:64:cpu2"
+pl_standard_cases
+pl_check_outfile -r -l MATCH_ALPHA tree
+pl_check_outfile -r -c MATCH_BETA tree
+
+# Many tiny inputs: hundreds of ROB and queue wrap-arounds per run.
+mkdir many || framework_failure_
+for i in $(seq 1 120); do
+  printf 'a%d MATCH_ALPHA\nb%d\n' $i $i > many/m$i || framework_failure_
+done
+PL_CANDS="shrunk:2:plain shrunk:16:plain shrunk:9:chaos3 shrunk:2:chaos4"
+pl_check "cmd" - -c MATCH_ALPHA many/m*
+pl_check "pool" - -c MATCH_ALPHA many/m1 many/m2 many/m3 many/m4 many/m5 \
+  many/m6 many/m7 many/m8 many/m9 many/m10 many/m11 many/m12 many/m13 \
+  many/m14 many/m15
+pl_check "pool chunk" - -n MATCH_ALPHA many/m1 big.txt many/m2 bignul.txt \
+  many/m3 big.txt many/m4
+pl_check "cmd" - -L MATCH_BETA many/m* many
+pl_check "tree" - -r -n MATCH_ALPHA many
+
+# Lines longer than a slice, and a slice that is all residue.
+$PERL -e 'print "x" x 10000, " MATCH_ALPHA long\n", "short MATCH_ALPHA\n",
+          "y" x 9000; print "\n" for 1..3; print "end MATCH_ALPHA\n"' \
+  > long_lines.txt || framework_failure_
+pl_check "pipe" "|long_lines.txt" -n MATCH_ALPHA
+pl_check "pipe" "|long_lines.txt" -c -v MATCH_ALPHA
+pl_check "stdin" long_lines.txt -b MATCH_ALPHA
+
+pl_summary
+Exit $pl_fail

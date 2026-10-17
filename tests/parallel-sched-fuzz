@@ -1,0 +1,54 @@
+#! /bin/sh
+# Run every parallel input path under perturbed thread scheduling:
+# random yields, sleeps and spurious condition-variable wakeups injected
+# at each mutex unlock, signal and thread creation (tests/chaos-shim.c),
+# odd and oversubscribed thread counts, and two processors shared by 64
+# threads.  Output must match GREP_THREADS=1 and stock grep byte for byte.
+#
+# CHAOS_SEEDS="1 2 ..." selects the seeds.  With RUN_EXPENSIVE_TESTS=yes
+# or SOAK_DURATION=SECONDS, keep going with new seeds, thread counts and
+# delay points until the time is up.
+#
+# Copyright (C) 2026 David Lin <dtwlin@gmail.com>
+#
+# Copying and distribution of this file, with or without modification,
+# are permitted in any medium without royalty provided the copyright
+# notice and this notice are preserved.
+
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+. "$abs_srcdir/parallel-lib.sh"
+
+pl_setup_bins
+pl_have_bin hooks && pl_have_hooks=yes
+pl_have_bin shrunk && pl_have_shrunk=yes
+pl_make_corpus
+pl_build_shim || echo "chaos-shim.so unusable here; skipping chaos runs" >&2
+
+PL_CANDS="rel:7:plain rel:64:cpu2"
+for s in ${CHAOS_SEEDS:-1 2}; do
+  PL_CANDS="$PL_CANDS rel:2:chaos$s rel:16:chaos$((s + 100))"
+done
+pl_standard_cases
+pl_check_outfile -r -l MATCH_ALPHA tree
+pl_check_outfile -r -c MATCH_BETA tree
+pl_check_outfile -r -m1 -n MATCH_ALPHA tree
+
+duration=${SOAK_DURATION-}
+test -z "$duration" && test "$RUN_EXPENSIVE_TESTS" = yes && duration=600
+if test -n "$duration" && test $pl_fail = 0; then
+  PL_NO_BASE=yes
+  end=$(($(date +%s) + duration))
+  s=1000
+  while test $(date +%s) -lt $end && test $pl_fail = 0; do
+    s=$((s + 1))
+    t=$(( (s % 7) + 2 ))
+    case $((s % 3)) in
+      0) t=$((t * 9));;
+    esac
+    PL_CANDS="rel:$t:chaos$s shrunk:$t:chaos$s hooks:$t:delay=*:$((s % 700))"
+    pl_standard_cases
+  done
+fi
+
+pl_summary
+Exit $pl_fail

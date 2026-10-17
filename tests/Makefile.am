@@ -149,14 +149,19 @@ TESTS =						\
   parallel-cli-flags				\
   parallel-coverage-complete			\
   parallel-coverage-edge-cases			\
+  parallel-delay-sites				\
+  parallel-early-exit				\
   parallel-env-limits				\
   parallel-fault-injection			\
+  parallel-io-faults				\
   parallel-gcov-branches			\
   parallel-kwset-ac				\
   parallel-matrix				\
   parallel-multithread-cases			\
   parallel-pcre-must				\
   parallel-refactor				\
+  parallel-sched-fuzz				\
+  parallel-shrunk-limits			\
   parallel-stage1-optim				\
   parallel-stream-stdin				\
   parallel-stress-test				\
@@ -216,6 +221,7 @@ TESTS =						\
 EXTRA_DIST =					\
   $(TESTS)					\
   bre.awk					\
+  chaos-shim.c					\
   bre.tests					\
   Coreutils.pm					\
   CuSkip.pm					\
@@ -228,6 +234,7 @@ EXTRA_DIST =					\
   khadafy.lines					\
   khadafy.regexp				\
   no-perl					\
+  parallel-lib.sh				\
   spencer1.awk					\
   spencer1.tests				\
   spencer1-locale.awk

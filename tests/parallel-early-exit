@@ -1,0 +1,192 @@
+#! /bin/sh
+# Early exit and termination while worker threads are busy: -q, -m1,
+# -l and -L with the deciding match at the start, in the middle, at the
+# end, or nowhere; readers that go away (SIGPIPE, and EPIPE with SIGPIPE
+# ignored); a full output device; termination by a signal; and running
+# out of file descriptors.  Each run must finish (no hang), report the
+# right exit status, and print each diagnostic exactly once.
+#
+# Copyright (C) 2026 David Lin <dtwlin@gmail.com>
+#
+# Copying and distribution of this file, with or without modification,
+# are permitted in any medium without royalty provided the copyright
+# notice and this notice are preserved.
+
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+. "$abs_srcdir/parallel-lib.sh"
+require_timeout_
+
+pl_setup_bins
+pl_have_bin hooks && pl_have_hooks=yes
+pl_have_bin shrunk && pl_have_shrunk=yes
+pl_make_corpus
+PL_TIMEOUT=${PL_TIMEOUT:-30}
+iters=${EXIT_ITERS:-6}
+
+# 1. The deciding match at different places, repeated to vary timing.
+#    MATCH_ALPHA2500 is in the first chunk of big.txt, MATCH_ALPHA37500
+#    in the last; MATCH_ALPHA999 is only in the deepest file of the tree.
+PL_NO_BASE=yes
+PL_CANDS="rel:2:plain rel:16:plain rel:64:plain hooks:16:delay=quiet_exit:3000"
+PL_CANDS="$PL_CANDS shrunk:8:plain"
+i=0
+while test $i -lt $iters; do
+  i=$((i + 1))
+  for tok in MATCH_ALPHA MATCH_ALPHA999 NEVER_PRESENT; do
+    pl_check "tree" - -r -q $tok tree
+    pl_check "tree" - -r -m1 -c $tok tree
+    pl_check "tree" - -r -l -w $tok tree
+    pl_check "tree" - -r -L -w $tok tree
+  done
+  for tok in MATCH_ALPHA2500 MATCH_ALPHA37500 NEVER_PRESENT; do
+    pl_check "chunk" - -q -w $tok big.txt
+    pl_check "chunk" - -l -w $tok big.txt bignul.txt
+    pl_check "chunk" - -m1 -n -w $tok big.txt
+    pl_check "pipe" "|big.txt" -q -w $tok
+    pl_check "pipe" "|big.txt" -m1 -w $tok
+    pl_check "cmd" - -q -w $tok ops/o0? ops/o1? big.txt ops/o2?
+  done
+done
+
+pl_stop_check ()
+{
+  if test "${PL_STOP_ON_FAIL-}" = yes \
+     && { test $pl_fail = 1 || test "${fail-0}" = 1; }; then
+    pl_summary
+    Exit 1
+  fi
+}
+pl_stop_check
+
+# 2. A reader that goes away.  The writer must die of SIGPIPE (or exit
+#    successfully if all output fit in the pipe), or, with SIGPIPE
+#    ignored, report one write error and exit with status 2.
+sigpipe_case ()
+{
+  for t in 2 32; do
+    for n in 1 4096 65536; do
+      (env GREP_THREADS=$t timeout 30 grep "$@" 2> sp_err; echo $? > sp_rc) \
+        | head -c $n > /dev/null
+      rc=$(cat sp_rc)
+      case $rc in
+        0|141) compare /dev/null sp_err \
+                 || { echo "FAIL sigpipe stderr: t=$t n=$n grep $*" >&2; fail=1; };;
+        *) echo "FAIL sigpipe rc=$rc: t=$t n=$n grep $*" >&2; fail=1;;
+      esac
+      (trap '' PIPE; env GREP_THREADS=$t timeout 30 grep "$@" 2> ep_err;
+       echo $? > ep_rc) | head -c $n > /dev/null
+      rc=$(cat ep_rc)
+      case $rc in
+        0) compare /dev/null ep_err \
+             || { echo "FAIL epipe stderr: t=$t n=$n grep $*" >&2; fail=1; };;
+        2) echo 'grep: write error: Broken pipe' > ep_exp
+           compare ep_exp ep_err \
+             || { echo "FAIL epipe diagnostic: t=$t n=$n grep $*" >&2; fail=1; };;
+        *) echo "FAIL epipe rc=$rc: t=$t n=$n grep $*" >&2; fail=1;;
+      esac
+    done
+  done
+}
+fail=0
+sigpipe_case -r filler tree
+sigpipe_case -r -n -C1 filler tree
+sigpipe_case -n filler big.txt
+sigpipe_case -c filler big.txt ops/o0? ops/o1? ops/o2? big.txt
+sigpipe_case filler ops/o0? ops/o1? ops/o2? big.txt tree/a_big.txt
+sigpipe_case -r -l filler tree
+cat stdin.txt stdin.txt stdin.txt > stdin3.txt || framework_failure_
+for t in 2 32; do
+  for n in 1 65536; do
+    (cat stdin3.txt | env GREP_THREADS=$t timeout 30 grep filler 2> sp_err;
+     echo $? > sp_rc) | head -c $n > /dev/null
+    case $(cat sp_rc) in
+      0|141) compare /dev/null sp_err || fail=1;;
+      *) echo "FAIL sigpipe rc=$(cat sp_rc): pipe t=$t n=$n" >&2; fail=1;;
+    esac
+  done
+done
+
+pl_stop_check
+
+# 3. A full output device: status 2 and the same single diagnostic as
+#    stock grep, on every path.
+full_case ()
+{
+  env GREP_THREADS=1 timeout 30 grep "$@" > /dev/full 2> full_exp
+  echo $? > full_exp_rc
+  if test $pl_have_base = yes; then
+    env PATH="$(pl_bin_dir base):$PATH" timeout 30 grep "$@" \
+      > /dev/full 2> full_base
+    echo $? > full_base_rc
+    compare full_exp full_base && compare full_exp_rc full_base_rc \
+      || { echo "FAIL /dev/full baseline: grep $*" >&2; fail=1; }
+  fi
+  for t in 2 16 64; do
+    env GREP_THREADS=$t timeout 30 grep "$@" > /dev/full 2> full_got
+    echo $? > full_got_rc
+    compare full_exp full_got && compare full_exp_rc full_got_rc \
+      || { echo "FAIL /dev/full: t=$t grep $*" >&2; fail=1; }
+  done
+}
+if test -w /dev/full && test -c /dev/full; then
+  full_case -r MATCH_ALPHA tree
+  full_case -r -c MATCH_ALPHA tree
+  full_case -n filler big.txt
+  full_case -c MATCH_ALPHA big.txt bignul.txt
+  full_case MATCH_ALPHA ops/o0? ops/o1? ops/o2?
+  full_case -n MATCH_ALPHA ops/o01 - big.txt < stdin.txt
+  for t in 1 2 16 64; do
+    cat stdin.txt | env GREP_THREADS=$t timeout 30 grep -n MATCH_ALPHA \
+      > /dev/full 2> full_pipe_$t
+    echo "rc=$?" >> full_pipe_$t
+    test $t = 1 && continue
+    compare full_pipe_1 full_pipe_$t \
+      || { echo "FAIL /dev/full: pipe t=$t" >&2; fail=1; }
+  done
+fi
+
+pl_stop_check
+
+# 4. Termination by a signal while workers are busy reading a stream
+#    that never ends: the process must die promptly.
+for sig in TERM HUP; do
+  for t in 2 16; do
+    yes 'MATCH_ALPHA y' | env GREP_THREADS=$t grep -c MATCH_ALPHA > sig_out &
+    pid=$!
+    sleep 0.3
+    kill -$sig $pid 2>/dev/null
+    j=0
+    while kill -0 $pid 2>/dev/null && test $j -lt 50; do
+      sleep 0.1
+      j=$((j + 1))
+    done
+    if kill -0 $pid 2>/dev/null; then
+      echo "FAIL: grep ignored SIG$sig for 5 s (t=$t)" >&2
+      kill -KILL $pid
+      fail=1
+    fi
+    wait $pid 2>/dev/null
+  done
+done
+
+# 5. Few file descriptors: many operands and a deep tree must still be
+#    searched completely, with no descriptor leaked along the way.
+mkdir fdops || framework_failure_
+for i in $(seq 1 200); do
+  echo "fd_line $i MATCH_ALPHA" > fdops/f$i || framework_failure_
+done
+env GREP_THREADS=1 grep -c MATCH_ALPHA fdops/* > fd_exp 2> fd_exp_err
+for t in 3 16 64; do
+  (
+    { set +x; } 2>/dev/null
+    for fd in $(seq 3 63); do eval "exec $fd>&-"; done 2>/dev/null
+    ulimit -n 24 && env GREP_THREADS=$t timeout 30 grep -c MATCH_ALPHA \
+      fdops/* > fd_got 2> fd_got_err
+  )
+  compare fd_exp fd_got || { echo "FAIL fd pressure stdout: t=$t" >&2; fail=1; }
+  compare fd_exp_err fd_got_err || { echo "FAIL fd pressure stderr: t=$t" >&2; fail=1; }
+done
+
+test $pl_fail = 1 && fail=1
+pl_summary
+Exit $fail

@@ -1,0 +1,115 @@
+#! /bin/sh
+# Faulty input: reads that return fewer bytes than asked for, and reads
+# interrupted with EINTR (tests/chaos-shim.c), on regular files, directory
+# trees, pipes and FIFOs, on the serial and every parallel path; plus
+# unusual standard inputs.  Only results that do not depend on where
+# reads end are compared: line selection on text without null bytes,
+# and -c, -l, -L and -q on any input.
+#
+# Copyright (C) 2026 David Lin <dtwlin@gmail.com>
+#
+# Copying and distribution of this file, with or without modification,
+# are permitted in any medium without royalty provided the copyright
+# notice and this notice are preserved.
+
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+. "$abs_srcdir/parallel-lib.sh"
+
+pl_setup_bins
+pl_have_bin shrunk && pl_have_shrunk=yes
+pl_make_corpus
+pl_build_shim || skip_ "chaos-shim.so cannot be preloaded here"
+
+PL_NO_BASE=yes
+
+# Directory trees (small files are read with read, not mapped).  The
+# parallel traversal relies on regular files on local file systems not
+# returning short reads before end of file, so only the single-threaded
+# search gets those here.
+PL_CANDS="rel:1:ioreg1 rel:4:io2 rel:16:io3 shrunk:4:io4 shrunk:16:io5"
+pl_check "tree" - -r -c MATCH_ALPHA tree
+pl_check "tree" - -r -l MATCH_BETA tree
+pl_check "tree" - -r -L MATCH_BETA tree
+pl_check "tree" - -r -q MATCH_ALPHA999 tree
+pl_check "tree" - -r -c -v filler tree
+pl_check "tree" - -r -n --exclude=bin.dat MATCH_ALPHA tree
+pl_check "tree" - -r -n -C1 --exclude=bin.dat MATCH_BETA tree
+# Many operands, few operands, a single small file.
+PL_CANDS="rel:1:ioreg1 rel:4:ioreg2 rel:16:ioreg3 shrunk:4:ioreg4 shrunk:16:io5"
+pl_check "cmd" - -n MATCH_ALPHA ops/o0? ops/o1? ops/o2?
+pl_check "cmd" - -c -C1 MATCH_BETA ops/o0? ops/o1? ops/o2?
+pl_check "pool" - -n MATCH_ALPHA ops/o01 big.txt ops/o02
+pl_check "pool" - -n MATCH_ALPHA ops/o01
+# Standard input: small and large regular files, and pipes.
+pl_check "stdin" ops/o03 -n MATCH_ALPHA
+pl_check "stdin" stdin.txt -n -b MATCH_BETA
+pl_check "pipe" "|stdin.txt" -n MATCH_ALPHA
+pl_check "pipe" "|stdin.txt" -c filler
+pl_check "pipe" "|stdin.txt" -v -c MATCH_ALPHA
+pl_check "pipe" "|bignul.txt" -c MATCH_ALPHA
+pl_check "pipe" "|bignul.txt" -l MATCH_BETA
+pl_check "pipe" "|bignul.txt" -q MATCH_ALPHA37500
+pl_check "pool pipe" "|stdin.txt" -c MATCH_ALPHA ops/o05 - big.txt
+
+fail=$pl_fail
+
+# A FIFO operand among regular files, written by another process.
+if mkfifo fifo 2>/dev/null; then
+  for env_ in "GREP_THREADS=1" \
+              "GREP_THREADS=8 LD_PRELOAD=$PWD/chaos-shim.so CHAOS_SHORT_READ=0.5 CHAOS_EINTR=0.2" \
+              "GREP_THREADS=3 LD_PRELOAD=$PWD/chaos-shim.so CHAOS_SHORT_READ=0.9"; do
+    cat stdin.txt > fifo &
+    env $env_ timeout 30 grep -c MATCH_ALPHA ops/o01 fifo ops/o02 > fifo_got 2>&1
+    echo "rc=$?" >> fifo_got
+    wait
+    if test "$env_" = GREP_THREADS=1; then
+      mv fifo_got fifo_exp
+    else
+      compare fifo_exp fifo_got || { echo "FAIL fifo: $env_" >&2; fail=1; }
+    fi
+  done
+fi
+
+# Unusual standard inputs: closed, a directory, empty.
+for t in 1 4 32; do
+  for how in closed dir null; do
+    case $how in
+      closed) env GREP_THREADS=$t grep -c x 0<&- > u_out 2> u_err;;
+      dir) env GREP_THREADS=$t grep -c x < . > u_out 2> u_err;;
+      null) env GREP_THREADS=$t grep -c x < /dev/null > u_out 2> u_err;;
+    esac
+    echo "rc=$?" >> u_out
+    if test $t = 1; then
+      mv u_out u_exp_$how; mv u_err u_experr_$how
+      if test $pl_have_base = yes; then
+        bp="$(pl_bin_dir base):$PATH"
+        case $how in
+          closed) env PATH="$bp" grep -c x 0<&- > b_out 2> b_err;;
+          dir) env PATH="$bp" grep -c x < . > b_out 2> b_err;;
+          null) env PATH="$bp" grep -c x < /dev/null > b_out 2> b_err;;
+        esac
+        echo "rc=$?" >> b_out
+        compare u_exp_$how b_out && compare u_experr_$how b_err \
+          || { echo "FAIL stdin $how vs baseline" >&2; fail=1; }
+      fi
+    else
+      compare u_exp_$how u_out && compare u_experr_$how u_err \
+        || { echo "FAIL stdin $how: t=$t" >&2; fail=1; }
+    fi
+  done
+done
+
+# Standard input among other operands, closed.
+for t in 1 4 32; do
+  env GREP_THREADS=$t grep -c MATCH_ALPHA ops/o01 - ops/o02 0<&- > m_out 2> m_err
+  echo "rc=$?" >> m_out
+  if test $t = 1; then
+    mv m_out m_exp; mv m_err m_experr
+  else
+    compare m_exp m_out && compare m_experr m_err \
+      || { echo "FAIL closed stdin among operands: t=$t" >&2; fail=1; }
+  fi
+done
+
+pl_summary
+Exit $fail
