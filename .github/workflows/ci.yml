@@ -166,10 +166,12 @@ jobs:
         env:
           ASAN_OPTIONS: "detect_leaks=1:abort_on_error=1"
           UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
-          TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
+          TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1:report_thread_leaks=1"
+          # Sanitized grep is several times slower; a hang still times out.
+          PL_TIMEOUT: "300"
         run: |
           make check -C tests -j"$(nproc)" \
-            TESTS="parallel-tree-walk parallel-chunked-mmap parallel-stream-stdin parallel-kwset-ac parallel-pcre-must parallel-env-limits parallel-coverage-edge-cases parallel-boundary-cases parallel-multithread-cases parallel-stress-test parallel-cli-flags parallel-coverage-complete" || {
+            TESTS="parallel-tree-walk parallel-chunked-mmap parallel-stream-stdin parallel-kwset-ac parallel-pcre-must parallel-env-limits parallel-coverage-edge-cases parallel-boundary-cases parallel-multithread-cases parallel-stress-test parallel-cli-flags parallel-coverage-complete parallel-sched-fuzz parallel-shrunk-limits parallel-delay-sites parallel-early-exit parallel-io-faults" || {
             cat tests/test-suite.log
             exit 1
           }
@@ -264,7 +266,7 @@ jobs:
       - name: Run parallel test suite
         run: |
           make check -C tests -j"$(sysctl -n hw.ncpu)" \
-            TESTS="parallel-tree-walk parallel-chunked-mmap parallel-stream-stdin parallel-kwset-ac parallel-pcre-must parallel-env-limits parallel-coverage-edge-cases parallel-boundary-cases parallel-multithread-cases parallel-stress-test parallel-cli-flags parallel-coverage-complete" || {
+            TESTS="parallel-tree-walk parallel-chunked-mmap parallel-stream-stdin parallel-kwset-ac parallel-pcre-must parallel-env-limits parallel-coverage-edge-cases parallel-boundary-cases parallel-multithread-cases parallel-stress-test parallel-cli-flags parallel-coverage-complete parallel-sched-fuzz parallel-shrunk-limits parallel-delay-sites parallel-early-exit parallel-io-faults" || {
             cat tests/test-suite.log
             exit 1
           }
