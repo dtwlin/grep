@@ -90,12 +90,16 @@ pl_build_shim ()
   pl_have_shim=yes
 }
 
-# Run a command with SIGPIPE, SIGHUP and SIGTERM restored to SIG_DFL,
-# in case the parent environment inherited SIG_IGN (as CI runners do).
+# Run a command with SIGPIPE, SIGHUP and SIGTERM unblocked and restored
+# to SIG_DFL, in case the parent environment blocked or ignored them.
 pl_with_sig_dfl ()
 {
-  $PERL -e 'alarm shift; $SIG{PIPE} = "DEFAULT"; $SIG{HUP} = "DEFAULT";
-            $SIG{TERM} = "DEFAULT"; exec @ARGV or die $!' \
+  $PERL -MPOSIX -e '
+    POSIX::sigprocmask (POSIX::SIG_UNBLOCK (),
+      POSIX::SigSet->new (POSIX::SIGPIPE (), POSIX::SIGHUP (),
+                          POSIX::SIGTERM (), POSIX::SIGALRM ()));
+    alarm shift; $SIG{PIPE} = "DEFAULT"; $SIG{HUP} = "DEFAULT";
+    $SIG{TERM} = "DEFAULT"; exec @ARGV or die $!' \
     "${PL_TIMEOUT:-60}" "$@"
 }
 
@@ -103,8 +107,12 @@ pl_with_sig_dfl ()
 # without an external timeout wrapper that might reset SIGPIPE.
 pl_with_sig_ign ()
 {
-  $PERL -e 'alarm shift; $SIG{PIPE} = "IGNORE"; $SIG{HUP} = "DEFAULT";
-            $SIG{TERM} = "DEFAULT"; exec @ARGV or die $!' \
+  $PERL -MPOSIX -e '
+    POSIX::sigprocmask (POSIX::SIG_UNBLOCK (),
+      POSIX::SigSet->new (POSIX::SIGHUP (), POSIX::SIGTERM (),
+                          POSIX::SIGALRM ()));
+    alarm shift; $SIG{PIPE} = "IGNORE"; $SIG{HUP} = "DEFAULT";
+    $SIG{TERM} = "DEFAULT"; exec @ARGV or die $!' \
     "${PL_TIMEOUT:-60}" "$@"
 }
 

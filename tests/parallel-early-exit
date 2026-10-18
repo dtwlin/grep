@@ -155,10 +155,19 @@ pl_stop_check
 #    that never ends: the process must die promptly.
 for sig in TERM HUP; do
   for t in 2 16; do
-    $PERL -e '$SIG{PIPE} = "DEFAULT"; while (1) { print "MATCH_ALPHA y\n" or exit 0 }' \
-      | $PERL -e '$SIG{PIPE} = "DEFAULT"; $SIG{HUP} = "DEFAULT";
-                  $SIG{TERM} = "DEFAULT"; $ENV{GREP_THREADS} = shift;
-                  exec @ARGV or die $!' "$t" grep -c MATCH_ALPHA > sig_out &
+    $PERL -MPOSIX -e '
+      POSIX::sigprocmask (POSIX::SIG_UNBLOCK (),
+        POSIX::SigSet->new (POSIX::SIGPIPE (), POSIX::SIGHUP (),
+                            POSIX::SIGTERM ()));
+      $SIG{PIPE} = "DEFAULT";
+      while (1) { print "MATCH_ALPHA y\n" or exit 0 }' \
+      | $PERL -MPOSIX -e '
+          POSIX::sigprocmask (POSIX::SIG_UNBLOCK (),
+            POSIX::SigSet->new (POSIX::SIGPIPE (), POSIX::SIGHUP (),
+                                POSIX::SIGTERM ()));
+          $SIG{PIPE} = "DEFAULT"; $SIG{HUP} = "DEFAULT";
+          $SIG{TERM} = "DEFAULT"; $ENV{GREP_THREADS} = shift;
+          exec @ARGV or die $!' "$t" grep -c MATCH_ALPHA > sig_out &
     pid=$!
     sleep 0.3
     kill -$sig $pid 2>/dev/null
