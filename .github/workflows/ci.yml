@@ -88,6 +88,7 @@ jobs:
         run: |
           make check -C tests -j"$(nproc)" || {
             cat tests/test-suite.log
+            awk '{print "::error::" $0}' tests/test-suite.log
             exit 1
           }
 
@@ -180,6 +181,7 @@ jobs:
           make check -C tests -j"$(nproc)" \
             TESTS="parallel-tree-walk parallel-chunked-mmap parallel-stream-stdin parallel-kwset-ac parallel-pcre-must parallel-env-limits parallel-coverage-edge-cases parallel-boundary-cases parallel-multithread-cases parallel-stress-test parallel-cli-flags parallel-coverage-complete parallel-sched-fuzz parallel-shrunk-limits parallel-delay-sites parallel-early-exit parallel-io-faults" || {
             cat tests/test-suite.log
+            awk '{print "::error::" $0}' tests/test-suite.log
             exit 1
           }
 
@@ -278,6 +280,7 @@ jobs:
           make check -C tests -j"$(sysctl -n hw.ncpu)" \
             TESTS="parallel-tree-walk parallel-chunked-mmap parallel-stream-stdin parallel-kwset-ac parallel-pcre-must parallel-env-limits parallel-coverage-edge-cases parallel-boundary-cases parallel-multithread-cases parallel-stress-test parallel-cli-flags parallel-coverage-complete parallel-sched-fuzz parallel-shrunk-limits parallel-delay-sites parallel-early-exit parallel-io-faults" || {
             cat tests/test-suite.log
+            awk '{print "::error::" $0}' tests/test-suite.log
             exit 1
           }
 

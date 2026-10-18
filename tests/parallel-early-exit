@@ -67,7 +67,7 @@ sigpipe_case ()
 {
   for t in 2 32; do
     for n in 1 4096 65536; do
-      (pl_with_sig_dfl env GREP_THREADS=$t $pl_timeout grep "$@" 2> sp_err;
+      (pl_with_sig_dfl env GREP_THREADS=$t grep "$@" 2> sp_err;
        echo $? > sp_rc) | head -c $n > /dev/null
       rc=$(cat sp_rc)
       case $rc in
@@ -75,7 +75,7 @@ sigpipe_case ()
                  || { echo "FAIL sigpipe stderr: t=$t n=$n grep $*" >&2; fail=1; };;
         *) echo "FAIL sigpipe rc=$rc: t=$t n=$n grep $*" >&2; fail=1;;
       esac
-      (trap '' PIPE; env GREP_THREADS=$t $pl_timeout grep "$@" 2> ep_err;
+      (pl_with_sig_ign env GREP_THREADS=$t grep "$@" 2> ep_err;
        echo $? > ep_rc) | head -c $n > /dev/null
       rc=$(cat ep_rc)
       case $rc in
@@ -100,7 +100,7 @@ cat stdin.txt stdin.txt stdin.txt > stdin3.txt || framework_failure_
 for t in 2 32; do
   for n in 1 65536; do
     (pl_with_sig_dfl cat stdin3.txt 2>/dev/null \
-       | pl_with_sig_dfl env GREP_THREADS=$t $pl_timeout grep filler 2> sp_err;
+       | pl_with_sig_dfl env GREP_THREADS=$t grep filler 2> sp_err;
      echo $? > sp_rc) | head -c $n > /dev/null
     case $(cat sp_rc) in
       0|141) compare /dev/null sp_err || fail=1;;
@@ -179,19 +179,15 @@ done
 # 5. Few file descriptors: many operands and a deep tree must still be
 #    searched completely, with no descriptor leaked along the way.
 if test -z "$ASAN_OPTIONS" && test -z "$TSAN_OPTIONS" \
-   && (ulimit -n 24) 2>/dev/null; then
+   && (pl_with_nofile 28 env GREP_THREADS=1 grep --version) >/dev/null 2>&1; then
   mkdir fdops || framework_failure_
   for i in $(seq 1 200); do
     echo "fd_line $i MATCH_ALPHA" > fdops/f$i || framework_failure_
   done
   env GREP_THREADS=1 grep -c MATCH_ALPHA fdops/* > fd_exp 2> fd_exp_err
   for t in 3 16 64; do
-    (
-      { set +x; } 2>/dev/null
-      exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- 2>/dev/null
-      ulimit -n 24 && env GREP_THREADS=$t $pl_timeout grep -c MATCH_ALPHA \
-        fdops/* > fd_got 2> fd_got_err
-    )
+    pl_with_nofile 28 env GREP_THREADS=$t grep -c MATCH_ALPHA \
+      fdops/* > fd_got 2> fd_got_err
     compare fd_exp fd_got || { echo "FAIL fd pressure stdout: t=$t" >&2; fail=1; }
     compare fd_exp_err fd_got_err || { echo "FAIL fd pressure stderr: t=$t" >&2; fail=1; }
   done

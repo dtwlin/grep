@@ -94,8 +94,26 @@ pl_build_shim ()
 # in case the parent environment inherited SIG_IGN (as CI runners do).
 pl_with_sig_dfl ()
 {
-  $PERL -e '$SIG{PIPE} = "DEFAULT"; $SIG{HUP} = "DEFAULT";
-            $SIG{TERM} = "DEFAULT"; exec @ARGV or die $!' -- "$@"
+  $PERL -e 'alarm shift; $SIG{PIPE} = "DEFAULT"; $SIG{HUP} = "DEFAULT";
+            $SIG{TERM} = "DEFAULT"; exec @ARGV or die $!' \
+    "${PL_TIMEOUT:-60}" "$@"
+}
+
+# Run a command with SIGPIPE set to SIG_IGN and an alarm timeout,
+# without an external timeout wrapper that might reset SIGPIPE.
+pl_with_sig_ign ()
+{
+  $PERL -e 'alarm shift; $SIG{PIPE} = "IGNORE"; $SIG{HUP} = "DEFAULT";
+            $SIG{TERM} = "DEFAULT"; exec @ARGV or die $!' \
+    "${PL_TIMEOUT:-60}" "$@"
+}
+
+# Close inherited file descriptors >= 3, set RLIMIT_NOFILE to $1, and
+# exec the remaining arguments.
+pl_with_nofile ()
+{
+  $PERL -MPOSIX -e 'POSIX::close($_) for 3..1024; exec @ARGV or die $!' \
+    sh -c 'ulimit -n "$1" && shift && exec "$@"' sh "$@"
 }
 
 # Write the corpus used by the standard cases.
