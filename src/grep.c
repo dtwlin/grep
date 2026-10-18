@@ -4978,10 +4978,10 @@ producer_flush_batch (void)
         .command_line = producer_batch[i].command_line
       };
       work_queue_push_locked (&t);
+      pthread_cond_signal (&q_not_empty_cv);
     }
 
   producer_batch_count = 0;
-  pthread_cond_broadcast (&q_not_empty_cv);
   pthread_mutex_unlock (&pool_mutex);
 }
 
@@ -5717,50 +5717,51 @@ chunk_enqueue_line_number_pass2 (struct chunk_file_state *state,
   char *data = state->mmap_data;
 
   pthread_mutex_lock (&pool_mutex);
-  if (work_queue_wait_space_locked (num_chunks))
+  for (size_t k = 0; k < num_chunks; ++k)
     {
-      for (size_t k = 0; k < num_chunks; ++k)
+      size_t c_beg = bounds[k];
+      size_t c_end = bounds[k + 1];
+      bool is_last = (k == num_chunks - 1);
+
+      uint64_t seq = producer_alloc_slot_locked ();
+      struct rob_slot *slot = &rob[seq % ROB_CAP];
+      slot->is_chunk = true;
+      slot->is_last_chunk = is_last;
+      if (is_last)
         {
-          size_t c_beg = bounds[k];
-          size_t c_end = bounds[k + 1];
-          bool is_last = (k == num_chunks - 1);
-
-          uint64_t seq = producer_alloc_slot_locked ();
-          struct rob_slot *slot = &rob[seq % ROB_CAP];
-          slot->is_chunk = true;
-          slot->is_last_chunk = is_last;
-          if (is_last)
-            {
-              slot->cleanup_fn = cleanup_chunk_file_state;
-              slot->cleanup_arg = state;
-              slot->filename = xstrdup (fname);
-            }
-
-          if (!state->chunk_has_matches[k])
-            {
-              slot->status = true;
-              slot->state = ROB_SLOT_DONE;
-              continue;
-            }
-
-          struct work_task t = {
-            .type = TASK_TYPE_CHUNK,
-            .seq = seq,
-            .filename = (char *) state->fname,
-            .mode = CHUNK_MODE_LINE_NUMBER,
-            .chunk_data = data + c_beg,
-            .chunk_len = c_end - c_beg,
-            .chunk_totalcc = c_beg,
-            .chunk_lineno_offset = state->prefix_nls[k],
-            .chunk_free_data = false,
-            .is_last_chunk = is_last,
-            .shared_state = state
-          };
-          work_queue_push_locked (&t);
+          slot->cleanup_fn = cleanup_chunk_file_state;
+          slot->cleanup_arg = state;
+          slot->filename = xstrdup (fname);
         }
-      rob_try_commit_locked ();
-      pthread_cond_broadcast (&q_not_empty_cv);
+
+      if (!state->chunk_has_matches[k])
+        {
+          slot->status = true;
+          slot->state = ROB_SLOT_DONE;
+          rob_try_commit_locked ();
+          continue;
+        }
+
+      if (!work_queue_wait_space_locked (1))
+        break;
+
+      struct work_task t = {
+        .type = TASK_TYPE_CHUNK,
+        .seq = seq,
+        .filename = (char *) state->fname,
+        .mode = CHUNK_MODE_LINE_NUMBER,
+        .chunk_data = data + c_beg,
+        .chunk_len = c_end - c_beg,
+        .chunk_totalcc = c_beg,
+        .chunk_lineno_offset = state->prefix_nls[k],
+        .chunk_free_data = false,
+        .is_last_chunk = is_last,
+        .shared_state = state
+      };
+      work_queue_push_locked (&t);
+      pthread_cond_signal (&q_not_empty_cv);
     }
+  rob_try_commit_locked ();
   pthread_mutex_unlock (&pool_mutex);
 }
 
@@ -8033,10 +8034,17 @@ pool_spawner (void *arg)
   for (int i = 1; i < pool_nthreads; i++)
     {
       GREP_TEST_DELAY ("spawn");
-      if (atomic_load (&pool_stop_spawning)
-          || pthread_create (&pool_threads[i], &attr, worker_thread_func,
-                             nullptr) != 0)
+      if (atomic_load (&pool_stop_spawning))
         break;
+      if (pthread_create (&pool_threads[i], &attr, worker_thread_func,
+                          nullptr) != 0)
+        {
+          pthread_mutex_lock (&pool_mutex);
+          pool_nthreads = i;
+          pthread_cond_broadcast (&q_not_full_cv);
+          pthread_mutex_unlock (&pool_mutex);
+          break;
+        }
       atomic_store (&pool_created, i + 1);
     }
   pthread_attr_destroy (&attr);

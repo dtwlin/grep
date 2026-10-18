@@ -32,7 +32,7 @@ pl_runs=0
 PL_ONLY=${PL_ONLY-}
 PL_CANDS=${PL_CANDS-}
 
-pl_timeout=
+pl_timeout=pl_with_sig_dfl
 if (timeout 10s true) >/dev/null 2>&1; then
   pl_timeout="timeout ${PL_TIMEOUT:-60}"
 fi
@@ -274,12 +274,13 @@ pl_check ()
   pc_dir=pl_res/c$pl_cases
   mkdir -p $pc_dir || framework_failure_
   pl_exec rel $pc_dir/ref "$pc_in" "GREP_THREADS=1 $PL_ENV" -- "$@"
-  if test "$(cat $pc_dir/ref.rc)" = 124; then
-    pr_replay="GREP_THREADS=1 grep $*"
-    echo "FAIL [reference timed out]: grep $*" >&2
-    pl_fail=1
-    return
-  fi
+  case $(cat $pc_dir/ref.rc) in
+    124|142)
+      pr_replay="GREP_THREADS=1 grep $*"
+      echo "FAIL [reference timed out]: grep $*" >&2
+      pl_fail=1
+      return;;
+  esac
   if test $pl_have_base = yes && test "${PL_NO_BASE-}" != yes; then
     pl_exec base $pc_dir/base "$pc_in" "$PL_ENV" -- "$@"
     pr_replay="$abs_top_srcdir/benchmarks/grep-baseline $*"
@@ -309,12 +310,13 @@ pl_check ()
       \|*) pr_replay="cat ${pc_in#|} | $pr_replay";;
       *) pr_replay="$pr_replay < $pc_in";;
     esac
-    if test "$(cat $pc_out.rc)" = 124; then
-      echo "FAIL [hang: timed out after ${PL_TIMEOUT:-60}s, $pc_cand]: grep $*" >&2
-      echo "  replay: (cd $PWD && $pr_replay)" >&2
-      pl_fail=1
-      continue
-    fi
+    case $(cat $pc_out.rc) in
+      124|142)
+        echo "FAIL [hang: timed out after ${PL_TIMEOUT:-60}s, $pc_cand]: grep $*" >&2
+        echo "  replay: (cd $PWD && $pr_replay)" >&2
+        pl_fail=1
+        continue;;
+    esac
     pl_same $pc_out $pc_dir/ref \
       || pl_report "$pc_cand" $pc_out $pc_dir/ref "$@"
   done

@@ -276,8 +276,12 @@ jobs:
           ./src/grep --version | ./src/grep -F "SWAR)"
 
       - name: Run parallel test suite
+        env:
+          DELAY_USEC: "400"
+          CHAOS_SEEDS: "1"
+          PL_TIMEOUT: "20"
         run: |
-          make check -C tests -j"$(sysctl -n hw.ncpu)" \
+          perl -e 'alarm 480; exec @ARGV or die $!' make check -C tests -j"$(sysctl -n hw.ncpu)" \
             TESTS="parallel-tree-walk parallel-chunked-mmap parallel-stream-stdin parallel-kwset-ac parallel-pcre-must parallel-env-limits parallel-coverage-edge-cases parallel-boundary-cases parallel-multithread-cases parallel-stress-test parallel-cli-flags parallel-coverage-complete parallel-sched-fuzz parallel-shrunk-limits parallel-delay-sites parallel-early-exit parallel-io-faults" || {
             cat tests/test-suite.log
             python3 -c 't=open("tests/test-suite.log",errors="replace").read(); idx=t.find("\nFAIL:"); s=t[idx+1:] if idx>=0 else t; al=[l.strip() for l in s.splitlines() if l.strip()]; nt=[l for l in al if not l.startswith("+ ") and not l.startswith("++")]; p=nt[:40]+["--- TAIL ---"]+al[-25:]; [print("::error::"+" | ".join(p[i:i+8])) for i in range(0,min(len(p),72),8)]'
