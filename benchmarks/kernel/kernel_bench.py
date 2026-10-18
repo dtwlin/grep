@@ -11,6 +11,7 @@ Compares:
   G0: Stock upstream GNU grep baseline
   G1: Multi-threaded GNU grep fork
   R0: Stock ripgrep
+  U0: Stock ugrep
   G2: Distro GNU grep
   X1: git grep
 
@@ -42,6 +43,20 @@ if SCRIPT_DIR not in sys.path:
 
 from scenarios import Scenario, make_scenarios
 from evict_cache import evict_paths, check_fincore_sample
+
+DEFAULT_TOOLS = "G0,G1,R0,U0,G2,X1"
+
+# Tools whose thread count the harness can set (GREP_THREADS, -j, -J, --threads).
+THREAD_TOOLS = ("G1", "R0", "U0", "X1")
+
+# Gate B differences that are explained by documented behavior of the other tool.
+KNOWN_SEMANTIC = {
+    ("T-09", "R0"): "KNOWN-SEMANTIC (BOM stripping)",
+    ("T-09", "U0"): "KNOWN-SEMANTIC (BOM stripping)",
+    ("T-19", "U0"): "KNOWN-SEMANTIC (no group separator between files)",
+    ("T-20", "U0"): "KNOWN-SEMANTIC (no group separator between files)",
+    ("T-26", "U0"): "KNOWN-SEMANTIC (-b prints the match offset)",
+}
 
 
 def scrub_string(text: str, ksrc: str = "", kbench_dir: str = "", repo_dir: str = "") -> str:
@@ -486,6 +501,8 @@ def capture_env_metadata(
         cwd = None
         if tool_name == "R0":
             argv = [bin_path, "-uu", "-g", "!.git", "-F", probe, ksrc]
+        elif tool_name == "U0":
+            argv = [bin_path, "-r", "--hidden", "--exclude-dir=.git", "-F", probe, ksrc]
         elif tool_name == "X1":
             argv = [bin_path, "grep", "-F", probe]
             cwd = ksrc
@@ -511,6 +528,7 @@ def capture_env_metadata(
             v_line = res.stdout.splitlines()[0] if res.stdout else res.stderr.splitlines()[0]
             m = re.search(r"\b(\d+(?:\.\d+){1,2})\b", v_line)
             t_info["version"] = m.group(1) if m else "unknown"
+            t_info["version_line"] = v_line.strip()
         except Exception:
             t_info["version"] = "unknown"
         tools_meta[tool_name] = t_info
@@ -756,10 +774,11 @@ def main():
     parser.add_argument("--ksrc", default=os.environ.get("K_SRC", os.path.expanduser("~/p/s/linux-stable")), help="Linux kernel source tree")
     parser.add_argument("--kbench-dir", default=os.environ.get("KBENCH_DIR", os.path.expanduser("~/p/s/kbench")), help="Generated corpus directory")
     parser.add_argument("--patterns-dir", default=os.path.join(SCRIPT_DIR, "patterns"), help="Pattern files directory")
-    parser.add_argument("--tools", default="G0,G1,R0,G2,X1", help="Comma-separated tools to run (G0,G1,R0,G2,X1)")
+    parser.add_argument("--tools", default=None, help=f"Comma-separated tools to run (default: {DEFAULT_TOOLS}; U0 is skipped when ugrep is not installed)")
     parser.add_argument("--bin-G0", default=os.path.abspath(os.path.join(SCRIPT_DIR, "../grep-baseline")), help="Path to G0 baseline binary")
     parser.add_argument("--bin-G1", default=os.path.abspath(os.path.join(SCRIPT_DIR, "../../src/grep")), help="Path to G1 multi-threaded binary")
     parser.add_argument("--bin-R0", default="/usr/bin/rg", help="Path to R0 ripgrep binary")
+    parser.add_argument("--bin-U0", default=shutil.which("ugrep") or "/usr/bin/ugrep", help="Path to U0 ugrep binary")
     parser.add_argument("--bin-G2", default="/usr/bin/grep", help="Path to G2 distro grep binary")
     parser.add_argument("--bin-X1", default="/usr/bin/git", help="Path to X1 git binary")
     parser.add_argument("--categories", default="", help="Comma-separated categories to run (e.g. T,B,M,L,X,U,P)")
@@ -782,17 +801,19 @@ def main():
     parser.add_argument("--sweep-warmups", type=int, default=1, help="Number of warmup rounds per thread sweep point")
     parser.add_argument("--cold-rounds", type=int, default=3, help="Number of cold cache measured rounds")
     parser.add_argument("--phase", choices=["all", "warm", "c", "cold", "sweep"], default="all", help="Which benchmark phase to run")
+    parser.add_argument("--fixed-threads", type=int, default=None, help="Run phases 1 and 2 with this thread count for G1, R0, U0 and X1 instead of their defaults")
     parser.add_argument("--out", default=None, help="Output directory for results")
     parser.add_argument("--resume", default=None, help="Resume from an existing results directory")
     args = parser.parse_args()
 
     repo_dir = os.path.abspath(os.path.join(SCRIPT_DIR, "../.."))
-    tools = [t.strip() for t in args.tools.split(",") if t.strip()]
+    tools = [t.strip() for t in (args.tools or DEFAULT_TOOLS).split(",") if t.strip()]
 
     binaries = {
         "G0": args.bin_G0,
         "G1": args.bin_G1,
         "R0": args.bin_R0,
+        "U0": args.bin_U0,
         "G2": args.bin_G2,
         "X1": args.bin_X1,
     }
@@ -801,6 +822,14 @@ def main():
         fallback = binaries["G2"] if os.path.exists(binaries["G2"]) else binaries["G1"]
         print(f"Note: G0 binary not found at {binaries['G0']}; falling back to {fallback}", file=sys.stderr)
         binaries["G0"] = fallback
+
+    if args.tools is None and "U0" in tools and not os.path.exists(binaries["U0"]):
+        print(f"Note: ugrep not found at {binaries['U0']}; skipping U0 (use --bin-U0)", file=sys.stderr)
+        tools.remove("U0")
+
+    def run_threads(tool: str) -> Optional[int]:
+        """Thread count for phases 1 and 2: the tool's default unless --fixed-threads."""
+        return args.fixed_threads if tool in THREAD_TOOLS else None
 
     # Verify binaries
     for t in tools:
@@ -959,7 +988,7 @@ def main():
                     patterns_dir=args.patterns_dir,
                     repo_dir=repo_dir,
                     locale=primary_locale,
-                    threads=None,
+                    threads=run_threads(tool),
                     round_idx=-1 - w,
                     is_warmup=True,
                     tmp_dir=tmp_scratch,
@@ -984,7 +1013,7 @@ def main():
                     patterns_dir=args.patterns_dir,
                     repo_dir=repo_dir,
                     locale=primary_locale,
-                    threads=None,
+                    threads=run_threads(tool),
                     round_idx=r,
                     is_warmup=False,
                     tmp_dir=tmp_scratch,
@@ -1022,7 +1051,7 @@ def main():
         ref_g0 = os.path.join(tmp_scratch, f"ref_{scenario.sid}_G0.sorted")
         if os.path.exists(ref_g0):
             g0_hash = sha256_file(ref_g0)
-            for t in ("R0", "G2", "X1"):
+            for t in ("R0", "U0", "G2", "X1"):
                 ref_t = os.path.join(tmp_scratch, f"ref_{scenario.sid}_{t}.sorted")
                 if os.path.exists(ref_t):
                     t_hash = sha256_file(ref_t)
@@ -1035,7 +1064,7 @@ def main():
                         )
                         diff_lines = diff_res.stdout.splitlines()[:10]
                         diff_sample = "\n".join(diff_lines)
-                        classification = "KNOWN-SEMANTIC (BOM stripping)" if (scenario.sid == "T-09" and t == "R0") else "SOFT_DIFF"
+                        classification = KNOWN_SEMANTIC.get((scenario.sid, t), "SOFT_DIFF")
                         all_diff_samples.setdefault(scenario.sid, {})[t] = {
                             "classification": classification,
                             "diff_sample": diff_sample,
@@ -1049,7 +1078,7 @@ def main():
         # Quick mode inline sweep (1 round)
         if args.quick and scenario.is_sweep and sweep_threads and not args.dry_run:
             print(f"  Thread sweep ({scenario.sid}): {sweep_threads}")
-            sweep_tools = [t for t in ("G1", "R0", "X1") if t in tools and t not in scenario.na_tools]
+            sweep_tools = [t for t in ("G1", "R0", "U0", "X1") if t in tools and t not in scenario.na_tools]
             for th in sweep_threads:
                 for s_tool in sweep_tools:
                     rec = execute_run(
@@ -1114,7 +1143,7 @@ def main():
                         patterns_dir=args.patterns_dir,
                         repo_dir=repo_dir,
                         locale="C",
-                        threads=None,
+                        threads=run_threads(tool),
                         round_idx=-1 - w,
                         is_warmup=True,
                         tmp_dir=tmp_scratch,
@@ -1138,7 +1167,7 @@ def main():
                         patterns_dir=args.patterns_dir,
                         repo_dir=repo_dir,
                         locale="C",
-                        threads=None,
+                        threads=run_threads(tool),
                         round_idx=r,
                         is_warmup=False,
                         tmp_dir=tmp_scratch,
@@ -1243,7 +1272,7 @@ def main():
 
         for s_idx, scenario in enumerate(sw_scenarios, 1):
             print(f"\n[Phase 4 {s_idx}/{len(sw_scenarios)}] Thread Sweep Scenario {scenario.sid}: {scenario.description}")
-            sweep_tools = [t for t in ("G1", "R0", "X1") if t in tools and t not in scenario.na_tools]
+            sweep_tools = [t for t in ("G1", "R0", "U0", "X1") if t in tools and t not in scenario.na_tools]
             timeout_for_scenario = scenario.timeout_sec or args.timeout
             g1_shas = {}
 

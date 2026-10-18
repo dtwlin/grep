@@ -161,6 +161,74 @@ def format_ratio(val: Optional[float]) -> str:
     return f"{val:.2f}×"
 
 
+# Names and thread-count options of the multi-threaded competitors.
+COMPETITOR_NAMES = {"R0": "ripgrep", "U0": "ugrep"}
+COMPETITOR_THREAD_FLAGS = {"R0": "-j", "U0": "-J"}
+
+# Speedup ratios within this distance of 1.0 count as ties.
+TIE_TOLERANCE = 0.02
+
+CATEGORY_ORDER = ("B", "T", "M", "L", "U", "X", "P")
+
+# Explanations of Gate B differences, keyed by (scenario, tool).
+GATE_B_NOTES = {
+    ("T-09", "R0"): "Ripgrep strips the UTF-8 BOM at the start of `Documentation/translations/zh_CN/dev-tools/sparse.rst` (`\\ufeffCopyright 2004 Linus Torvalds`), whereas GNU grep prints the BOM bytes (12,577,386 vs 12,577,383 bytes).",
+    ("T-09", "U0"): "Like ripgrep, ugrep strips the UTF-8 BOM at the start of `Documentation/translations/zh_CN/dev-tools/sparse.rst`; every other line is identical.",
+    ("T-19", "U0"): "Every match and context line is identical. GNU grep also prints the `--` group separator between matches in different files (10 of its 16 separators); ugrep prints it only between groups in the same file.",
+    ("T-20", "U0"): "Every match and context line is identical. GNU grep also prints the `--` group separator between matches in different files (3,422 of its 15,719 separators); ugrep prints it only between groups in the same file.",
+    ("T-21", "U0"): "The counts differ in 118 of 95,932 files. In the 5 binary files GNU grep counts NUL-terminated records, because it treats NUL bytes as line ends in binary files, while ugrep counts newline-terminated lines. In the 113 files whose last line has no newline, `ugrep -v -c` reports one line fewer than the lines `ugrep -v` prints (a file holding just `a` gives 1 with GNU grep and 0 with ugrep 7.8.5).",
+    ("T-26", "U0"): "Every file, line number and line is identical. ugrep's `-b` prints the byte offset of the first match on the line, GNU grep's the offset of the line itself; they agree on the 14 lines where the match starts the line.",
+}
+
+
+def md_table_head(cols: List[str]) -> List[str]:
+    """Return the header and alignment rows of a table with columns COLS.
+
+    Scenario and description columns are left-aligned, gate columns
+    centered, and all other columns, which hold numbers, right-aligned.
+    """
+    def align(col: str) -> str:
+        if col in ("Scenario", "Description"):
+            return ":---"
+        if col.startswith("Gate"):
+            return ":---:"
+        return "---:"
+
+    return [md_row(cols), md_row([align(c) for c in cols])]
+
+
+def md_row(cells: List[str]) -> str:
+    return "| " + " | ".join(cells) + " |"
+
+
+def geomean(values) -> Optional[float]:
+    vals = [v for v in values if v is not None and v > 0]
+    if not vals:
+        return None
+    return math.exp(sum(math.log(v) for v in vals) / len(vals))
+
+
+def count_wtl(ratios, tie_tol: float = TIE_TOLERANCE) -> Tuple[int, int, int]:
+    """Count wins, ties and losses in speedup RATIOS (> 1 means G1 is faster)."""
+    wins = ties = losses = 0
+    for r in ratios:
+        if r is None:
+            continue
+        if abs(r - 1.0) <= tie_tol:
+            ties += 1
+        elif r > 1.0:
+            wins += 1
+        else:
+            losses += 1
+    return wins, ties, losses
+
+
+def format_wtl(wtl: Tuple[int, int, int]) -> str:
+    w, t, l = wtl
+    return (f"{w} Win{'' if w == 1 else 's'} / {t} Tie{'' if t == 1 else 's'} / "
+            f"{l} Loss{'' if l == 1 else 'es'}")
+
+
 class ReportGenerator:
     def __init__(self, results_dir: str):
         self.results_dir = os.path.abspath(results_dir)
@@ -247,6 +315,7 @@ class ReportGenerator:
             if sid not in seen_sids:
                 seen_sids[sid] = r
         self.scenarios = sorted(seen_sids.keys(), key=lambda s: (1 if seen_sids[s].get("category") == "P" else 0, s))
+        self.has_u0 = any(k[1] == "U0" for k in self.stats)
 
     def get_stat(
         self,
@@ -272,7 +341,7 @@ class ReportGenerator:
         return ("PASS" if passed else "FAIL"), ("Byte-exact match" if passed else "Output mismatch")
 
     def check_gate_b(self, sid: str, tool: str = "R0", locale: str = "en_US.UTF-8") -> Tuple[str, str]:
-        """Gate B: R0/G2/X1 vs G0 normalized equivalence."""
+        """Gate B: R0/U0/G2/X1 vs G0 normalized equivalence."""
         g0 = self.get_stat(sid, "G0", None, locale=locale)
         t_stat = self.get_stat(sid, tool, None, locale=locale)
         if not g0 or not t_stat:
@@ -294,29 +363,47 @@ class ReportGenerator:
 
     def generate_headline_table(self) -> str:
         has_other = any(k[1] in ("G2", "X1") for k in self.stats.keys())
+        has_u0 = self.has_u0
+        cols = ["Scenario", "Description", "G0 (ms)", "G1 (ms)", "R0 (ms)"]
+        if has_u0:
+            cols.append("U0 (ms)")
         if has_other:
-            lines = [
-                "| Scenario | Description | G0 (ms) | G1 (ms) | R0 (ms) | G2 (ms) | X1 (ms) | G1 vs G0 | R0 vs G0 | G1 vs R0 | G1 CPU | R0 CPU | G2 CPU | X1 CPU | G1 RSS | R0 RSS | G2 RSS | X1 RSS | Gate A | Gate B |",
-                "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: | :---: |",
-            ]
-        else:
-            lines = [
-                "| Scenario | Description | G0 (ms) | G1 (ms) | R0 (ms) | G1 vs G0 | R0 vs G0 | G1 vs R0 | G1 CPU | R0 CPU | G1 RSS | R0 RSS | Gate A | Gate B |",
-                "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: | :---: |",
-            ]
+            cols += ["G2 (ms)", "X1 (ms)"]
+        cols += ["G1 vs G0", "R0 vs G0"]
+        if has_u0:
+            cols.append("U0 vs G0")
+        cols.append("G1 vs R0")
+        if has_u0:
+            cols.append("G1 vs U0")
+        cols += ["G1 CPU", "R0 CPU"]
+        if has_u0:
+            cols.append("U0 CPU")
+        if has_other:
+            cols += ["G2 CPU", "X1 CPU"]
+        cols += ["G1 RSS", "R0 RSS"]
+        if has_u0:
+            cols.append("U0 RSS")
+        if has_other:
+            cols += ["G2 RSS", "X1 RSS"]
+        cols += ["Gate A", "Gate B"]
+        if has_u0:
+            cols.append("Gate B (U0)")
+        lines = md_table_head(cols)
 
         for sid in self.scenarios:
             g0 = self.get_stat(sid, "G0")
             g1 = self.get_stat(sid, "G1")
             r0 = self.get_stat(sid, "R0")
+            u0 = self.get_stat(sid, "U0")
             g2 = self.get_stat(sid, "G2")
             x1 = self.get_stat(sid, "X1")
 
-            desc = (g1 or g0 or r0 or g2 or x1 or {}).get("description", "").replace("|", "\\|")
+            desc = (g1 or g0 or r0 or u0 or g2 or x1 or {}).get("description", "").replace("|", "\\|")
 
             g0_ms = g0["median_ms"] if g0 else None
             g1_ms = g1["median_ms"] if g1 else None
             r0_ms = r0["median_ms"] if r0 else None
+            u0_ms = u0["median_ms"] if u0 else None
             g2_ms = g2["median_ms"] if g2 else None
             x1_ms = x1["median_ms"] if x1 else None
 
@@ -324,21 +411,26 @@ class ReportGenerator:
             if sid == "M-02" and (x1 is None or x1.get("timed_out") or x1_ms is None):
                 x1_str = "DNF (> 600 s)"
 
+            # On U-02, rg and ugrep skip .git by default; grep scans it.
             r0_str = format_ms(r0_ms)
             if sid == "U-02" and r0_ms is not None:
                 r0_str = f"{format_ms(r0_ms)}*"
+            u0_str = format_ms(u0_ms)
+            if sid == "U-02" and u0_ms is not None:
+                u0_str = f"{format_ms(u0_ms)}*"
 
-            g1_vs_g0 = (g0_ms / g1_ms) if (g0_ms and g1_ms and g1_ms > 0) else None
             r0_vs_g0 = (g0_ms / r0_ms) if (g0_ms and r0_ms and r0_ms > 0) else None
-            g1_vs_r0 = (r0_ms / g1_ms) if (r0_ms and g1_ms and g1_ms > 0) else None
+            u0_vs_g0 = (g0_ms / u0_ms) if (g0_ms and u0_ms and u0_ms > 0) else None
 
             g1_cpu = format_cpu(g1["mean_cpu_s"] if g1 else None)
             r0_cpu = format_cpu(r0["mean_cpu_s"] if r0 else None)
+            u0_cpu = format_cpu(u0["mean_cpu_s"] if u0 else None)
             g2_cpu = format_cpu(g2["mean_cpu_s"] if g2 else None)
             x1_cpu = format_cpu(x1["mean_cpu_s"] if (x1 and not (sid == "M-02" and x1.get("timed_out"))) else None)
 
             g1_rss = format_rss(g1["max_rss_mb"] if g1 else None)
             r0_rss = format_rss(r0["max_rss_mb"] if r0 else None)
+            u0_rss = format_rss(u0["max_rss_mb"] if u0 else None)
             g2_rss = format_rss(g2["max_rss_mb"] if g2 else None)
             x1_rss = format_rss(x1["max_rss_mb"] if (x1 and not (sid == "M-02" and x1.get("timed_out"))) else None)
 
@@ -353,29 +445,38 @@ class ReportGenerator:
                 g1_str = f"invalid (exit {g1_exit})" if g1_exit != 0 else "invalid (mismatch)"
                 g1_vs_g0 = None
                 g1_vs_r0 = None
+                g1_vs_u0 = None
             else:
                 g1_str = format_ms(g1_ms)
                 g1_vs_g0 = (g0_ms / g1_ms) if (g0_ms and g1_ms and g1_ms > 0) else None
                 g1_vs_r0 = (r0_ms / g1_ms) if (r0_ms and g1_ms and g1_ms > 0) else None
+                g1_vs_u0 = (u0_ms / g1_ms) if (u0_ms and g1_ms and g1_ms > 0) else None
 
+            cells = [f"`{sid}`", desc, format_ms(g0_ms), g1_str, r0_str]
+            if has_u0:
+                cells.append(u0_str)
             if has_other:
-                row = (
-                    f"| `{sid}` | {desc} | "
-                    f"{format_ms(g0_ms)} | {g1_str} | {r0_str} | "
-                    f"{format_ms(g2_ms)} | {x1_str} | "
-                    f"**{format_ratio(g1_vs_g0)}** | {format_ratio(r0_vs_g0)} | "
-                    f"**{format_ratio(g1_vs_r0)}** | {g1_cpu} | {r0_cpu} | {g2_cpu} | {x1_cpu} | "
-                    f"{g1_rss} | {r0_rss} | {g2_rss} | {x1_rss} | {gate_a_str} | {gate_b_str} |"
-                )
-            else:
-                row = (
-                    f"| `{sid}` | {desc} | "
-                    f"{format_ms(g0_ms)} | {g1_str} | {r0_str} | "
-                    f"**{format_ratio(g1_vs_g0)}** | {format_ratio(r0_vs_g0)} | "
-                    f"**{format_ratio(g1_vs_r0)}** | {g1_cpu} | {r0_cpu} | "
-                    f"{g1_rss} | {r0_rss} | {gate_a_str} | {gate_b_str} |"
-                )
-            lines.append(row)
+                cells += [format_ms(g2_ms), x1_str]
+            cells += [f"**{format_ratio(g1_vs_g0)}**", format_ratio(r0_vs_g0)]
+            if has_u0:
+                cells.append(format_ratio(u0_vs_g0))
+            cells.append(f"**{format_ratio(g1_vs_r0)}**")
+            if has_u0:
+                cells.append(f"**{format_ratio(g1_vs_u0)}**")
+            cells += [g1_cpu, r0_cpu]
+            if has_u0:
+                cells.append(u0_cpu)
+            if has_other:
+                cells += [g2_cpu, x1_cpu]
+            cells += [g1_rss, r0_rss]
+            if has_u0:
+                cells.append(u0_rss)
+            if has_other:
+                cells += [g2_rss, x1_rss]
+            cells += [gate_a_str, gate_b_str]
+            if has_u0:
+                cells.append(self.check_gate_b(sid, "U0")[0])
+            lines.append(md_row(cells))
 
         failed_sids = [sid for sid in self.scenarios if self.get_stat(sid, "G1") and self.check_gate_a(sid)[0] != "PASS"]
         if failed_sids:
@@ -393,7 +494,7 @@ class ReportGenerator:
 
         cat_names = {
             "T": "Tree Traversal (96k files, 1.64 GB)",
-            "B": "Single Huge File ($BIG ≈ 1.39 GB)",
+            "B": "Single Huge File ($BIG ≈ 1.45 GB)",
             "M": "Multi-Pattern Sets",
             "L": "Per-Invocation Latency",
             "X": "xargs / External Parallelism",
@@ -403,32 +504,37 @@ class ReportGenerator:
         title = cat_names.get(category, f"Category {category}")
 
         has_other = any(k[1] in ("G2", "X1") for k in self.stats.keys())
+        has_u0 = self.has_u0
+        cols = ["Scenario", "Description", "G0 (ms)", "G1 (ms)", "R0 (ms)"]
+        if has_u0:
+            cols.append("U0 (ms)")
         if has_other:
-            lines = [
-                f"### Category {category} — {title}",
-                "",
-                "| Scenario | Description | G0 (ms) | G1 (ms) | R0 (ms) | G2 (ms) | X1 (ms) | Speedup (vs G0) | G1 vs R0 | G1 CPU | R0 CPU | G2 CPU | X1 CPU | G1 RSS | R0 RSS | G2 RSS | X1 RSS | Gate A |",
-                "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |",
-            ]
-        else:
-            lines = [
-                f"### Category {category} — {title}",
-                "",
-                "| Scenario | Description | G0 (ms) | G1 (ms) | R0 (ms) | Speedup (vs G0) | G1 vs R0 | G1 CPU | R0 CPU | G1 RSS | R0 RSS | Gate A |",
-                "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |",
-            ]
+            cols += ["G2 (ms)", "X1 (ms)"]
+        cols += ["Speedup (vs G0)", "G1 vs R0"]
+        if has_u0:
+            cols.append("G1 vs U0")
+        cols += ["G1 CPU", "R0 CPU"]
+        if has_other:
+            cols += ["G2 CPU", "X1 CPU"]
+        cols += ["G1 RSS", "R0 RSS"]
+        if has_other:
+            cols += ["G2 RSS", "X1 RSS"]
+        cols.append("Gate A")
+        lines = [f"### Category {category} — {title}", ""] + md_table_head(cols)
 
         for sid in sids:
             g0 = self.get_stat(sid, "G0")
             g1 = self.get_stat(sid, "G1")
             r0 = self.get_stat(sid, "R0")
+            u0 = self.get_stat(sid, "U0")
             g2 = self.get_stat(sid, "G2")
             x1 = self.get_stat(sid, "X1")
 
-            desc = (g1 or g0 or r0 or g2 or x1 or {}).get("description", "").replace("|", "\\|")
+            desc = (g1 or g0 or r0 or u0 or g2 or x1 or {}).get("description", "").replace("|", "\\|")
             g0_ms = g0["median_ms"] if g0 else None
             g1_ms = g1["median_ms"] if g1 else None
             r0_ms = r0["median_ms"] if r0 else None
+            u0_ms = u0["median_ms"] if u0 else None
             g2_ms = g2["median_ms"] if g2 else None
             x1_ms = x1["median_ms"] if x1 else None
 
@@ -439,6 +545,9 @@ class ReportGenerator:
             r0_str = format_ms(r0_ms)
             if sid == "U-02" and r0_ms is not None:
                 r0_str = f"{format_ms(r0_ms)}*"
+            u0_str = format_ms(u0_ms)
+            if sid == "U-02" and u0_ms is not None:
+                u0_str = f"{format_ms(u0_ms)}*"
 
             gate_a, _ = self.check_gate_a(sid)
             gate_a_str = f"**{gate_a}**" if gate_a == "PASS" else f"❌ {gate_a}"
@@ -448,10 +557,12 @@ class ReportGenerator:
                 g1_str = f"invalid (exit {g1_exit})" if g1_exit != 0 else "invalid (mismatch)"
                 g1_vs_g0 = None
                 g1_vs_r0 = None
+                g1_vs_u0 = None
             else:
                 g1_str = format_ms(g1_ms)
                 g1_vs_g0 = (g0_ms / g1_ms) if (g0_ms and g1_ms and g1_ms > 0) else None
                 g1_vs_r0 = (r0_ms / g1_ms) if (r0_ms and g1_ms and g1_ms > 0) else None
+                g1_vs_u0 = (u0_ms / g1_ms) if (u0_ms and g1_ms and g1_ms > 0) else None
 
             g1_cpu = format_cpu(g1["mean_cpu_s"] if g1 else None)
             r0_cpu = format_cpu(r0["mean_cpu_s"] if r0 else None)
@@ -463,18 +574,22 @@ class ReportGenerator:
             g2_rss = format_rss(g2["max_rss_mb"] if g2 else None)
             x1_rss = format_rss(x1["max_rss_mb"] if (x1 and not (sid == "M-02" and x1.get("timed_out"))) else None)
 
+            cells = [f"`{sid}`", desc, format_ms(g0_ms), g1_str, r0_str]
+            if has_u0:
+                cells.append(u0_str)
             if has_other:
-                lines.append(
-                    f"| `{sid}` | {desc} | {format_ms(g0_ms)} | {g1_str} | {r0_str} | "
-                    f"{format_ms(g2_ms)} | {x1_str} | **{format_ratio(g1_vs_g0)}** | **{format_ratio(g1_vs_r0)}** | "
-                    f"{g1_cpu} | {r0_cpu} | {g2_cpu} | {x1_cpu} | {g1_rss} | {r0_rss} | {g2_rss} | {x1_rss} | {gate_a_str} |"
-                )
-            else:
-                lines.append(
-                    f"| `{sid}` | {desc} | {format_ms(g0_ms)} | {g1_str} | {r0_str} | "
-                    f"**{format_ratio(g1_vs_g0)}** | **{format_ratio(g1_vs_r0)}** | "
-                    f"{g1_cpu} | {r0_cpu} | {g1_rss} | {r0_rss} | {gate_a_str} |"
-                )
+                cells += [format_ms(g2_ms), x1_str]
+            cells += [f"**{format_ratio(g1_vs_g0)}**", f"**{format_ratio(g1_vs_r0)}**"]
+            if has_u0:
+                cells.append(f"**{format_ratio(g1_vs_u0)}**")
+            cells += [g1_cpu, r0_cpu]
+            if has_other:
+                cells += [g2_cpu, x1_cpu]
+            cells += [g1_rss, r0_rss]
+            if has_other:
+                cells += [g2_rss, x1_rss]
+            cells.append(gate_a_str)
+            lines.append(md_row(cells))
 
         cat_fails = [sid for sid in sids if self.get_stat(sid, "G1") and self.check_gate_a(sid)[0] != "PASS"]
         if cat_fails:
@@ -488,6 +603,10 @@ class ReportGenerator:
                 "",
                 "> \\* **Note on U-02 (`R0`)**: `rg` skips `.git` by default even without `-g '!.git'`; GNU `grep` requires explicit `--exclude-dir=.git` to avoid traversing `.git` pack files (hence scanning the 6 GB `.git` directory in U-02).",
             ])
+            if has_u0:
+                lines.append(
+                    "> \\* **Note on U-02 (`U0`)**: `ugrep` skips hidden files and directories, `.git` included, unless `--hidden` is given, so its U-01 and U-02 commands are the same."
+                )
 
         return "\n".join(lines)
 
@@ -508,7 +627,7 @@ class ReportGenerator:
         ]
 
         for sid in sids:
-            for tool in ("G0", "G1", "R0", "G2", "X1"):
+            for tool in ("G0", "G1", "R0", "U0", "G2", "X1"):
                 st = self.get_stat(sid, tool)
                 if not st:
                     continue
@@ -534,22 +653,28 @@ class ReportGenerator:
                 )
 
         has_other = any(k[1] in ("G2", "X1") for k in self.stats.keys())
+        has_u0 = self.has_u0
         lines.extend([
             "",
             "#### Summary Comparison (Net Latency Median)",
             "",
         ])
+        cols = ["Scenario", "Description", "G0 Net", "G1 Net", "R0 Net"]
+        if has_u0:
+            cols.append("U0 Net")
         if has_other:
-            lines.append("| Scenario | Description | G0 Net | G1 Net | R0 Net | G2 Net | X1 Net | G1 vs G0 | G1 vs R0 | Gate A |")
-            lines.append("| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |")
-        else:
-            lines.append("| Scenario | Description | G0 Net | G1 Net | R0 Net | G1 vs G0 | G1 vs R0 | Gate A |")
-            lines.append("| :--- | :--- | ---: | ---: | ---: | ---: | ---: | :---: |")
+            cols += ["G2 Net", "X1 Net"]
+        cols += ["G1 vs G0", "G1 vs R0"]
+        if has_u0:
+            cols.append("G1 vs U0")
+        cols.append("Gate A")
+        lines.extend(md_table_head(cols))
 
         for sid in sids:
             g0 = self.get_stat(sid, "G0")
             g1 = self.get_stat(sid, "G1")
             r0 = self.get_stat(sid, "R0")
+            u0 = self.get_stat(sid, "U0")
             g2 = self.get_stat(sid, "G2")
             x1 = self.get_stat(sid, "X1")
 
@@ -565,25 +690,27 @@ class ReportGenerator:
             g0_net = get_net(g0, "G0")
             g1_net = get_net(g1, "G1")
             r0_net = get_net(r0, "R0")
+            u0_net = get_net(u0, "U0")
             g2_net = get_net(g2, "G2")
             x1_net = get_net(x1, "X1")
 
             g1_vs_g0 = (g0_net / g1_net) if (g0_net and g1_net and g1_net > 0) else None
             g1_vs_r0 = (r0_net / g1_net) if (r0_net and g1_net and g1_net > 0) else None
+            g1_vs_u0 = (u0_net / g1_net) if (u0_net and g1_net and g1_net > 0) else None
 
             gate_a, _ = self.check_gate_a(sid)
             gate_a_str = f"**{gate_a}**" if gate_a == "PASS" else f"❌ {gate_a}"
 
+            cells = [f"`{sid}`", desc, format_ms(g0_net), format_ms(g1_net), format_ms(r0_net)]
+            if has_u0:
+                cells.append(format_ms(u0_net))
             if has_other:
-                lines.append(
-                    f"| `{sid}` | {desc} | {format_ms(g0_net)} | {format_ms(g1_net)} | {format_ms(r0_net)} | "
-                    f"{format_ms(g2_net)} | {format_ms(x1_net)} | **{format_ratio(g1_vs_g0)}** | **{format_ratio(g1_vs_r0)}** | {gate_a_str} |"
-                )
-            else:
-                lines.append(
-                    f"| `{sid}` | {desc} | {format_ms(g0_net)} | {format_ms(g1_net)} | {format_ms(r0_net)} | "
-                    f"**{format_ratio(g1_vs_g0)}** | **{format_ratio(g1_vs_r0)}** | {gate_a_str} |"
-                )
+                cells += [format_ms(g2_net), format_ms(x1_net)]
+            cells += [f"**{format_ratio(g1_vs_g0)}**", f"**{format_ratio(g1_vs_r0)}**"]
+            if has_u0:
+                cells.append(f"**{format_ratio(g1_vs_u0)}**")
+            cells.append(gate_a_str)
+            lines.append(md_row(cells))
 
         return "\n".join(lines)
 
@@ -593,18 +720,20 @@ class ReportGenerator:
             return ""
 
         has_other = any(k[1] in ("G2", "X1") for k in self.stats.keys())
+        has_u0 = self.has_u0
         lines = [
             "### Locale Sensitivity: en_US.UTF-8 vs LC_ALL=C (22 Scenarios)",
             "",
             "> Ratio = UTF-8 median / C median. A ratio > 1.00× indicates that the C locale is faster (multibyte/case-folding overhead in UTF-8).",
             "",
         ]
+        cols = ["Scenario", "Description", "G0 UTF-8", "G0 C", "G0 (U/C)", "G1 UTF-8", "G1 C", "G1 (U/C)",
+                "R0 UTF-8", "R0 C", "R0 (U/C)"]
+        if has_u0:
+            cols += ["U0 UTF-8", "U0 C", "U0 (U/C)"]
         if has_other:
-            lines.append("| Scenario | Description | G0 UTF-8 | G0 C | G0 (U/C) | G1 UTF-8 | G1 C | G1 (U/C) | R0 UTF-8 | R0 C | R0 (U/C) | G2 (U/C) | X1 (U/C) |")
-            lines.append("| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
-        else:
-            lines.append("| Scenario | Description | G0 UTF-8 | G0 C | G0 (U/C) | G1 UTF-8 | G1 C | G1 (U/C) | R0 UTF-8 | R0 C | R0 (U/C) |")
-            lines.append("| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+            cols += ["G2 (U/C)", "X1 (U/C)"]
+        lines.extend(md_table_head(cols))
 
         for sid in c_sids:
             g0_u = self.get_stat(sid, "G0", locale="en_US.UTF-8")
@@ -613,6 +742,8 @@ class ReportGenerator:
             g1_c = self.get_stat(sid, "G1", locale="C")
             r0_u = self.get_stat(sid, "R0", locale="en_US.UTF-8")
             r0_c = self.get_stat(sid, "R0", locale="C")
+            u0_u = self.get_stat(sid, "U0", locale="en_US.UTF-8")
+            u0_c = self.get_stat(sid, "U0", locale="C")
             g2_u = self.get_stat(sid, "G2", locale="en_US.UTF-8")
             g2_c = self.get_stat(sid, "G2", locale="C")
             x1_u = self.get_stat(sid, "X1", locale="en_US.UTF-8")
@@ -625,26 +756,18 @@ class ReportGenerator:
                     return f"{u['median_ms'] / c['median_ms']:.2f}×"
                 return "—"
 
-            g0_u_ms = format_ms(g0_u["median_ms"]) if g0_u else "—"
-            g0_c_ms = format_ms(g0_c["median_ms"]) if g0_c else "—"
-            g1_u_ms = format_ms(g1_u["median_ms"]) if g1_u else "—"
-            g1_c_ms = format_ms(g1_c["median_ms"]) if g1_c else "—"
-            r0_u_ms = format_ms(r0_u["median_ms"]) if r0_u else "—"
-            r0_c_ms = format_ms(r0_c["median_ms"]) if r0_c else "—"
+            def ms_or_dash(st):
+                return format_ms(st["median_ms"]) if st else "—"
 
+            cells = [f"`{sid}`", desc,
+                     ms_or_dash(g0_u), ms_or_dash(g0_c), f"**{calc_ratio(g0_u, g0_c)}**",
+                     ms_or_dash(g1_u), ms_or_dash(g1_c), f"**{calc_ratio(g1_u, g1_c)}**",
+                     ms_or_dash(r0_u), ms_or_dash(r0_c), f"**{calc_ratio(r0_u, r0_c)}**"]
+            if has_u0:
+                cells += [ms_or_dash(u0_u), ms_or_dash(u0_c), f"**{calc_ratio(u0_u, u0_c)}**"]
             if has_other:
-                lines.append(
-                    f"| `{sid}` | {desc} | {g0_u_ms} | {g0_c_ms} | **{calc_ratio(g0_u, g0_c)}** | "
-                    f"{g1_u_ms} | {g1_c_ms} | **{calc_ratio(g1_u, g1_c)}** | "
-                    f"{r0_u_ms} | {r0_c_ms} | **{calc_ratio(r0_u, r0_c)}** | "
-                    f"{calc_ratio(g2_u, g2_c)} | {calc_ratio(x1_u, x1_c)} |"
-                )
-            else:
-                lines.append(
-                    f"| `{sid}` | {desc} | {g0_u_ms} | {g0_c_ms} | **{calc_ratio(g0_u, g0_c)}** | "
-                    f"{g1_u_ms} | {g1_c_ms} | **{calc_ratio(g1_u, g1_c)}** | "
-                    f"{r0_u_ms} | {r0_c_ms} | **{calc_ratio(r0_u, r0_c)}** |"
-                )
+                cells += [calc_ratio(g2_u, g2_c), calc_ratio(x1_u, x1_c)]
+            lines.append(md_row(cells))
 
         return "\n".join(lines)
 
@@ -664,8 +787,8 @@ class ReportGenerator:
         ]
 
         for sid in cold_sids:
-            corpus_mb = 1390.0 if sid == "B-01" else 1640.6
-            for tool in ("G0", "G1", "R0", "G2", "X1"):
+            corpus_mb = 1453.3 if sid == "B-01" else 1640.6
+            for tool in ("G0", "G1", "R0", "U0", "G2", "X1"):
                 w_st = self.get_stat(sid, tool, locale="en_US.UTF-8", cache_state="warm")
                 c_st = self.get_stat(sid, tool, locale="en_US.UTF-8", cache_state="cold")
                 if not c_st:
@@ -682,10 +805,18 @@ class ReportGenerator:
 
         return "\n".join(lines)
 
-    def generate_matched_threads_table(self, target_threads: int = 32) -> str:
+    def competitor_default_threads(self, tool: str) -> int:
+        """Worker threads TOOL uses by default (measured peak threads minus the main thread)."""
+        measured = self.env_meta.get("empirical_default_threads", {}).get(tool)
+        return measured - 1 if measured and measured > 1 else 12
+
+    def generate_matched_threads_table(self, target_threads: int = 32, competitor: str = "R0") -> str:
+        c = competitor
+        flag = COMPETITOR_THREAD_FLAGS.get(c, "-j")
+        c_def = self.competitor_default_threads(c)
         matched_sids = [
             sid for sid in self.scenarios
-            if self.get_stat(sid, "R0", target_threads) is not None and self.get_stat(sid, "G1") is not None
+            if self.get_stat(sid, c, target_threads) is not None and self.get_stat(sid, "G1") is not None
         ]
         if not matched_sids:
             return ""
@@ -694,20 +825,20 @@ class ReportGenerator:
 
         if has_g1_12:
             lines = [
-                f"### Matched Thread Comparison: G1 ({target_threads}t) vs G1 (12t) vs R0 (Default 12t) vs R0 (-j {target_threads})",
+                f"### Matched Thread Comparison: G1 ({target_threads}t) vs G1 (12t) vs {c} (Default {c_def}t) vs {c} ({flag} {target_threads})",
                 "",
-                f"> Side-by-side comparison of G1 (default {target_threads} threads and matched 12 threads) against both out-of-the-box R0 (default 12 threads) and thread-matched `R0 -j {target_threads}` ({target_threads} threads).",
+                f"> Side-by-side comparison of G1 (default {target_threads} threads and matched 12 threads) against both out-of-the-box {c} (default {c_def} threads) and thread-matched `{c} {flag} {target_threads}` ({target_threads} threads).",
                 "",
-                f"| Scenario | Cat | Description | G0 (1t) | G1 (12t) | R0 (12t) | G1 vs R0 (12t) | G1 ({target_threads}t) | R0 (-j {target_threads}) | G1 vs R0 ({target_threads}t) | G1 ({target_threads}t) vs R0 (12t) |",
+                f"| Scenario | Cat | Description | G0 (1t) | G1 (12t) | {c} ({c_def}t) | G1 vs {c} (12t) | G1 ({target_threads}t) | {c} ({flag} {target_threads}) | G1 vs {c} ({target_threads}t) | G1 ({target_threads}t) vs {c} ({c_def}t) |",
                 "| :--- | :-: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             ]
         else:
             lines = [
-                f"### Matched Thread Comparison: G1 ({target_threads}t) vs R0 (Default 12t) vs R0 (-j {target_threads})",
+                f"### Matched Thread Comparison: G1 ({target_threads}t) vs {c} (Default {c_def}t) vs {c} ({flag} {target_threads})",
                 "",
-                f"> Side-by-side comparison of G1 (default {target_threads} threads) against both out-of-the-box R0 (default 12 threads) and thread-matched `R0 -j {target_threads}` ({target_threads} threads).",
+                f"> Side-by-side comparison of G1 (default {target_threads} threads) against both out-of-the-box {c} (default {c_def} threads) and thread-matched `{c} {flag} {target_threads}` ({target_threads} threads).",
                 "",
-                f"| Scenario | Cat | Description | G0 (1t) | G1 ({target_threads}t) | R0 (12t) | R0 (-j {target_threads}) | G1 vs R0 (12t) | G1 vs R0 ({target_threads}t) | G1 CPU | R0 ({target_threads}t) CPU |",
+                f"| Scenario | Cat | Description | G0 (1t) | G1 ({target_threads}t) | {c} ({c_def}t) | {c} ({flag} {target_threads}) | G1 vs {c} ({c_def}t) | G1 vs {c} ({target_threads}t) | G1 CPU | {c} ({target_threads}t) CPU |",
                 "| :--- | :-: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             ]
 
@@ -715,9 +846,9 @@ class ReportGenerator:
             g0 = self.get_stat(sid, "G0")
             g1 = self.get_stat(sid, "G1")
             g1_12 = self.get_stat(sid, "G1", 12)
-            r0_def = self.get_stat(sid, "R0")
-            r0_32 = self.get_stat(sid, "R0", target_threads)
-            if not g1 or not r0_32:
+            c_def_st = self.get_stat(sid, c)
+            c_32 = self.get_stat(sid, c, target_threads)
+            if not g1 or not c_32:
                 continue
 
             cat = g1.get("category", "")
@@ -725,25 +856,25 @@ class ReportGenerator:
             g0_ms = g0["median_ms"] if g0 else None
             g1_ms = g1["median_ms"]
             g1_12_ms = g1_12["median_ms"] if g1_12 else None
-            r0_def_ms = r0_def["median_ms"] if r0_def else None
-            r0_32_ms = r0_32["median_ms"]
+            c_def_ms = c_def_st["median_ms"] if c_def_st else None
+            c_32_ms = c_32["median_ms"]
 
-            vs_def = (r0_def_ms / g1_ms) if (r0_def_ms and g1_ms > 0) else None
-            vs_32 = (r0_32_ms / g1_ms) if (r0_32_ms and g1_ms > 0) else None
-            vs_12 = (r0_def_ms / g1_12_ms) if (r0_def_ms and g1_12_ms and g1_12_ms > 0) else None
+            vs_def = (c_def_ms / g1_ms) if (c_def_ms and g1_ms > 0) else None
+            vs_32 = (c_32_ms / g1_ms) if (c_32_ms and g1_ms > 0) else None
+            vs_12 = (c_def_ms / g1_12_ms) if (c_def_ms and g1_12_ms and g1_12_ms > 0) else None
 
             if has_g1_12:
                 lines.append(
                     f"| `{sid}` | {cat} | {desc} | {format_ms(g0_ms)} | {format_ms(g1_12_ms)} | "
-                    f"{format_ms(r0_def_ms)} | **{format_ratio(vs_12)}** | {format_ms(g1_ms)} | "
-                    f"{format_ms(r0_32_ms)} | **{format_ratio(vs_32)}** | **{format_ratio(vs_def)}** |"
+                    f"{format_ms(c_def_ms)} | **{format_ratio(vs_12)}** | {format_ms(g1_ms)} | "
+                    f"{format_ms(c_32_ms)} | **{format_ratio(vs_32)}** | **{format_ratio(vs_def)}** |"
                 )
             else:
                 lines.append(
                     f"| `{sid}` | {cat} | {desc} | {format_ms(g0_ms)} | {format_ms(g1_ms)} | "
-                    f"{format_ms(r0_def_ms)} | {format_ms(r0_32_ms)} | "
+                    f"{format_ms(c_def_ms)} | {format_ms(c_32_ms)} | "
                     f"**{format_ratio(vs_def)}** | **{format_ratio(vs_32)}** | "
-                    f"{format_cpu(g1.get('mean_cpu_s'))} | {format_cpu(r0_32.get('mean_cpu_s'))} |"
+                    f"{format_cpu(g1.get('mean_cpu_s'))} | {format_cpu(c_32.get('mean_cpu_s'))} |"
                 )
 
         return "\n".join(lines)
@@ -774,7 +905,7 @@ class ReportGenerator:
             g0 = self.get_stat(sid, "G0")
             g0_ms = g0["median_ms"] if g0 else 1.0
 
-            for tool in ("G1", "R0", "X1"):
+            for tool in ("G1", "R0", "U0", "X1"):
                 t_vals = []
                 best_speedup = 0.0
                 has_any = False
@@ -806,6 +937,91 @@ class ReportGenerator:
                     lines.append(f"| `{sid}` | **{tool}** | " + " | ".join(t_vals) + f" | **{best_speedup:.2f}×** |")
 
         return "\n".join(lines), csv_rows
+
+    def category_of(self, sid: str) -> str:
+        return (self.get_stat(sid, "G1") or self.get_stat(sid, "G0") or {}).get("category", "")
+
+    def ratio(self, sid: str, num: str, den: str,
+              num_threads: Optional[int] = None, den_threads: Optional[int] = None) -> Optional[float]:
+        """Median warm en_US.UTF-8 time of NUM divided by that of DEN.
+
+        A ratio above 1 means DEN is faster.  Returns None when either run is
+        missing or when G1 is involved and failed Gate A.
+        """
+        n = self.get_stat(sid, num, num_threads)
+        d = self.get_stat(sid, den, den_threads)
+        if not n or not d or n["median_ms"] <= 0 or d["median_ms"] <= 0:
+            return None
+        if "G1" in (num, den) and self.check_gate_a(sid)[0] != "PASS":
+            return None
+        return n["median_ms"] / d["median_ms"]
+
+    def competitor_summary(self, tool: str, matched_threads: int = 32) -> Dict[str, Any]:
+        """Geometric-mean speedups and win/tie/loss counts of G1 against TOOL.
+
+        For all scenarios and for each category, report the geometric mean
+        of G1 at its default against G0, TOOL at its default and at
+        MATCHED_THREADS threads against G0, and G1 against both TOOL runs,
+        with win/tie/loss counts for the latter two.  "matched12" compares G1
+        at 12 threads with TOOL at its default (12 threads for rg and ugrep).
+        """
+        def block(sids: List[str]) -> Dict[str, Any]:
+            g1_vs_tool = [self.ratio(s, tool, "G1") for s in sids]
+            g1_vs_tool_m = [self.ratio(s, tool, "G1", num_threads=matched_threads) for s in sids]
+            return {
+                "n": len(sids),
+                "g1_vs_g0": geomean(self.ratio(s, "G0", "G1") for s in sids),
+                "tool_vs_g0": geomean(self.ratio(s, "G0", tool) for s in sids),
+                "tool_m_vs_g0": geomean(self.ratio(s, "G0", tool, den_threads=matched_threads) for s in sids),
+                "g1_vs_tool": geomean(g1_vs_tool),
+                "g1_vs_tool_m": geomean(g1_vs_tool_m),
+                "wtl": count_wtl(g1_vs_tool),
+                "wtl_m": count_wtl(g1_vs_tool_m),
+            }
+
+        sids = [s for s in self.scenarios if self.get_stat(s, tool)]
+        summary: Dict[str, Any] = {"overall": block(sids), "categories": {}}
+        for cat in CATEGORY_ORDER:
+            cat_sids = [s for s in sids if self.category_of(s) == cat]
+            if cat_sids:
+                summary["categories"][cat] = block(cat_sids)
+
+        m12 = [s for s in sids if self.get_stat(s, "G1", 12)]
+        m12_t = [s for s in m12 if self.category_of(s) == "T"]
+        r12 = [self.ratio(s, tool, "G1", den_threads=12) for s in m12]
+        r12_t = [self.ratio(s, tool, "G1", den_threads=12) for s in m12_t]
+        summary["matched12"] = {
+            "n": len(m12), "geo": geomean(r12), "wtl": count_wtl(r12),
+            "T": {"n": len(m12_t), "geo": geomean(r12_t), "wtl": count_wtl(r12_t)},
+        }
+        return summary
+
+    def generate_competitor_summary_table(self, tool: str, matched_threads: int = 32) -> str:
+        """Category geometric means of G1 against TOOL, for summary.md."""
+        s = self.competitor_summary(tool, matched_threads)
+        flag = COMPETITOR_THREAD_FLAGS.get(tool, "-j")
+        c_def = self.competitor_default_threads(tool)
+        lines = md_table_head([
+            "Scenarios", "N", "G1 vs G0", f"{tool} ({c_def}t) vs G0", f"{tool} ({flag} {matched_threads}) vs G0",
+            f"G1 vs {tool} ({c_def}t)", f"G1 vs {tool} ({flag} {matched_threads})",
+            f"W/T/L vs {tool} ({c_def}t)", f"W/T/L vs {tool} ({flag} {matched_threads})",
+        ])
+        rows = [("All", s["overall"])] + [(f"Category {c}", b) for c, b in s["categories"].items()]
+        for label, b in rows:
+            lines.append(md_row([
+                label, str(b["n"]), format_ratio(b["g1_vs_g0"]), format_ratio(b["tool_vs_g0"]),
+                format_ratio(b["tool_m_vs_g0"]), f"**{format_ratio(b['g1_vs_tool'])}**",
+                f"**{format_ratio(b['g1_vs_tool_m'])}**", "/".join(map(str, b["wtl"])), "/".join(map(str, b["wtl_m"])),
+            ]))
+        m = s["matched12"]
+        if m["n"]:
+            lines.extend([
+                "",
+                f"> G1 at 12 threads vs {tool} at its default ({c_def} threads): **{format_ratio(m['geo'])}** geometric mean "
+                f"over {m['n']} scenarios ({format_wtl(m['wtl'])}); Category T: **{format_ratio(m['T']['geo'])}** "
+                f"({format_wtl(m['T']['wtl'])}). Ties are within ±{TIE_TOLERANCE:.0%}.",
+            ])
+        return "\n".join(lines)
 
     def evaluate_hypotheses(self) -> str:
         scorecard = [
@@ -986,6 +1202,7 @@ class ReportGenerator:
         g0_v = extract_version(tools_meta.get("G0", {}).get("version", ""), "3.12.41")
         g1_v = extract_version(tools_meta.get("G1", {}).get("version", ""), "3.12.41")
         r0_v = extract_version(tools_meta.get("R0", {}).get("version", ""), "15.1.0")
+        u0_v = extract_version(tools_meta.get("U0", {}).get("version", ""), "?")
         g2_v = extract_version(tools_meta.get("G2", {}).get("version", ""), "3.12")
         x1_v = extract_version(tools_meta.get("X1", {}).get("version", ""), "2.56.0")
 
@@ -997,20 +1214,22 @@ class ReportGenerator:
         g0_th = emp_th.get("G0", 1)
         g1_th = emp_th.get("G1", 16)
         r0_th = emp_th.get("R0", 12)
+        u0_th = emp_th.get("U0", 12)
         g2_th = emp_th.get("G2", 1)
         x1_th = emp_th.get("X1", 128)
 
+        u0_vs = f" vs `ugrep` {u0_v} (U0)" if self.has_u0 else ""
         content = [
             "# Linux Kernel-Tree 3-Way Benchmark Results",
             "",
-            "> Multi-threaded GNU `grep` fork (G1) vs Stock upstream GNU `grep` (G0) vs `ripgrep` 15.1.0 (R0) vs Distro GNU `grep` 3.12 (G2) vs `git grep` (X1).",
+            f"> Multi-threaded GNU `grep` fork (G1) vs Stock upstream GNU `grep` (G0) vs `ripgrep` 15.1.0 (R0){u0_vs} vs Distro GNU `grep` 3.12 (G2) vs `git grep` (X1).",
             "",
             "## 1. System & Binary Provenance",
             "",
             f"- **Host**: AMD EPYC 7B13 Zen 3 (128 logical cores), 236 GiB RAM",
             f"- **Kernel**: `{k_str}`",
             f"- **THP**: `{self.env_meta.get('thp_enabled', 'always')}`",
-            f"- **Corpus**: Linux kernel clean working tree (96,034 files, 1.64 GB), `linux-all.c` (1.39 GB)",
+            f"- **Corpus**: Linux kernel clean working tree (96,034 files, 1.64 GB), `linux-all.c` (1.45 GB)",
         ]
 
         aff_cpus = self.env_meta.get("affinity_cpus")
@@ -1031,6 +1250,10 @@ class ReportGenerator:
             f"- **G0**: Upstream GNU grep baseline `{g0_v}` ({g0_th} thread)",
             f"- **G1**: Our multi-threaded fork (`{self.env_meta.get('grep_git_sha', 'HEAD')[:7]}`, default {g1_th} threads)",
             f"- **R0**: Stock ripgrep {r0_v} (default {r0_th} threads)",
+        ])
+        if self.has_u0:
+            content.append(f"- **U0**: Stock ugrep {u0_v} (default {u0_th} threads)")
+        content.extend([
             f"- **G2**: Distro GNU grep {g2_v} ({g2_th} thread)",
             f"- **X1**: Git grep {x1_v} (default {x1_th} threads)",
             "",
@@ -1038,10 +1261,20 @@ class ReportGenerator:
             "",
             self.generate_headline_table(),
             "",
+        ])
+        if self.has_u0:
+            content.extend([
+                "### Summary vs ugrep (U0)",
+                "",
+                self.generate_competitor_summary_table("U0"),
+                "",
+            ])
+        gate_b_tools = "R0 / U0 / G2 / X1" if self.has_u0 else "R0 / G2 / X1"
+        content.extend([
             "## 3. Correctness & Equivalence Gates",
             "",
             "- **Gate A (Hard)**: G1 byte-exact match against G0 on stdout, normalized stderr, and exit code.",
-            "- **Gate B (Soft)**: R0 / G2 / X1 equivalence against G0 (sorted match set).",
+            f"- **Gate B (Soft)**: {gate_b_tools} equivalence against G0 (sorted match set).",
             "- **Gate C**: Exit-code consistency.",
             "- **Gate D**: G1 thread invariance (identical output across 1..64 threads).",
             "",
@@ -1084,6 +1317,11 @@ class ReportGenerator:
         if matched_text:
             content.append(matched_text)
             content.append("")
+        if self.has_u0:
+            matched_u0 = self.generate_matched_threads_table(32, "U0")
+            if matched_u0:
+                content.append(matched_u0)
+                content.append("")
 
         content.append("## 8. Hypothesis Scorecard")
         content.append("")
@@ -1142,9 +1380,17 @@ class ReportGenerator:
             "",
             "## 2. Gate B: Cross-Tool Normalized Match Set Equivalence",
             "",
-            "| Scenario | Description | R0 Match vs G0 | G2 Match vs G0 | X1 Match vs G0 | Notes |",
-            "| :--- | :--- | :---: | :---: | :---: | :--- |",
         ])
+        if self.has_u0:
+            lines.extend([
+                "| Scenario | Description | R0 Match vs G0 | U0 Match vs G0 | G2 Match vs G0 | X1 Match vs G0 | Notes |",
+                "| :--- | :--- | :---: | :---: | :---: | :---: | :--- |",
+            ])
+        else:
+            lines.extend([
+                "| Scenario | Description | R0 Match vs G0 | G2 Match vs G0 | X1 Match vs G0 | Notes |",
+                "| :--- | :--- | :---: | :---: | :---: | :--- |",
+            ])
 
         for sid in self.scenarios:
             g0 = self.get_stat(sid, "G0")
@@ -1153,7 +1399,11 @@ class ReportGenerator:
             g2_v, g2_note = self.check_gate_b(sid, "G2")
             x1_v, x1_note = self.check_gate_b(sid, "X1")
 
-            lines.append(f"| `{sid}` | {desc} | {r0_v} | {g2_v} | {x1_v} | {r0_note} |")
+            if self.has_u0:
+                u0_v, u0_note = self.check_gate_b(sid, "U0")
+                lines.append(f"| `{sid}` | {desc} | {r0_v} | {u0_v} | {g2_v} | {x1_v} | R0: {r0_note}; U0: {u0_note} |")
+            else:
+                lines.append(f"| `{sid}` | {desc} | {r0_v} | {g2_v} | {x1_v} | {r0_note} |")
 
         # Section 2.1: Diff Samples & Semantic Classifications
         lines.extend([
@@ -1170,8 +1420,9 @@ class ReportGenerator:
                 diff_sample = scrub_string(d_info.get("diff_sample", "").strip())
                 lines.append(f"#### `{sid}` vs {tool} (`{classification}`)")
                 lines.append("")
-                if sid == "T-09" and tool == "R0":
-                    lines.append("Ripgrep strips the UTF-8 BOM at the start of `Documentation/translations/zh_CN/dev-tools/sparse.rst` (`\\ufeffCopyright 2004 Linus Torvalds`), whereas GNU grep prints the BOM bytes (12,577,386 vs 12,577,383 bytes).")
+                note = GATE_B_NOTES.get((sid, tool))
+                if note:
+                    lines.append(note)
                     lines.append("")
                 if diff_sample:
                     lines.append("```diff")

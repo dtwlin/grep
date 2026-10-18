@@ -20,12 +20,39 @@ Builds exact command invocations for contestants:
   G0: Stock upstream GNU grep
   G1: Multi-threaded GNU grep fork
   R0: Stock ripgrep
+  U0: Stock ugrep
   G2: Distro GNU grep
   X1: git grep
 """
 
 import os
+import re
 from typing import Any, Dict, List, Optional
+
+
+# Short options that ugrep reads differently from GNU grep: -z decompresses,
+# -Z is fuzzy matching, -0 is --null, -y passes all lines through, -u
+# ungroups matches, -U matches bytes, and -X and -W print hex.  GNU grep's
+# -NUM context shorthand is a maximum match count in ugrep.
+UGREP_CONFLICTING_OPTIONS = frozenset(["-z", "-Z", "-0", "-y", "-u", "-U", "-X", "-W"])
+
+
+def ugrep_args_from_grep(grep_args: List[str]) -> List[str]:
+    """Return the ugrep equivalent of the GNU grep arguments GREP_ARGS.
+
+    ugrep accepts the GNU grep options used here with the same meaning,
+    except that a recursive search skips hidden files and directories unless
+    --hidden is given, so --hidden follows -r and -R.  Options that mean
+    something else in ugrep raise ValueError.
+    """
+    out: List[str] = []
+    for arg in grep_args:
+        if arg in UGREP_CONFLICTING_OPTIONS or re.fullmatch(r"-\d+", arg):
+            raise ValueError(f"grep option {arg} means something else in ugrep")
+        out.append(arg)
+        if arg in ("-r", "-R"):
+            out.append("--hidden")
+    return out
 
 
 class Scenario:
@@ -94,6 +121,7 @@ class StandardScenario(Scenario):
         git_args_fn=None,
         stdin_fn=None,
         pipe_fn=None,
+        ug_args_fn=None,
     ):
         super().__init__(
             sid=sid,
@@ -112,6 +140,8 @@ class StandardScenario(Scenario):
         self.git_args_fn = git_args_fn
         self.stdin_fn = stdin_fn
         self.pipe_fn = pipe_fn
+        # ugrep arguments default to the translated grep arguments.
+        self.ug_args_fn = ug_args_fn
 
     def build_cmd(
         self,
@@ -148,6 +178,16 @@ class StandardScenario(Scenario):
             if threads is not None:
                 extra = ["-j", str(threads)]
             argv = [bin_path] + extra + self.rg_args_fn(ctx)
+
+        elif tool == "U0":
+            extra = []
+            if threads is not None:
+                extra = ["-J", str(threads)]
+            if self.ug_args_fn:
+                ug_args = self.ug_args_fn(ctx)
+            else:
+                ug_args = ugrep_args_from_grep(self.grep_args_fn(ctx))
+            argv = [bin_path] + extra + ug_args
 
         elif tool == "X1":
             extra = []
@@ -236,6 +276,11 @@ class XargsScenario(Scenario):
             if threads is not None:
                 extra = ["-j", str(threads)]
             tool_args = extra + self.rg_args_fn(ctx)
+        elif tool == "U0":
+            extra = []
+            if threads is not None:
+                extra = ["-J", str(threads)]
+            tool_args = extra + ugrep_args_from_grep(self.grep_args_fn(ctx))
         elif tool == "X1":
             extra = []
             if threads is not None:
@@ -1062,6 +1107,8 @@ def make_scenarios() -> Dict[str, Scenario]:
             grep_args_fn=lambda c: ["-r", "--exclude-dir=.git", "--color=never", "-n", "-F", "spin_lock_irqsave", c["K"]],
             rg_args_fn=lambda c: ["--color=never", "--no-heading", "-n", "-F", "spin_lock_irqsave", c["K"]],
             git_args_fn=lambda c: [],
+            # ugrep's defaults skip hidden files and directories, .git included.
+            ug_args_fn=lambda c: ["-r", "--color=never", "-n", "-F", "spin_lock_irqsave", c["K"]],
         )
     )
 
@@ -1078,6 +1125,8 @@ def make_scenarios() -> Dict[str, Scenario]:
             grep_args_fn=lambda c: ["-r", "--color=never", "-n", "-F", "spin_lock_irqsave", c["K"]],
             rg_args_fn=lambda c: ["--color=never", "--no-heading", "-n", "-F", "spin_lock_irqsave", c["K"]],
             git_args_fn=lambda c: [],
+            # Without --hidden, ugrep skips .git, like rg.
+            ug_args_fn=lambda c: ["-r", "--color=never", "-n", "-F", "spin_lock_irqsave", c["K"]],
         )
     )
 
@@ -1093,6 +1142,8 @@ def make_scenarios() -> Dict[str, Scenario]:
             grep_args_fn=lambda c: ["-r", "--exclude-dir=.git", "--color=never", "-E", r"\b([a-z]{4,})_\1\b", c["K"]],
             rg_args_fn=lambda c: ["-uu", "-g", "!.git", "--color=never", "--no-heading", "-P", r"\b([a-z]{4,})_\1\b", c["K"]],
             git_args_fn=lambda c: ["-P", r"\b([a-z]{4,})_\1\b"],
+            # ugrep's default regex engine has no backreferences.
+            ug_args_fn=lambda c: ["-r", "--hidden", "--exclude-dir=.git", "--color=never", "-P", r"\b([a-z]{4,})_\1\b", c["K"]],
         )
     )
 
