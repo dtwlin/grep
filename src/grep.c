@@ -600,6 +600,14 @@ membuf_free (struct membuf *mb)
 }
 
 static void
+record_stdout_errno (int err)
+{
+  if (err == EPIPE)
+    raise (SIGPIPE);
+  stdout_errno = err;
+}
+
+static void
 putchar_errno (int c)
 {
   if (buffering_enabled)
@@ -609,7 +617,7 @@ putchar_errno (int c)
       return;
     }
   if (putchar (c) < 0)
-    stdout_errno = errno;
+    record_stdout_errno (errno);
 }
 
 /* Record a buffered write of LEN bytes that is about to be appended to
@@ -635,7 +643,7 @@ fputs_errno (char const *s)
       return;
     }
   if (fputs (s, stdout) < 0)
-    stdout_errno = errno;
+    record_stdout_errno (errno);
 }
 
 static void _GL_ATTRIBUTE_FORMAT_PRINTF_STANDARD (1, 2)
@@ -665,7 +673,7 @@ printf_errno (char const *format, ...)
   else
     {
       if (vfprintf (stdout, format, ap) < 0)
-        stdout_errno = errno;
+        record_stdout_errno (errno);
     }
   va_end (ap);
 }
@@ -684,7 +692,7 @@ fwrite_errno (void const *ptr, idx_t size, idx_t nmemb)
       return;
     }
   if (fwrite (ptr, size, nmemb, stdout) != nmemb)
-    stdout_errno = errno;
+    record_stdout_errno (errno);
 }
 
 static void
@@ -693,7 +701,7 @@ fflush_errno (void)
   if (buffering_enabled)
     return;
   if (fflush (stdout) != 0)
-    stdout_errno = errno;
+    record_stdout_errno (errno);
 }
 
 /* Return the result of formatting FMT and AP as a string.  If it fits
@@ -1025,12 +1033,18 @@ static void
 clean_up_stdout (void)
 {
   if (! stdout_errno && ! atomic_load (&skip_clean_up_stdout))
-    close_stdout ();
+    {
+      if (fflush (stdout) != 0 && errno == EPIPE)
+        raise (SIGPIPE);
+      close_stdout ();
+    }
 }
 
 static _Noreturn void
 die_write_error (void)
 {
+  if (stdout_errno == EPIPE)
+    raise (SIGPIPE);
   atomic_store (&skip_clean_up_stdout, true);
   if (atomic_exchange (&write_error_dying, true))
     for (;;)
@@ -3809,11 +3823,11 @@ commit_stdout (char const *out, size_t from, size_t to,
 {
   if (!exact_stdout)
     {
-      if (from < to)
+      if (from < to && !stdout_errno)
         fwrite_errno (out + from, 1, to - from);
       return;
     }
-  while (from < to)
+  while (from < to && !stdout_errno)
     {
       if (*bigi < nbig && big[2 * *bigi] == from)
         {
@@ -3854,7 +3868,7 @@ commit_output (char const *out, size_t outlen, char const *err,
         }
       commit_stdout (out, pos, h.outpos, big, nbig, &bigi);
       pos = h.outpos;
-      fflush (stdout);
+      fflush_errno ();
       fwrite (text, 1, h.len, stderr);
       p = text + h.len;
     }
