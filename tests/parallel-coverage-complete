@@ -471,10 +471,11 @@ for i in $(seq 1 20); do
   printf 'DEEP_MATCH_TOK w%d\n' "$i" > "deep_root/wide_$i/sub/f.txt" || framework_failure_
 done
 check_threads deep_walk grep -r DEEP_MATCH_TOK deep_root
-if test -z "$ASAN_OPTIONS" && (ulimit -n 28) 2>/dev/null; then
+if test -z "$ASAN_OPTIONS" && test -z "$TSAN_OPTIONS" \
+   && (ulimit -n 28) 2>/dev/null; then
   (
     { set +x; } 2>/dev/null
-    for fd in $(seq 3 63); do eval "exec $fd>&-"; done 2>/dev/null
+    exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- 2>/dev/null
     ulimit -n 28 && GREP_THREADS=2 grep -r DEEP_MATCH_TOK deep_root > out_fd_press
   ) || fail=1
   compare exp_deep_walk out_fd_press || fail=1

@@ -59,9 +59,11 @@ if mkfifo fifo 2>/dev/null; then
               "GREP_THREADS=8 LD_PRELOAD=$PWD/chaos-shim.so CHAOS_SHORT_READ=0.5 CHAOS_EINTR=0.2" \
               "GREP_THREADS=3 LD_PRELOAD=$PWD/chaos-shim.so CHAOS_SHORT_READ=0.9"; do
     cat stdin.txt > fifo &
-    env $env_ timeout 30 grep -c MATCH_ALPHA ops/o01 fifo ops/o02 > fifo_got 2>&1
+    wpid=$!
+    $pl_timeout env $env_ grep -c MATCH_ALPHA ops/o01 fifo ops/o02 > fifo_got 2>&1
     echo "rc=$?" >> fifo_got
-    wait
+    kill $wpid 2>/dev/null
+    wait $wpid 2>/dev/null
     if test "$env_" = GREP_THREADS=1; then
       mv fifo_got fifo_exp
     else

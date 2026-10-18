@@ -70,17 +70,32 @@ pl_have_bin ()
 }
 
 # Build chaos-shim.so and check that grep still works under it.  This
-# fails under sanitizers that insist on preloading their own runtime.
+# fails under sanitizers that insist on preloading their own runtime,
+# and on platforms such as macOS where LD_PRELOAD is ignored.
 pl_build_shim ()
 {
   ${CC:-cc} -shared -fPIC -O2 -o chaos-shim.so "$abs_srcdir/chaos-shim.c" \
     -ldl -lpthread 2>/dev/null || return 1
+  rm -f chaos-probe
   out=$(echo pl_probe \
-        | env LD_PRELOAD="$PWD/chaos-shim.so" CHAOS_YIELD=1 \
+        | env LD_PRELOAD="$PWD/chaos-shim.so" \
+              CHAOS_PROBE_FILE="$PWD/chaos-probe" CHAOS_YIELD=1 \
               CHAOS_SHORT_READ=1 CHAOS_SHORT_READ_REG=1 GREP_THREADS=2 \
               pl_bin/rel/grep pl_probe 2>&1)
-  test "$out" = pl_probe || return 1
+  test "$out" = pl_probe && test -f chaos-probe || {
+    rm -f chaos-probe
+    return 1
+  }
+  rm -f chaos-probe
   pl_have_shim=yes
+}
+
+# Run a command with SIGPIPE, SIGHUP and SIGTERM restored to SIG_DFL,
+# in case the parent environment inherited SIG_IGN (as CI runners do).
+pl_with_sig_dfl ()
+{
+  $PERL -e '$SIG{PIPE} = "DEFAULT"; $SIG{HUP} = "DEFAULT";
+            $SIG{TERM} = "DEFAULT"; exec @ARGV or die $!' -- "$@"
 }
 
 # Write the corpus used by the standard cases.
@@ -157,7 +172,7 @@ pl_exec ()
     -) $pl_timeout env $pe_env PATH="$pe_path" grep "$@" \
          < /dev/null > "$pe_out.out" 2> "$pe_out.err"
        echo $? > "$pe_out.rc";;
-    \|*) cat "${pe_in#|}" \
+    \|*) pl_with_sig_dfl cat "${pe_in#|}" 2>/dev/null \
          | $pl_timeout env $pe_env PATH="$pe_path" grep "$@" \
              > "$pe_out.out" 2> "$pe_out.err"
        echo $? > "$pe_out.rc";;
@@ -290,7 +305,7 @@ pl_taskset_exec ()
     case $pt_in in
       -) $pl_timeout taskset -c 0,1 env $pt_env PATH="$pt_path" grep "$@" \
            < /dev/null > "$pt_out.out" 2> "$pt_out.err";;
-      \|*) cat "${pt_in#|}" \
+      \|*) pl_with_sig_dfl cat "${pt_in#|}" 2>/dev/null \
            | $pl_timeout taskset -c 0,1 env $pt_env PATH="$pt_path" grep "$@" \
                > "$pt_out.out" 2> "$pt_out.err";;
       *) $pl_timeout taskset -c 0,1 env $pt_env PATH="$pt_path" grep "$@" \

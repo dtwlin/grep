@@ -35,6 +35,7 @@
 #define _GNU_SOURCE 1
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
@@ -99,14 +100,27 @@ chaos_init (void)
       if (*end == ':')
         sleep_usec = strtoul (end + 1, NULL, 10);
     }
+  char const *pr = getenv ("CHAOS_PROBE_FILE");
+  if (pr && *pr)
+    {
+      int fd = open (pr, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+      if (0 <= fd)
+        close (fd);
+    }
 }
 
 static uint64_t
 chaos_rand (void)
 {
   if (!rng)
-    rng = (seed * 0x9E3779B97F4A7C15ull) ^ ((uint64_t) syscall (SYS_gettid)
-                                           * 0xBF58476D1CE4E5B9ull) ^ 1;
+    {
+#ifdef SYS_gettid
+      uint64_t tid = (uint64_t) syscall (SYS_gettid);
+#else
+      uint64_t tid = (uint64_t) (uintptr_t) pthread_self ();
+#endif
+      rng = (seed * 0x9E3779B97F4A7C15ull) ^ (tid * 0xBF58476D1CE4E5B9ull) ^ 1;
+    }
   rng ^= rng << 13;
   rng ^= rng >> 7;
   rng ^= rng << 17;

@@ -47,7 +47,7 @@ compare exp_all out_large || fail=1
 # Subshell with ulimit -n 48 should complete without 'Too many open files'
 (
   { set +x; } 2>/dev/null
-  for fd in $(seq 3 63); do eval "exec $fd>&-"; done 2>/dev/null
+  exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- 2>/dev/null
   ulimit -n 48 2>/dev/null || exit 0
   grep -r 'DATA_TARGET' env_tree > out_nofile || exit 1
   compare exp_all out_nofile || exit 1
