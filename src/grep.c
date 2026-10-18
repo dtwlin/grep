@@ -26,6 +26,7 @@
 #include <stdckdint.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <signal.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <sched.h>
@@ -1034,8 +1035,14 @@ clean_up_stdout (void)
 {
   if (! stdout_errno && ! atomic_load (&skip_clean_up_stdout))
     {
-      if (fflush (stdout) != 0 && errno == EPIPE)
-        raise (SIGPIPE);
+      if (fflush (stdout) != 0)
+        {
+          int err = errno;
+          if (err == EPIPE)
+            raise (SIGPIPE);
+          error (0, err, _("write error"));
+          _exit (EXIT_TROUBLE);
+        }
       close_stdout ();
     }
 }
