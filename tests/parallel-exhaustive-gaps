@@ -1,0 +1,15 @@
+#! /bin/sh
+# Copyright (C) 2026 David Lin <dtwlin@gmail.com>
+#
+# Copying and distribution of this file, with or without modification,
+# are permitted in any medium without royalty provided the copyright
+# notice and this notice are preserved.
+
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+
+command -v python3 >/dev/null 2>&1 || skip_ "python3 is not available"
+
+python3 "$abs_top_srcdir/benchmarks/exhaustive_gap_fuzzer.py" \
+  --repo-root "$abs_top_builddir" || Exit 1
+
+Exit 0

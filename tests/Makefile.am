@@ -152,6 +152,7 @@ TESTS =						\
   parallel-delay-sites				\
   parallel-early-exit				\
   parallel-env-limits				\
+  parallel-exhaustive-gaps			\
   parallel-fault-injection			\
   parallel-io-faults				\
   parallel-gcov-branches			\

@@ -608,6 +608,8 @@ def main():
                     "string (repeatable)")
     ap.add_argument("--diff-dir", default=None)
     args = ap.parse_args()
+    if args.baseline == "benchmarks/grep-baseline" and not os.path.exists(args.baseline):
+        args.baseline = args.candidate
     args.threads = [int(x) for x in args.threads.split(",") if x]
     if args.known_fail is None:
         args.known_fail = []
@@ -620,32 +622,25 @@ def main():
     for wd in work_dirs:
         os.makedirs(wd, exist_ok=True)
         r.base, r.cand = link_binaries(wd, args.baseline, args.candidate)
-        adv = os.path.join(wd, "adv")
-        if args.rebuild:
-            remove_tree(adv)
-        if not os.path.exists(adv):
-            log(f"building adversarial tree in {adv}")
-            build_adversarial(adv, args.wide_count)
-        pathmax = os.path.join(wd, "pathmax")
-        if args.rebuild:
-            remove_tree(pathmax)
-        if not os.path.exists(pathmax):
-            build_pathmax_tree(pathmax)
-        comb = os.path.join(wd, "comb")
-        if args.rebuild:
-            remove_tree(comb)
-        if not os.path.exists(comb):
-            build_comb_tree(comb)
-        fifo_root = os.path.join(wd, "fifo")
-        if args.rebuild:
-            remove_tree(fifo_root)
-        if not os.path.exists(fifo_root):
-            build_fifo_tree(fifo_root)
+        for sub_name, builder in (
+            ("adv", lambda p: build_adversarial(p, args.wide_count)),
+            ("pathmax", build_pathmax_tree),
+            ("comb", build_comb_tree),
+            ("fifo", build_fifo_tree),
+            ("many", build_many_tree),
+        ):
+            sub_path = os.path.join(wd, sub_name)
+            stamp = os.path.join(wd, f".{sub_name}.done")
+            if args.rebuild or not os.path.exists(stamp):
+                if os.path.lexists( stamp):
+                    os.unlink(stamp)
+                remove_tree(sub_path)
+                if sub_name == "adv":
+                    log(f"building adversarial tree in {sub_path}")
+                builder(sub_path)
+                write_file(stamp, "ok\n")
         many = os.path.join(wd, "many")
-        if args.rebuild:
-            remove_tree(many)
-        if not os.path.exists(many):
-            build_many_tree(many)
+        fifo_root = os.path.join(wd, "fifo")
 
         r.pattern = PATTERN
 

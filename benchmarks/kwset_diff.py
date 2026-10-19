@@ -352,8 +352,8 @@ def check_case(case, baseline, candidate, threads):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--baseline', required=True)
-    ap.add_argument('--candidate', required=True)
+    ap.add_argument('--baseline', default='benchmarks/grep-baseline')
+    ap.add_argument('--candidate', default='src/grep')
     ap.add_argument('--corpus', help='directory tree to take real text from')
     ap.add_argument('--cases', type=int, default=2000)
     ap.add_argument('--seed', type=int, default=1)
@@ -367,6 +367,8 @@ def main():
                     help='another build to rerun failing cases with; failures '
                     'that it shares are reported as pre-existing')
     opts = ap.parse_args()
+    if opts.baseline == 'benchmarks/grep-baseline' and not os.path.exists(opts.baseline):
+        opts.baseline = opts.candidate
 
     baseline = os.path.abspath(opts.baseline)
     candidate = os.path.abspath(opts.candidate)

@@ -221,8 +221,6 @@ skip_quantifiers (char const *p, char const *lim, reg_syntax_t syntax_bits)
   return p;
 }
 
-/* Advance S past a bracket expression '[...]' bounded by LIM.
-   If CLOSED is non-null, set *CLOSED to true iff a closing ']' was found.  */
 /* Advance S past a bracket expression '[...]' bounded by LIM.  Since
    dfaparse and re_compile_pattern have already validated the pattern
    syntax, the bracket expression is guaranteed to be closed before LIM.  */
@@ -247,15 +245,18 @@ skip_bracket_expr (char const *s, char const *lim, reg_syntax_t syntax_bits)
           && (s[1] == ':' || s[1] == '.' || s[1] == '='))
         {
           char ctype = s[1];
-          s += 2;
-          while (s + 1 < lim && !(s[0] == ctype && s[1] == ']'))
-            s++;
-          s += 2;
-          continue;
+          char const *q = s + 2;
+          while (q + 1 < lim && *q != ']' && !(q[0] == ctype && q[1] == ']'))
+            q++;
+          if (q + 1 < lim && q[0] == ctype && q[1] == ']')
+            {
+              s = q + 2;
+              continue;
+            }
         }
       s++;
     }
-  return s + 1;
+  return s < lim ? s + 1 : lim;
 }
 
 struct branch_slice
@@ -295,6 +296,9 @@ split_top_level_branches (char const *raw_pat, idx_t raw_size,
           p = skip_bracket_expr (p, lim, syntax_bits);
           continue;
         }
+
+      if (*p == '\n' && paren_depth != 0)
+        goto fail;
 
       /* Top-level branch separators.  */
       if (paren_depth == 0)
@@ -336,7 +340,8 @@ split_top_level_branches (char const *raw_pat, idx_t raw_size,
             }
           if (*p == ')')
             {
-              paren_depth--;
+              if (paren_depth > 0)
+                paren_depth--;
               p++;
               continue;
             }
@@ -356,6 +361,8 @@ split_top_level_branches (char const *raw_pat, idx_t raw_size,
             }
           if (*p == '\\' && p + 1 < lim && p[1] == ')')
             {
+              if (paren_depth == 0)
+                goto fail;
               paren_depth--;
               p += 2;
               continue;
@@ -370,7 +377,7 @@ split_top_level_branches (char const *raw_pat, idx_t raw_size,
       p++;
     }
 
-  if (b_start >= lim || nbranches < 1)
+  if (paren_depth != 0 || b_start >= lim || nbranches < 1)
     goto fail;
 
   if (nbranches == branch_cap)
@@ -444,10 +451,9 @@ extract_branch_best_literal (struct branch_slice slice,
               bp++;
               continue;
             }
-          if (*bp == ')')
+          if (*bp == ')' && b_paren > 0)
             {
-              if (b_paren > 0)
-                b_paren--;
+              b_paren--;
               bp++;
               if (b_paren == 0)
                 bp = skip_quantifiers (bp, blim, syntax_bits);
@@ -512,7 +518,15 @@ extract_branch_best_literal (struct branch_slice slice,
               if (is_quantifier (bp, blim, syntax_bits))
                 bp = skip_quantifiers (bp, blim, syntax_bits);
               else
-                bp = skip_quantifiers (bp + 2, blim, syntax_bits);
+                {
+                  idx_t esc_len = bp + 1 < blim ? 2 : 1;
+                  if (esc_len == 2 && localeinfo.using_utf8
+                      && (unsigned char) bp[1] >= 0x80)
+                    while (bp + esc_len < blim
+                           && ((unsigned char) bp[esc_len] & 0xC0) == 0x80)
+                      esc_len++;
+                  bp = skip_quantifiers (bp + esc_len, blim, syntax_bits);
+                }
             }
           continue;
         }
@@ -662,7 +676,14 @@ extract_secondary_must (struct dfa_comp *dc, char const *raw_pat,
             }
           cur_len = 0;
           if (*bp == '\\' && bp + 1 < lim)
-            bp = skip_quantifiers (bp + 2, lim, syntax_bits);
+            {
+              idx_t esc_len = 2;
+              if (localeinfo.using_utf8 && (unsigned char) bp[1] >= 0x80)
+                while (bp + esc_len < lim
+                       && ((unsigned char) bp[esc_len] & 0xC0) == 0x80)
+                  esc_len++;
+              bp = skip_quantifiers (bp + esc_len, lim, syntax_bits);
+            }
           else
             bp = skip_quantifiers (bp + clen, lim, syntax_bits);
           continue;
@@ -885,8 +906,9 @@ is_backref_quantifier_start (char const *s, char const *lim, bool no_bk_parens)
    chained quantifier is encountered.  */
 static bool
 parse_group_quantifier (char const **sp, char const *g1_end,
-                        bool no_bk_parens, idx_t *qmin_out)
+                        reg_syntax_t syntax_bits, idx_t *qmin_out)
 {
+  bool no_bk_parens = (syntax_bits & RE_NO_BK_PARENS) != 0;
   char const *s = *sp;
   idx_t qmin = 1;
   bool had_quant = false;
@@ -915,12 +937,12 @@ parse_group_quantifier (char const **sp, char const *g1_end,
       else if ((no_bk_parens && *s == '{')
                || (!no_bk_parens && *s == '\\' && s + 1 < g1_end && s[1] == '{'))
         {
+          if (!is_dfa_brace_quantifier (s, g1_end, syntax_bits))
+            return false;
           s += no_bk_parens ? 1 : 2;
           qmin = 0;
-          bool has_content = false;
           while (s < g1_end && *s >= '0' && *s <= '9')
             {
-              has_content = true;
               if (qmin > 255)
                 return false;
               qmin = qmin * 10 + (*s - '0');
@@ -928,13 +950,10 @@ parse_group_quantifier (char const **sp, char const *g1_end,
             }
           if (s < g1_end && *s == ',')
             {
-              has_content = true;
               s++;
               while (s < g1_end && *s >= '0' && *s <= '9')
                 s++;
             }
-          if (!has_content || (no_bk_parens && (s >= g1_end || *s != '}')))
-            return false;
           s += no_bk_parens ? 1 : 2;
           had_quant = true;
         }
@@ -1017,7 +1036,7 @@ analyze_backref_filter (char const *p, idx_t len, reg_syntax_t syntax_bits,
         }
 
       idx_t qmin = 1;
-      if (!parse_group_quantifier (&s, g1_end, no_bk_parens, &qmin))
+      if (!parse_group_quantifier (&s, g1_end, syntax_bits, &qmin))
         return;
       min_len += atom_base * qmin;
     }

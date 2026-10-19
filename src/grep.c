@@ -660,12 +660,14 @@ printf_errno (char const *format, ...)
       int n = vsnprintf (buf, sizeof buf, format, ap);
       if (n >= 0 && (size_t) n < sizeof buf)
         {
+          note_big_write ((size_t) n);
           membuf_append (&tls_out, buf, n);
         }
       else if (n >= 0)
         {
           char *dyn = xmalloc (n + 1);
           vsnprintf (dyn, n + 1, format, ap2);
+          note_big_write ((size_t) n);
           membuf_append (&tls_out, dyn, n);
           free (dyn);
         }
@@ -3859,7 +3861,8 @@ commit_stdout (char const *out, size_t from, size_t to,
    first.  Buffering must be disabled.  */
 static void
 commit_output (char const *out, size_t outlen, char const *err,
-               size_t errlen, size_t const *big, size_t nbig, bool sep)
+               size_t errlen, size_t const *big, size_t nbig, bool sep,
+               bool had_prline)
 {
   size_t pos = 0, bigi = 0;
   char const *lim = err + errlen;
@@ -3868,6 +3871,7 @@ commit_output (char const *out, size_t outlen, char const *err,
       struct errrec h;
       memcpy (&h, p, sizeof h);
       char const *text = p + sizeof h;
+      bool wrote_stdout = (sep && h.after_sep) || (h.outpos > pos);
       if (sep && h.after_sep)
         {
           print_group_separator ();
@@ -3875,13 +3879,18 @@ commit_output (char const *out, size_t outlen, char const *err,
         }
       commit_stdout (out, pos, h.outpos, big, nbig, &bigi);
       pos = h.outpos;
-      fflush_errno ();
+      if (wrote_stdout && stdout_errno && had_prline)
+        die_write_error ();
+      fflush (stdout);
       fwrite (text, 1, h.len, stderr);
       p = text + h.len;
     }
+  bool tail_stdout = sep || (outlen > pos);
   if (sep)
     print_group_separator ();
   commit_stdout (out, pos, outlen, big, nbig, &bigi);
+  if (tail_stdout && stdout_errno && had_prline)
+    die_write_error ();
 }
 
 /* Reset the per-file state of the current thread before searching a
@@ -4050,6 +4059,7 @@ init_stream_slice_tls (char *beg, char *lim, off_t slice_totalcc,
   encoding_error_output = false;
   file_used = false;
   task_had_prtext = false;
+  task_had_prline = false;
   task_sep = false;
   offset_width = compute_offset_width (nullptr);
 }
@@ -4074,6 +4084,9 @@ stream_commit_binary (struct rob_slot *slot)
   slot->big = nullptr;
   slot->nbig = 0;
   slot->enc_error = false;
+  slot->had_prline = false;
+  slot->had_prtext = false;
+  slot->sep = false;
 
   if (!slot->stream_chunk_data)
     {
@@ -4121,6 +4134,8 @@ stream_commit_binary (struct rob_slot *slot)
   slot->chunk_count = count_matches ? n + nb : 0;
   slot->status = n + nb == 0;
   slot->chunk_nls = count_newlines (beg, lim);
+  slot->had_prline = task_had_prline;
+  slot->had_prtext = task_had_prtext;
 
   restore_search_tls (&saved);
 
@@ -4157,6 +4172,7 @@ stream_commit_slice_locked (struct rob_slot *slot)
       slot->status = (mcnt == 0);
       if (mcnt > 0)
         slot->had_prtext = true;
+      slot->had_prline = task_had_prline;
       slot->enc_error |= had_enc_err;
 
       restore_search_tls (&saved);
@@ -4273,7 +4289,7 @@ rob_try_commit_locked (void)
 
       commit_output (slot->stdout_buf ? slot->stdout_buf : slot->inline_out,
                      slot->stdout_len, slot->stderr_buf, slot->stderr_len,
-                     slot->big, slot->nbig, want_sep);
+                     slot->big, slot->nbig, want_sep, slot->had_prline);
 
       /* Like single-threaded grep, report omitted lines once, after all
          the output of the file.  */
@@ -4320,11 +4336,14 @@ rob_try_commit_locked (void)
     }
 }
 
+static void drain_queue_if_no_workers_locked (void);
+
 static uint64_t
 producer_alloc_slot_locked (void)
 {
   while (next_seq - commit_seq >= ROB_CAP && !pool_terminate)
     {
+      drain_queue_if_no_workers_locked ();
       rob_try_commit_locked ();
       if (next_seq - commit_seq < ROB_CAP)
         break;
@@ -4472,6 +4491,7 @@ work_queue_wait_space_locked (size_t needed)
 {
   while (q_count + needed > WORK_QUEUE_CAP && !pool_terminate)
     {
+      drain_queue_if_no_workers_locked ();
       rob_try_commit_locked ();
       if (q_count + needed <= WORK_QUEUE_CAP)
         break;
@@ -4495,6 +4515,7 @@ rob_wait_all_committed_locked (void)
 {
   while (commit_seq < next_seq)
     {
+      drain_queue_if_no_workers_locked ();
       rob_try_commit_locked ();
       if (commit_seq >= next_seq)
         break;
@@ -4520,6 +4541,7 @@ worker_run_mmap_scan (struct work_task const *task)
   size_t idx = task->chunk_idx;
   char const *cbeg = task->chunk_data;
   char const *clim = task->chunk_data + task->chunk_len;
+  filename = task->filename;
 
   if (cbeg == clim)
     {
@@ -4604,6 +4626,7 @@ worker_run_mmap_scan (struct work_task const *task)
         }
     }
 
+  filename = nullptr;
   /* Count the chunk under DONE_MUTEX and do not touch STATE
      afterwards: once the last chunk is counted, the producer
      may go on to free STATE.  */
@@ -4855,6 +4878,84 @@ rob_complete_worker_slot_locked (struct work_task const *task, bool status,
   rob_try_commit_locked ();
 }
 
+static void
+worker_execute_task (struct work_task const *task)
+{
+  if (task->type == TASK_TYPE_WALK)
+    {
+      walk_participate (task->seq);
+      pthread_mutex_lock (&pool_mutex);
+      return;
+    }
+
+  if (task->type == TASK_TYPE_MMAP_SCAN)
+    {
+      worker_run_mmap_scan (task);
+      pthread_mutex_lock (&pool_mutex);
+      return;
+    }
+
+  task_reset ();
+
+  bool status = true;
+  intmax_t chunk_matched_cnt = 0;
+  bool enc_error = false;
+
+  if (task->type == TASK_TYPE_FILE)
+    {
+      filename = task->filename;
+      status = grepfile (AT_FDCWD, task->filename, task->follow,
+                         task->command_line);
+      free (task->filename);
+      filename = nullptr;
+    }
+  else if (task->type == TASK_TYPE_STREAM_CHUNK)
+    {
+      if (worker_run_stream_chunk (task, &status, &chunk_matched_cnt,
+                                   &enc_error))
+        return;
+    }
+  else if (task->type == TASK_TYPE_CHUNK)
+    {
+      worker_run_file_chunk (task, &status, &chunk_matched_cnt,
+                             &enc_error);
+    }
+
+  char *copy_out = nullptr;
+  if (tls_out.len > sizeof rob[0].inline_out && tls_out.len <= 32768)
+    {
+      copy_out = ximalloc (tls_out.len);
+      memcpy (copy_out, tls_out.data, tls_out.len);
+    }
+
+  GREP_TEST_DELAY ("worker_complete");
+  pthread_mutex_lock (&pool_mutex);
+  rob_complete_worker_slot_locked (task, status, chunk_matched_cnt,
+                                   enc_error, copy_out);
+}
+
+static void
+drain_queue_if_no_workers_locked (void)
+{
+  while (pool_nthreads == 0 && q_count > 0 && !pool_terminate)
+    {
+      struct work_task task = work_queue[q_head];
+      q_head = (q_head + 1) % WORK_QUEUE_CAP;
+      q_count--;
+      pthread_mutex_unlock (&pool_mutex);
+
+      struct search_tls_state saved;
+      save_search_tls (&saved);
+      tls_out = tls_err = tls_big = (struct membuf) { .data = nullptr };
+      buffering_enabled = true;
+      worker_execute_task (&task);
+      membuf_free (&tls_out);
+      membuf_free (&tls_err);
+      membuf_free (&tls_big);
+      restore_search_tls (&saved);
+    }
+}
+
 static void *
 worker_thread_func (void *arg)
 {
@@ -4885,57 +4986,7 @@ worker_thread_func (void *arg)
       pthread_mutex_unlock (&pool_mutex);
       GREP_TEST_DELAY ("worker_dequeued");
 
-      if (task.type == TASK_TYPE_WALK)
-        {
-          walk_participate (task.seq);
-          pthread_mutex_lock (&pool_mutex);
-          continue;
-        }
-
-      if (task.type == TASK_TYPE_MMAP_SCAN)
-        {
-          worker_run_mmap_scan (&task);
-          pthread_mutex_lock (&pool_mutex);
-          continue;
-        }
-
-      task_reset ();
-
-      bool status = true;
-      intmax_t chunk_matched_cnt = 0;
-      bool enc_error = false;
-
-      if (task.type == TASK_TYPE_FILE)
-        {
-          filename = task.filename;
-          status = grepfile (AT_FDCWD, task.filename, task.follow,
-                             task.command_line);
-          free (task.filename);
-          filename = nullptr;
-        }
-      else if (task.type == TASK_TYPE_STREAM_CHUNK)
-        {
-          if (worker_run_stream_chunk (&task, &status, &chunk_matched_cnt,
-                                       &enc_error))
-            continue;
-        }
-      else if (task.type == TASK_TYPE_CHUNK)
-        {
-          worker_run_file_chunk (&task, &status, &chunk_matched_cnt,
-                                 &enc_error);
-        }
-
-      char *copy_out = nullptr;
-      if (tls_out.len > sizeof rob[0].inline_out && tls_out.len <= 32768)
-        {
-          copy_out = ximalloc (tls_out.len);
-          memcpy (copy_out, tls_out.data, tls_out.len);
-        }
-
-      GREP_TEST_DELAY ("worker_complete");
-      pthread_mutex_lock (&pool_mutex);
-      rob_complete_worker_slot_locked (&task, status, chunk_matched_cnt,
-                                       enc_error, copy_out);
+      worker_execute_task (&task);
     }
 
   membuf_free (&tls_out);
@@ -4979,11 +5030,21 @@ producer_flush_batch (void)
 
   for (size_t i = 0; i < producer_batch_count; ++i)
     {
-      uint64_t seq = 0;
-      if (!pool_terminate)
-        seq = producer_alloc_slot_locked ();
+      if (pool_terminate)
+        {
+          for (size_t j = i; j < producer_batch_count; ++j)
+            free (producer_batch[j].filename);
+          producer_batch_count = 0;
+          pthread_mutex_unlock (&pool_mutex);
+          return;
+        }
+      uint64_t seq = producer_alloc_slot_locked ();
       if (!work_queue_wait_space_locked (1))
         {
+          struct rob_slot *slot = &rob[seq % ROB_CAP];
+          slot->status = true;
+          slot->state = ROB_SLOT_DONE;
+          rob_try_commit_locked ();
           for (size_t j = i; j < producer_batch_count; ++j)
             free (producer_batch[j].filename);
           producer_batch_count = 0;
@@ -5495,6 +5556,16 @@ enqueue_single_pass_chunks (struct chunk_file_state *state,
 
       if (!work_queue_wait_space_locked (1))
         {
+          slot->status = true;
+          slot->is_last_chunk = true;
+          slot->cleanup_fn = cleanup_chunk_file_state;
+          slot->cleanup_arg = state;
+          if (!slot->filename)
+            slot->filename = xstrdup (fname);
+          state->num_chunks = k + 1;
+          slot->state = ROB_SLOT_DONE;
+          chunk_slot_done_locked (state);
+          rob_try_commit_locked ();
           pthread_mutex_unlock (&pool_mutex);
           return;
         }
@@ -5629,7 +5700,8 @@ chunk_create_state (int fd, bool close_fd, char const *fname,
                     struct stat const *st, char *base, size_t total_alloc,
                     char *data, size_t effective_size)
 {
-  size_t num_chunks = MIN ((size_t) pool_nthreads * 2, MAX_FILE_CHUNKS);
+  size_t eff_threads = MAX (1, pool_nthreads);
+  size_t num_chunks = MIN (eff_threads * 2, MAX_FILE_CHUNKS);
   size_t min_chunk_size = CHUNK_MIN_SIZE;
   if (effective_size / num_chunks < min_chunk_size)
     num_chunks = effective_size / min_chunk_size;
@@ -5713,6 +5785,7 @@ chunk_run_mmap_scan_pass1 (struct chunk_file_state *state)
           };
           work_queue_push_locked (&t);
         }
+      drain_queue_if_no_workers_locked ();
       pthread_cond_broadcast (&q_not_empty_cv);
     }
   pthread_mutex_unlock (&pool_mutex);
@@ -5764,7 +5837,16 @@ chunk_enqueue_line_number_pass2 (struct chunk_file_state *state,
         }
 
       if (!work_queue_wait_space_locked (1))
-        break;
+        {
+          slot->status = true;
+          slot->is_last_chunk = true;
+          slot->cleanup_fn = cleanup_chunk_file_state;
+          slot->cleanup_arg = state;
+          if (!slot->filename)
+            slot->filename = xstrdup (fname);
+          slot->state = ROB_SLOT_DONE;
+          break;
+        }
 
       struct work_task t = {
         .type = TASK_TYPE_CHUNK,
@@ -5951,6 +6033,7 @@ stream_enqueue_slice_task (char *chunk_alloc, char *chunk_data,
 
   while (next_seq - commit_seq >= STREAM_MAX_INFLIGHT && !pool_terminate)
     {
+      drain_queue_if_no_workers_locked ();
       rob_try_commit_locked ();
       if (next_seq - commit_seq < STREAM_MAX_INFLIGHT)
         break;
@@ -5969,6 +6052,9 @@ stream_enqueue_slice_task (char *chunk_alloc, char *chunk_data,
   if (!work_queue_wait_space_locked (1))
     {
       free_slice_buf_locked (chunk_alloc);
+      slot->status = true;
+      slot->state = ROB_SLOT_DONE;
+      rob_try_commit_locked ();
       pthread_mutex_unlock (&pool_mutex);
       return false;
     }
@@ -5996,6 +6082,8 @@ static void
 stream_slicer_stdin (void)
 {
   producer_flush_batch ();
+  if (pool_started)
+    rob_wait_all_committed ();
   stream_readsize = ALIGN_TO (GOOD_READSIZE_MIN, pagesize);
 #ifdef F_GETPIPE_SZ
   int pipe_size = fcntl (STDIN_FILENO, F_GETPIPE_SZ);
@@ -6101,6 +6189,8 @@ stream_slicer_stdin (void)
     }
 
   free (residue_buf);
+  if (pool_started)
+    rob_wait_all_committed ();
 }
 
 /* Parallel ordered directory traversal.
@@ -6592,16 +6682,16 @@ walk_fd_release (struct walk_dir *d)
   GREP_TEST_DELAY ("walk_fd_release");
   if (!walk.logical && atomic_fetch_sub (&d->fd_users, 1) == 1)
     {
+      pthread_mutex_lock (&walk.fd_mu);
       if (!d->in_fd_list)
         {
           int fd = atomic_load_explicit (&d->fd, memory_order_relaxed);
           if (0 <= fd)
             close (fd);
           atomic_store_explicit (&d->fd, -1, memory_order_relaxed);
-          return;
         }
-      pthread_mutex_lock (&walk.fd_mu);
-      walk_close_fd_locked (d);
+      else
+        walk_close_fd_locked (d);
       pthread_mutex_unlock (&walk.fd_mu);
     }
 }
@@ -6857,7 +6947,6 @@ walk_real_reg_fs (int fd)
       case 0x01021994UL:        /* tmpfs */
       case 0x58465342UL:        /* XFS */
       case 0x9123683EUL:        /* Btrfs */
-      case 0x794C7630UL:        /* overlayfs */
       case 0x858458F6UL:        /* ramfs */
       case 0xF2F52010UL:        /* F2FS */
       case 0x3153464AUL:        /* JFS */
@@ -7161,7 +7250,11 @@ walk_open_dir_entry (struct walk_dir *p, struct walk_ent *e, char const *path,
       && !(skip_devices (false) && is_device_mode (st_out->st_mode)))
     {
       e->kind = WALK_FILE;
-      walk_search (p, walk.logical ? AT_FDCWD : walk_dir_fd (p), e, false);
+      int pfd = walk.logical ? AT_FDCWD : walk_dir_fd (p);
+      if (pfd < 0)
+        walk_ent_error (p, e, errno);
+      else
+        walk_search (p, pfd, e, true);
     }
   return -1;
 }
@@ -7326,8 +7419,10 @@ walk_recruit (unsigned int gen)
     {
       /* Wake a worker for each task now, not after the loop: if the
          queue fills up, only workers that take tasks make room.  */
-      while (q_count >= WORK_QUEUE_CAP)
+      while (q_count >= WORK_QUEUE_CAP && i < pool_nthreads && !pool_terminate)
         pthread_cond_wait (&q_not_full_cv, &pool_mutex);
+      if (i >= pool_nthreads || pool_terminate)
+        break;
       work_queue[q_tail] = (struct work_task) { .type = TASK_TYPE_WALK,
                                                 .seq = gen };
       q_tail = (q_tail + 1) % WORK_QUEUE_CAP;
@@ -7571,7 +7666,7 @@ walk_commit_ent (struct walk_dir *d, struct walk_ent *e)
     {
       char const *out = (char const *) (o->big + 2 * o->nbig);
       commit_output (out, o->outlen, out + o->outlen, o->errlen, o->big,
-                     o->nbig, sep);
+                     o->nbig, sep, e->had_prline);
       walk_free_out (o);
       e->out = nullptr;
       if (line_buffered)
@@ -7609,7 +7704,7 @@ walk_commit_locked (void)
             {
               struct walk_out *o = d->post;
               commit_output (nullptr, 0, (char const *) o->big, o->errlen,
-                             nullptr, 0, false);
+                             nullptr, 0, false, false);
             }
           struct walk_dir *p = d->parent;
           if (p)
@@ -7713,7 +7808,7 @@ static void
 walk_help_bin_job (struct walk_bin_job *job, bool *published)
 {
   size_t slice = job->slice_size;
-  size_t overlap = MAX (65536, (size_t) raw_keycc + 1);
+  size_t overlap = MAX (65536, (size_t) raw_keycc * 2 + 1);
   while (!atomic_load_explicit (&job->found, memory_order_relaxed))
     {
       if (published && !*published)
@@ -7803,13 +7898,13 @@ walk_participate (unsigned int gen)
         walk_commit ();
       walk_maybe_recruit ();
       pthread_mutex_lock (&walk.mu);
-      walk.running--;
-      if (!should_commit && walk.running == 0)
+      if (!should_commit && walk.running == 1)
         {
           pthread_mutex_unlock (&walk.mu);
           walk_commit ();
           pthread_mutex_lock (&walk.mu);
         }
+      walk.running--;
     }
   if (--walk.inside == 0)
     pthread_cond_broadcast (&walk.left_cv);
@@ -7983,6 +8078,9 @@ producer_run (char *const *files)
     {
       if (STREQ (*f, "-"))
         {
+          producer_flush_batch ();
+          if (pool_started)
+            rob_wait_all_committed ();
           struct stat st;
           bool stdin_ok = fstat (STDIN_FILENO, &st) == 0;
           bool stdin_is_reg = stdin_ok && S_ISREG (st.st_mode);
