@@ -102,14 +102,19 @@ for t in 1 4 32; do
 done
 
 # Standard input among other operands, closed.
-for t in 1 4 32; do
-  env GREP_THREADS=$t grep -c MATCH_ALPHA ops/o01 - ops/o02 0<&- > m_out 2> m_err
+for env_ in "GREP_THREADS=1" \
+            "GREP_THREADS=4" \
+            "GREP_THREADS=32" \
+            "GREP_THREADS=32 LD_PRELOAD=$PWD/chaos-shim.so CHAOS_SEED=1 CHAOS_SLEEP=1:2000 CHAOS_YIELD=0.5" \
+            "GREP_THREADS=32 LD_PRELOAD=$PWD/chaos-shim.so CHAOS_SEED=2 CHAOS_SLEEP=1:2000 CHAOS_YIELD=0.5" \
+            "GREP_THREADS=32 LD_PRELOAD=$PWD/chaos-shim.so CHAOS_SEED=3 CHAOS_SLEEP=1:2000 CHAOS_YIELD=0.5"; do
+  env $env_ grep -c MATCH_ALPHA ops/o01 - ops/o02 0<&- > m_out 2> m_err
   echo "rc=$?" >> m_out
-  if test $t = 1; then
+  if test "$env_" = GREP_THREADS=1; then
     mv m_out m_exp; mv m_err m_experr
   else
     compare m_exp m_out && compare m_experr m_err \
-      || { echo "FAIL closed stdin among operands: t=$t" >&2; fail=1; }
+      || { echo "FAIL closed stdin among operands: $env_" >&2; fail=1; }
   fi
 done
 

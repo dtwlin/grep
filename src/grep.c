@@ -1678,6 +1678,7 @@ static bool exit_on_match;	/* Exit on first match.  */
 static bool dev_null_output;	/* Stdout is known to be /dev/null.  */
 static bool possibly_tty;	/* Stdout is a non-/dev/null character device.  */
 static bool binary;		/* Use binary rather than text I/O.  */
+static bool stdin_is_closed;	/* Standard input was closed at startup.  */
 
 static bool global_used;
 static _Thread_local bool file_used;
@@ -2827,6 +2828,11 @@ grep_command_line_arg (char const *arg)
   if (STREQ (arg, "-"))
     {
       filename = label;
+      if (stdin_is_closed)
+        {
+          suppressible_error (EBADF);
+          return true;
+        }
       if (binary)
         xset_binary_mode (STDIN_FILENO, O_BINARY);
       return grepdesc (STDIN_FILENO, true);
@@ -8125,10 +8131,9 @@ producer_run (char *const *files)
           if (pool_started)
             rob_wait_all_committed ();
           struct stat st;
-          bool stdin_ok = fstat (STDIN_FILENO, &st) == 0;
+          bool stdin_ok = !stdin_is_closed && fstat (STDIN_FILENO, &st) == 0;
           bool stdin_is_reg = stdin_ok && S_ISREG (st.st_mode);
-          if (pool_target > 1 && !isatty (STDIN_FILENO)
-              && stdin_is_reg
+          if (pool_target > 1 && stdin_is_reg && !isatty (STDIN_FILENO)
               && st.st_size >= CHUNK_FILE_MIN
               && !SAME_INODE (st, out_stat)
               && lseek (STDIN_FILENO, 0, SEEK_CUR) == 0
@@ -8139,8 +8144,8 @@ producer_run (char *const *files)
               chunked_grep_fd (STDIN_FILENO, false, label ? label : _("(standard input)"), &st);
               rob_wait_all_committed ();
             }
-          else if (pool_target > 1 && !isatty (STDIN_FILENO)
-                   && stdin_ok && !stdin_is_reg
+          else if (pool_target > 1 && stdin_ok && !stdin_is_reg
+                   && !isatty (STDIN_FILENO)
                    && out_before < 0 && out_after < 0 && max_count == INTMAX_MAX
                    && !done_on_match && !line_buffered && !possibly_tty
                    && binary_files != WITHOUT_MATCH_BINARY_FILES)
@@ -9134,6 +9139,9 @@ main (int argc, char **argv)
       return errseen ? EXIT_TROUBLE : status;
     }
 
+  stdin_is_closed = fcntl (STDIN_FILENO, F_GETFD) < 0 && errno == EBADF;
+  if (stdin_is_closed)
+    fcntl (-1, F_DUPFD_CLOEXEC, 0);
   pool_target = nthreads;
   producer_run (files);
   finish_worker_pool ();

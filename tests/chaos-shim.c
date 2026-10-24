@@ -60,6 +60,7 @@ static int (*real_create) (pthread_t *, pthread_attr_t const *,
 static ssize_t (*real_read) (int, void *, size_t);
 
 static __thread uint64_t rng;
+static __thread int is_main_thread;
 
 static double
 env_prob (char const *name)
@@ -83,6 +84,7 @@ resolve (void)
 __attribute__ ((constructor)) static void
 chaos_init (void)
 {
+  is_main_thread = 1;
   resolve ();
   char const *s = getenv ("CHAOS_SEED");
   if (s)
@@ -136,10 +138,17 @@ chaos_hit (double p)
 static void
 chaos_point (void)
 {
+  int saved_errno = errno;
   if (chaos_hit (p_sleep) && sleep_usec)
-    usleep (chaos_rand () % sleep_usec);
+    {
+      int fd = is_main_thread ? -1 : open ("/dev/null", O_RDONLY | O_CLOEXEC);
+      usleep (chaos_rand () % sleep_usec);
+      if (0 <= fd)
+        close (fd);
+    }
   else if (chaos_hit (p_yield))
     sched_yield ();
+  errno = saved_errno;
 }
 
 int
