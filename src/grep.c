@@ -3653,6 +3653,12 @@ static_assert (1 <= STREAM_MAX_INFLIGHT);
 enum { CHUNK_FILE_MIN = GREP_CHUNK_FILE_MIN };
 enum { CHUNK_MIN_SIZE = GREP_CHUNK_MIN_SIZE };
 
+/* Such files are mapped at an address that is a multiple of
+   CHUNK_MAP_ALIGN, the size of a PMD-level huge page on x86-64 and on
+   arm64 with 4 KiB pages, so that the kernel can map each 2 MiB page
+   cache folio of the file with a single page table entry.  */
+enum { CHUNK_MAP_ALIGN = 2 * 1024 * 1024 };
+
 static struct rob_slot rob[ROB_CAP];
 static uint64_t next_seq;
 static uint64_t commit_seq;
@@ -5646,28 +5652,60 @@ chunk_mmap_file_with_sentinels (int fd, bool close_fd, char const *fname,
                                 size_t *total_alloc_out, char **data_out,
                                 size_t *effective_size_out)
 {
-  size_t file_size = (size_t) st->st_size;
   size_t ps = (size_t) pagesize;
+  size_t align = MAX (ps, CHUNK_MAP_ALIGN);
+  if ((uintmax_t) st->st_size > SIZE_MAX - align - 2 * ps)
+    {
+      chunked_fallback_enqueue (fd, close_fd, fname);
+      return false;
+    }
+  size_t file_size = (size_t) st->st_size;
   size_t aligned_file_size = (file_size % ps == 0
                               ? file_size
                               : file_size + (ps - file_size % ps));
-  size_t total_alloc = aligned_file_size + 2 * ps;
-  char *base = mmap (NULL, total_alloc, PROT_READ | PROT_WRITE,
+
+  /* Reserve room to start the file mapping on an ALIGN boundary after a
+     guard page.  File offsets and addresses then agree modulo the huge
+     page size, so the kernel can map each 2 MiB page cache folio with
+     one PMD entry, and folios never straddle a PMD boundary.  */
+  size_t reserve = aligned_file_size + align + ps;
+  char *base = mmap (NULL, reserve, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (base == MAP_FAILED)
     {
       chunked_fallback_enqueue (fd, close_fd, fname);
       return false;
     }
+#ifdef MADV_NOHUGEPAGE
+  /* A guard page holds just one sentinel byte; writing it must not
+     clear a whole huge page.  */
+  madvise (base, reserve, MADV_NOHUGEPAGE);
+#endif
 
-  char *data = mmap (base + pagesize, file_size, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_FIXED, fd, 0);
-  if (data == MAP_FAILED)
+  char *data = ALIGN_TO (base + ps, align);
+  if (mmap (data, file_size, PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_FIXED, fd, 0)
+      == MAP_FAILED)
     {
-      munmap (base, total_alloc);
+      munmap (base, reserve);
       chunked_fallback_enqueue (fd, close_fd, fname);
       return false;
     }
+#ifdef MADV_HUGEPAGE
+  /* Also make page faults on uncached parts of the file read 2 MiB
+     folios, which later runs can map with PMD entries too.  */
+  madvise (data, aligned_file_size, MADV_HUGEPAGE);
+#endif
+
+  /* Give back the reservation outside the two guard pages.  */
+  char *map_end = base + reserve;
+  char *guard_beg = data - ps;
+  char *guard_end = data + aligned_file_size + ps;
+  if (base < guard_beg && munmap (base, guard_beg - base) == 0)
+    base = guard_beg;
+  if (guard_end < map_end && munmap (guard_end, map_end - guard_end) == 0)
+    map_end = guard_end;
+  size_t total_alloc = map_end - base;
 
   data[-1] = eolbyte;
   if (data[file_size] != eolbyte)

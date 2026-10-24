@@ -118,4 +118,103 @@ GREP_THREADS=1 grep -c -E "$dfa_pat" in_dfa_2m > exp_dfa_c || fail=1
 GREP_THREADS=4 grep -c -E "$dfa_pat" in_dfa_2m > out_dfa_c4 || fail=1
 compare exp_dfa_c out_dfa_c4 || fail=1
 
+# make_sized FILE SIZE NL: write SIZE bytes of 100-byte lines.  The first
+# line, the last line, and every line that contains a 2 MiB boundary
+# include MATCH_ALIGN.  The file ends in a newline if and only if NL is 1.
+make_sized ()
+{
+  $PERL -e '
+    my ($file, $size, $nl) = @ARGV;
+    my $mib2 = 2 * 1024 * 1024;
+    my $out = "";
+    for (my $i = 0; length ($out) < $size; $i++) {
+      my $off = length ($out);
+      my $tag = ($i == 0 || int ($off / $mib2) != int (($off + 99) / $mib2))
+                ? "MATCH_ALIGN" : "filler";
+      $out .= sprintf ("%09d %-11s %s\n", $i, $tag, "x" x 77);
+    }
+    $out = substr ($out, 0, $size);
+    substr ($out, -1) = $nl ? "\n" : "z";
+    my $last = rindex ($out, "\n", $size - 2) + 1;
+    substr ($out, $last, 11) = "MATCH_ALIGN" if $size - $last >= 12;
+    open my $fh, ">", $file or die "$file: $!";
+    print $fh $out or die "$file: $!";
+    close $fh or die "$file: $!";
+  ' "$1" "$2" "$3" || framework_failure_
+}
+
+# 10. File sizes at page and 2 MiB boundaries, with and without a final
+#     newline.  The chunked search maps the file at a 2 MiB boundary, so
+#     the sentinel after the last byte lands either in the file's last page
+#     or in the guard page after it, and lines straddle huge page edges.
+for size in 2097151 2097152 2097153 3145728 4194304 4195160 6291455; do
+  for nl in 1 0; do
+    make_sized in_sz "$size" "$nl"
+    for opts in "" "-c" "-n" "-b" "-n -C 1" "-o" "-v -c" "-l"; do
+      GREP_THREADS=1 grep $opts MATCH_ALIGN in_sz > exp_sz || fail=1
+      for t in 3 32; do
+        GREP_THREADS=$t grep $opts MATCH_ALIGN in_sz > out_sz || fail=1
+        compare exp_sz out_sz || {
+          echo "FAIL: size=$size nl=$nl threads=$t opts='$opts'" >&2
+          fail=1
+        }
+      done
+    done
+  done
+done
+
+# 11. On Linux, the file mapping starts at a 2 MiB boundary and asks for
+#     huge pages, and anonymous guard pages that never use huge pages sit
+#     right before and after it.  grep-hooks sleeps before it queues each
+#     chunk, so its mappings can be inspected while it searches the file.
+hooks=$abs_top_builddir/src/grep-hooks
+if test -r /proc/self/smaps && test -x "$hooks" \
+   && test "$(env GREP_DELAY_AT=probe "$hooks" x </dev/null)" = grep-test-hooks
+then
+  make_sized in_layout 5000000 1
+  GREP_DELAY_AT=chunk_enqueue:3000000 GREP_THREADS=4 \
+    "$hooks" -c MATCH_ALIGN in_layout > /dev/null 2>&1 &
+  pid=$!
+  layout=
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1
+    cat /proc/$pid/smaps > layout_smaps 2>/dev/null || break
+    layout=$(awk '
+      /^[0-9a-f]+-[0-9a-f]+ / {
+        n++; split ($1, a, "-"); beg[n] = a[1]; end[n] = a[2]
+        anon[n] = (NF == 5); file[n] = ($0 ~ /\/in_layout$/); next
+      }
+      /^VmFlags:/ { flags[n] = $0 " " }
+      END {
+        for (i = 2; i < n; i++)
+          if (file[i])
+            print beg[i], end[i], end[i-1], beg[i+1], anon[i-1], anon[i+1], \
+                  (flags[i] ~ / hg /), (flags[i-1] ~ / nh /), (flags[i+1] ~ / nh /)
+      }' layout_smaps)
+    test -n "$layout" && break
+  done
+  kill $pid 2>/dev/null
+  wait $pid 2>/dev/null
+  if test -z "$layout"; then
+    echo "FAIL: the mapping of in_layout was not found" >&2
+    fail=1
+  else
+    set -- $layout
+    test $((0x$1 % 2097152)) -eq 0 || {
+      echo "FAIL: in_layout is mapped at 0x$1, not at a 2 MiB boundary" >&2
+      fail=1
+    }
+    test "$3" = "$1" && test "$5" = 1 && test "$4" = "$2" && test "$6" = 1 || {
+      echo "FAIL: no anonymous guard pages around the mapping: $layout" >&2
+      fail=1
+    }
+    if test -r /sys/kernel/mm/transparent_hugepage/enabled; then
+      test "$7$8$9" = 111 || {
+        echo "FAIL: huge page advice (file, guards) is not $layout" >&2
+        fail=1
+      }
+    fi
+  fi
+fi
+
 Exit $fail
