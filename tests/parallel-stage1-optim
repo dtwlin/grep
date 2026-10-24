@@ -137,4 +137,80 @@ for t in 1 2 4 8 16; do
   compare exp_bref "out_bref_$t" || fail=1
 done
 
+# -------------------------------------------------------------------------
+# 4. Single-literal BRE/ERE promotion, Fclone, and deferred dfacomp (-o/--color)
+# -------------------------------------------------------------------------
+
+cat << 'EOF' > in_promo
+alpha_call(arg1)
+might_sleep();
+beta.value = 42;
+star*ptr = &arr[0];
+caret^hat$dollar\slash
+mutex_lock(&lock);
+mutex_lock_nested(&lock, 0);
+ERR_PTR(-EINVAL) and ERR_PTR(-ENOMEM)
+EOF
+
+# Escaped metacharacters in -G and -E promoted to fixed strings
+grep -F 'might_sleep()' in_promo > exp_sleep || fail=1
+for t in 1 2 4 8; do
+  GREP_THREADS=$t grep -E 'might_sleep\(\)' in_promo > "out_sleep_e_$t" 2>err_sleep || fail=1
+  compare exp_sleep "out_sleep_e_$t" || fail=1
+  compare /dev/null err_sleep || fail=1
+  GREP_THREADS=$t grep -G 'might_sleep()' in_promo > "out_sleep_g_$t" 2>err_sleep_g || fail=1
+  compare exp_sleep "out_sleep_g_$t" || fail=1
+  compare /dev/null err_sleep_g || fail=1
+done
+
+grep -F 'beta.value' in_promo > exp_dot || fail=1
+GREP_THREADS=4 grep -G 'beta\.value' in_promo > out_dot_g 2>err_dot_g || fail=1
+GREP_THREADS=4 grep -E 'beta\.value' in_promo > out_dot_e 2>err_dot_e || fail=1
+compare exp_dot out_dot_g || fail=1
+compare exp_dot out_dot_e || fail=1
+compare /dev/null err_dot_g || fail=1
+compare /dev/null err_dot_e || fail=1
+
+grep -F 'caret^hat$dollar\slash' in_promo > exp_meta || fail=1
+GREP_THREADS=4 grep -E 'caret\^hat\$dollar\\slash' in_promo > out_meta_e 2>err_meta_e || fail=1
+GREP_THREADS=4 grep -G 'caret\^hat\$dollar\\slash' in_promo > out_meta_g 2>err_meta_g || fail=1
+compare exp_meta out_meta_e || fail=1
+compare exp_meta out_meta_g || fail=1
+compare /dev/null err_meta_e || fail=1
+compare /dev/null err_meta_g || fail=1
+
+# Single-literal -w in UTF-8 and C locales across threads
+grep -F -w 'mutex_lock' in_promo > exp_w_utf8 || fail=1
+test $(wc -l < exp_w_utf8) -eq 1 || fail=1
+for loc in en_US.UTF-8 C; do
+  for t in 1 2 4 8; do
+    LC_ALL=$loc GREP_THREADS=$t grep -w 'mutex_lock' in_promo > "out_w_${loc}_$t" || fail=1
+    compare exp_w_utf8 "out_w_${loc}_$t" || fail=1
+    LC_ALL=$loc GREP_THREADS=$t grep -F -w 'mutex_lock' in_promo > "out_fw_${loc}_$t" || fail=1
+    compare exp_w_utf8 "out_fw_${loc}_$t" || fail=1
+  done
+done
+
+# Stray backslash must still emit warning on stderr; trailing backslash must fail with status 2
+grep 'alpha\_call' in_promo > out_stray 2> err_stray || fail=1
+test -s err_stray || fail=1
+grep -E 'alpha\q' in_promo > out_stray2 2> err_stray2
+test -s err_stray2 || fail=1
+grep 'trailing\' in_promo > /dev/null 2>&1
+test $? -eq 2 || fail=1
+
+# Deferred dfacomp under exact (-o and --color=always) across multiple files and threads
+mkdir -p exact_dir || framework_failure_
+for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  cat in_promo > "exact_dir/f_$i.txt" || framework_failure_
+done
+GREP_THREADS=1 grep -n -o -E 'ERR_PTR\(-[A-Z0-9_]+\)' exact_dir/f_*.txt > exp_exact_o || fail=1
+GREP_THREADS=1 grep -n --color=always -E 'ERR_PTR\(-[A-Z0-9_]+\)' exact_dir/f_*.txt > exp_exact_col || fail=1
+for t in 2 4 8; do
+  GREP_THREADS=$t grep -n -o -E 'ERR_PTR\(-[A-Z0-9_]+\)' exact_dir/f_*.txt > "out_exact_o_$t" || fail=1
+  compare exp_exact_o "out_exact_o_$t" || fail=1
+  GREP_THREADS=$t grep -n --color=always -E 'ERR_PTR\(-[A-Z0-9_]+\)' exact_dir/f_*.txt > "out_exact_col_$t" || fail=1
+  compare exp_exact_col "out_exact_col_$t" || fail=1
+done
+
 Exit $fail

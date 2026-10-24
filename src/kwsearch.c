@@ -185,7 +185,7 @@ Fcompile (char *pattern, idx_t size, reg_syntax_t ignored, bool exact)
   kwsearch->kwset = sk->kwset;
   kwsearch->shared = sk;
   kwsearch->words = sk->words;
-  kwsearch->pattern = ximemdup0 (pattern, size);
+  kwsearch->pattern = nullptr;
   kwsearch->size = size;
   kwsearch->re = nullptr;
   kwsearch->utf8_quirk_mask = sk->utf8_quirk_mask;
@@ -195,12 +195,36 @@ Fcompile (char *pattern, idx_t size, reg_syntax_t ignored, bool exact)
 
   if (!localeinfo.multibyte && match_words)
     {
+      kwsearch->pattern = ximemdup0 (pattern, size);
       fgrep_to_grep_pattern (&kwsearch->pattern, &kwsearch->size);
       kwsearch->re = GEAcompile (kwsearch->pattern,
                                  kwsearch->size,
                                  RE_SYNTAX_GREP, exact);
     }
 
+  return kwsearch;
+}
+
+void *
+Fclone (void const *vcp)
+{
+  struct kwsearch const *orig = vcp;
+  if (orig->re)
+    return nullptr;
+  struct shared_kwset *sk = orig->shared;
+  atomic_fetch_add (&sk->refs, 1);
+
+  struct kwsearch *kwsearch = xmalloc (sizeof *kwsearch);
+  kwsearch->kwset = sk->kwset;
+  kwsearch->shared = sk;
+  kwsearch->words = sk->words;
+  kwsearch->pattern = nullptr;
+  kwsearch->size = orig->size;
+  kwsearch->re = nullptr;
+  kwsearch->utf8_quirk_mask = sk->utf8_quirk_mask;
+  kwsearch->quirk_norm = nullptr;
+  kwsearch->quirk_orig = nullptr;
+  kwsearch->quirk_cap = 0;
   return kwsearch;
 }
 

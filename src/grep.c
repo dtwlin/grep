@@ -2974,9 +2974,17 @@ clone_compiled_pattern (void)
   if (matchers[raw_matcher_index].compile == Pcompile)
     return Pclone (primary_compiled_pattern);
 #endif
-
   static pthread_mutex_t compile_mutex = PTHREAD_MUTEX_INITIALIZER;
   pthread_mutex_lock (&compile_mutex);
+  if (matchers[raw_matcher_index].compile == Fcompile)
+    {
+      void *pat = Fclone (primary_compiled_pattern);
+      if (pat)
+        {
+          pthread_mutex_unlock (&compile_mutex);
+          return pat;
+        }
+    }
   suppress_dfawarn = true;
   char *keys_copy = ximalloc (raw_keycc + 2);
   memcpy (keys_copy, raw_keys, raw_keycc);
@@ -3354,43 +3362,40 @@ try_fgrep_pattern (int matcher, char *keys, idx_t *len_p)
           break;
 
         case '\\':
-          if (1 < len)
+          if (len <= 1)
+            goto fail;
+          if (matcher == G_MATCHER_INDEX && q[1] == '|')
             {
-              if (matcher == G_MATCHER_INDEX && q[1] == '|')
+              if (p > new_keys && p[-1] != '\n'
+                  && len > 2 && q[2] != '\n'
+                  && !(len > 3 && q[2] == '\\' && q[3] == '|'))
                 {
-                  if (p > new_keys && p[-1] != '\n'
-                      && len > 2 && q[2] != '\n'
-                      && !(len > 3 && q[2] == '\\' && q[3] == '|'))
-                    {
-                      *p++ = '\n';
-                      n_alts++;
-                      q += 2;
-                      len -= 2;
-                      continue;
-                    }
-                  goto fail;
+                  *p++ = '\n';
+                  n_alts++;
+                  q += 2;
+                  len -= 2;
+                  continue;
                 }
-              switch (q[1])
-                {
-                case '\n':
-                case 'B': case 'S': case 'W': case'\'': case '<':
-                case 'b': case 's': case 'w': case '`': case '>':
-                case '1': case '2': case '3': case '4':
-                case '5': case '6': case '7': case '8': case '9':
-                  goto fail;
+              goto fail;
+            }
+          switch (q[1])
+            {
+            case '\\': case '^': case '$': case '*': case '.': case '[': case ']':
+              q++, len--;
+              break;
 
-                case '(': case '+': case '?': case '{': case '|':
-                  /* Pass '\)' to GEAcompile so it can complain.  Otherwise,
-                     "grep '\)'" would act like "grep ')'" while "grep '.*\)'"
-                     would be an error.  */
-                case ')':
-                  if (matcher == G_MATCHER_INDEX)
-                    goto fail;
-                  FALLTHROUGH;
-                default:
-                  q++, len--;
-                  break;
-                }
+            case '(': case '+': case '?': case '{': case '}': case '|':
+              /* Pass '\)' to GEAcompile so it can complain.  Otherwise,
+                 "grep '\)'" would act like "grep ')'" while "grep '.*\)'"
+                 would be an error.  */
+            case ')':
+              if (matcher == G_MATCHER_INDEX)
+                goto fail;
+              q++, len--;
+              break;
+
+            default:
+              goto fail;
             }
           break;
         }
@@ -3406,7 +3411,7 @@ try_fgrep_pattern (int matcher, char *keys, idx_t *len_p)
     }
 
   if (matcher != F_MATCHER_INDEX && n_patterns + n_alts <= 1
-      && !(match_icase && !(match_words && !localeinfo.multibyte)))
+      && (match_words && !localeinfo.multibyte))
     goto fail;
 
   if (n_alts > 0 || *len_p != p - new_keys)
@@ -8367,10 +8372,11 @@ compile_matcher_and_patterns (int matcher, char *keys, idx_t keycc)
               matcher = G_MATCHER_INDEX;
             }
         }
-      /* If -F works, switch from either -E or -G when there are multiple
-         patterns, when case is ignored, or when patterns contain '|'
-         (which try_fgrep_pattern can convert to newlines).  */
-      else if (1 < n_patterns || match_icase || memchr (keys, '|', keycc) != nullptr)
+      /* If -F works, switch from either -E or -G when the pattern can be
+         reduced to fixed strings (excluding single-pattern -w in a
+         single-byte locale, where -G is faster).  */
+      else if (1 < n_patterns || match_icase || !match_words
+               || localeinfo.multibyte || memchr (keys, '|', keycc) != nullptr)
         matcher = try_fgrep_pattern (matcher, keys, &keycc);
     }
 

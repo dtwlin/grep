@@ -1351,7 +1351,7 @@ setup_shared_dfa_and_kwset (struct dfa_comp *dc, char const *pattern,
         memcpy (dc->must2, sk->must2, sk->must2_len);
       atomic_fetch_add (&sk->refs, 1);
 
-      if (suppress_dfawarn && sk->dfa_supported && !exact && dc->pcount == 0)
+      if (suppress_dfawarn && sk->dfa_supported && dc->pcount == 0)
         {
           dc->dfa_compiled = false;
           dc->dfa_pattern = sk->pattern;

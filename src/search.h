@@ -60,6 +60,7 @@ extern void EGfree (void *);
 
 /* kwsearch.c */
 extern void *Fcompile (char *, idx_t, reg_syntax_t, bool);
+extern void *Fclone (void const *);
 extern ptrdiff_t Fexecute (void *, char const *, idx_t, idx_t *, char const *);
 extern void Ffree (void *);
 

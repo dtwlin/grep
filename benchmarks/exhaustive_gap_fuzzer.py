@@ -194,6 +194,13 @@ def suite_prefilter_regex_differential(
         ("ere_unclosed_collating_bracket", ["-E", "[[.a]bcd|ef.*gh"]),
         ("ere_unclosed_equiv_bracket", ["-E", "[[=a]bcd|ef.*gh"]),
         ("ere_unclosed_charclass_bracket", ["-E", "[[:a]bcd|ef.*gh"]),
+        ("single_lit_bre_plain", ["CAFE_TOKEN"]),
+        ("single_lit_ere_plain", ["-E", "CAFE_TOKEN"]),
+        ("single_lit_ere_escaped_parens", ["-E", r"ab\)cd"]),
+        ("single_lit_bre_escaped_dot", [r"ab\.cd"]),
+        ("single_lit_bre_word", ["-w", "CAFE_TOKEN"]),
+        ("single_lit_ere_word", ["-E", "-w", "CAFE_TOKEN"]),
+        ("exact_deferred_dfa_ere", ["-E", r"ef[0-9]+gh"]),
     ]
 
     for name, args in targeted_cases:

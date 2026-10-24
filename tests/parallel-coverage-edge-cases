@@ -209,6 +209,27 @@ for t in 2 4 8; do
   compare exp_col "out_col_$t" || fail=1
 done
 
+# Only-matching (-o) combinations with lazy per-thread dfacomp (-w, -i, -b, --color, multi-pattern)
+mkdir -p exact_dir || framework_failure_
+for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  cp in_data "exact_dir/f_$i.txt" || framework_failure_
+done
+
+for opts in "-o -w -E user_[a-z]+_[0-9]+" \
+            "-o -i -E ROLE=[A-Z]+" \
+            "-o -b -E seq=[0-9]+" \
+            "-o --color=always -E status=[0-9]+" \
+            "-o -E -e role=[a-z]+ -e auth=[a-z]+ -e host=[a-z0-9.]+"
+do
+  # shellcheck disable=SC2086
+  GREP_THREADS=1 grep -r $opts exact_dir | LC_ALL=C sort > exp_exact_o || fail=1
+  for t in 2 4 8; do
+    # shellcheck disable=SC2086
+    GREP_THREADS=$t grep -r $opts exact_dir | LC_ALL=C sort > "out_exact_o_$t" || fail=1
+    compare exp_exact_o "out_exact_o_$t" || fail=1
+  done
+done
+
 # -------------------------------------------------------------------------
 # 4. Error diagnostics and boundary handling
 # -------------------------------------------------------------------------

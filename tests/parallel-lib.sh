@@ -94,6 +94,8 @@ pl_build_shim ()
 # to SIG_DFL, in case the parent environment blocked or ignored them.
 pl_with_sig_dfl ()
 {
+  { local is_tracing=`{ :; } 2>&1`; } 2>/dev/null
+  { set +x; } 2>/dev/null
   $PERL -MPOSIX -e '
     POSIX::sigprocmask (POSIX::SIG_UNBLOCK (),
       POSIX::SigSet->new (POSIX::SIGPIPE (), POSIX::SIGHUP (),
@@ -101,12 +103,17 @@ pl_with_sig_dfl ()
     alarm shift; $SIG{PIPE} = "DEFAULT"; $SIG{HUP} = "DEFAULT";
     $SIG{TERM} = "DEFAULT"; exec @ARGV or die $!' \
     "${PL_TIMEOUT:-60}" "$@"
+  local rc=$?
+  test -n "$is_tracing" && set -x
+  { return $rc; } 2>/dev/null
 }
 
 # Run a command with SIGPIPE set to SIG_IGN and an alarm timeout,
 # without an external timeout wrapper that might reset SIGPIPE.
 pl_with_sig_ign ()
 {
+  { local is_tracing=`{ :; } 2>&1`; } 2>/dev/null
+  { set +x; } 2>/dev/null
   $PERL -MPOSIX -e '
     POSIX::sigprocmask (POSIX::SIG_UNBLOCK (),
       POSIX::SigSet->new (POSIX::SIGHUP (), POSIX::SIGTERM (),
@@ -114,14 +121,22 @@ pl_with_sig_ign ()
     alarm shift; $SIG{PIPE} = "IGNORE"; $SIG{HUP} = "DEFAULT";
     $SIG{TERM} = "DEFAULT"; exec @ARGV or die $!' \
     "${PL_TIMEOUT:-60}" "$@"
+  local rc=$?
+  test -n "$is_tracing" && set -x
+  { return $rc; } 2>/dev/null
 }
 
 # Close inherited file descriptors >= 3, set RLIMIT_NOFILE to $1, and
 # exec the remaining arguments.
 pl_with_nofile ()
 {
+  { local is_tracing=`{ :; } 2>&1`; } 2>/dev/null
+  { set +x; } 2>/dev/null
   $PERL -MPOSIX -e 'POSIX::close($_) for 3..1024; exec @ARGV or die $!' \
     sh -c 'ulimit -n "$1" && shift && exec "$@"' sh "$@"
+  local rc=$?
+  test -n "$is_tracing" && set -x
+  { return $rc; } 2>/dev/null
 }
 
 # Write the corpus used by the standard cases.
