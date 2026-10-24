@@ -11,7 +11,7 @@
 - **Isolation**: All 128 logical CPUs (2 NUMA nodes, CPUs 0-127)
 - **Run Note**: Complete 59-scenario Linux kernel benchmark (G0, G1, R0, U0 in one session) with fair thread-matched comparisons
 - **G0**: Upstream GNU grep baseline `3.12.41` (1 thread)
-- **G1**: Our multi-threaded fork (`76d3503`, default 33 threads)
+- **G1**: Our multi-threaded fork (`c632568`, default 33 threads)
 - **R0**: Stock ripgrep 15.1.0 (default 13 threads)
 - **U0**: Stock ugrep 7.8.5 (default 13 threads)
 - **G2**: Distro GNU grep 3.12 (1 thread)
@@ -26,11 +26,11 @@
 | `B-03` | moderate, line numbers ($BIG) | 934.2 ms | 40.6 ms | 246.2 ms | 433.6 ms | **22.99×** | 3.79× | 2.15× | **6.06×** | **10.67×** | 0.87 | 0.25 | 0.43 | 1375M | 1392M | 38M | **PASS** | PASS | PASS |
 | `B-04` | DFA regex ($BIG) | 434.7 ms | 20.0 ms | 173.8 ms | 429.0 ms | **21.75×** | 2.50× | 1.01× | **8.69×** | **21.46×** | 0.39 | 0.17 | 0.43 | 1375M | 1392M | 38M | **PASS** | PASS | PASS |
 | `B-05` | case-insensitive dense ($BIG) | 1.97 s | 44.8 ms | 300.3 ms | 300.6 ms | **43.93×** | 6.55× | 6.55× | **6.71×** | **6.71×** | 0.98 | 0.30 | 0.30 | 1375M | 1392M | 38M | **PASS** | PASS | PASS |
-| `B-06` | word match ($BIG) | 370.8 ms | 23.0 ms | 180.6 ms | 239.2 ms | **16.12×** | 2.05× | 1.55× | **7.85×** | **10.40×** | 0.46 | 0.18 | 0.24 | 1377M | 1391M | 38M | **PASS** | PASS | PASS |
+| `B-06` | word match ($BIG) | 370.8 ms | 17.8 ms | 180.6 ms | 239.2 ms | **20.83×** | 2.05× | 1.55× | **10.15×** | **13.43×** | 0.35 | 0.18 | 0.24 | 1379M | 1391M | 38M | **PASS** | PASS | PASS |
 | `B-07` | literal-free regex ($BIG) | 663.0 ms | 30.1 ms | 1.58 s | 226.5 ms | **22.05×** | 0.42× | 2.93× | **52.40×** | **7.53×** | 0.66 | 1.58 | 0.23 | 1377M | 1391M | 38M | **PASS** | PASS | PASS |
 | `B-08` | PCRE2 lookaround ($BIG) | 21.40 s | 164.4 ms | 21.61 s | 20.81 s | **130.13×** | 0.99× | 1.03× | **131.41×** | **126.53×** | 2.38 | 21.63 | 20.79 | 1440M | 1394M | 38M | **PASS** | PASS | PASS |
 | `B-09` | context ($BIG) | 916.9 ms | 36.6 ms | 272.8 ms | 380.3 ms | **25.06×** | 3.36× | 2.41× | **7.46×** | **10.39×** | 0.82 | 0.27 | 0.38 | 1374M | 1391M | 38M | **PASS** | PASS | PASS |
-| `B-10` | only-matching ($BIG) | 767.3 ms | 41.9 ms | 188.0 ms | 245.6 ms | **18.32×** | 4.08× | 3.12× | **4.49×** | **5.87×** | 0.66 | 0.19 | 0.25 | 1377M | 1392M | 38M | **PASS** | PASS | PASS |
+| `B-10` | only-matching ($BIG) | 767.3 ms | 41.6 ms | 188.0 ms | 245.6 ms | **18.43×** | 4.08× | 3.12× | **4.51×** | **5.90×** | 0.68 | 0.19 | 0.25 | 1373M | 1392M | 38M | **PASS** | PASS | PASS |
 | `B-11` | inverted count ($BIG) | 978.8 ms | 46.0 ms | 1.46 s | 1.06 s | **21.28×** | 0.67× | 0.93× | **31.80×** | **22.95×** | 1.00 | 1.46 | 1.05 | 1380M | 1391M | 38M | **PASS** | PASS | PASS |
 | `B-12` | stdin redirect (< $BIG) | 530.7 ms | 21.3 ms | 256.7 ms | 349.8 ms | **24.89×** | 2.07× | 1.52× | **12.04×** | **16.40×** | 0.44 | 0.26 | 0.35 | 1377M | 38M | 38M | **PASS** | PASS | PASS |
 | `B-13` | FIFO pipe (cat $BIG \\|) | 1.14 s | 651.3 ms | 853.2 ms | 813.5 ms | **1.74×** | 1.33× | 1.40× | **1.31×** | **1.25×** | 0.88 | 0.62 | 0.73 | 38M | 38M | 38M | **PASS** | PASS | PASS |
@@ -73,7 +73,7 @@
 | `T-25b` | quiet, immediate match | 2.7 ms | 2.7 ms | 6.0 ms | 12.5 ms | **1.00×** | 0.46× | 0.22× | **2.19×** | **4.59×** | 0.00 | 0.01 | 0.05 | 38M | 38M | 38M | **PASS** | PASS | PASS |
 | `T-26` | byte offsets | 4.44 s | 152.0 ms | 363.0 ms | 467.2 ms | **29.18×** | 12.22× | 9.49× | **2.39×** | **3.07×** | 4.52 | 4.27 | 5.82 | 38M | 38M | 38M | **PASS** | PASS | KNOWN-SEMANTIC |
 | `T-27` | sub-scope drivers/ | 2.01 s | 73.6 ms | 165.1 ms | 212.2 ms | **27.35×** | 12.18× | 9.48× | **2.24×** | **2.88×** | 1.95 | 1.90 | 2.51 | 51M | 51M | 51M | **PASS** | PASS | PASS |
-| `T-28` | sub-scope kernel mm fs | 168.2 ms | 17.1 ms | 19.1 ms | 24.5 ms | **9.83×** | 8.79× | 6.86× | **1.12×** | **1.43×** | 0.17 | 0.16 | 0.21 | 51M | 51M | 51M | **PASS** | PASS | PASS |
+| `T-28` | sub-scope kernel mm fs | 168.2 ms | 16.0 ms | 19.1 ms | 24.5 ms | **10.54×** | 8.79× | 6.86× | **1.20×** | **1.54×** | 0.17 | 0.16 | 0.21 | 37M | 51M | 51M | **PASS** | PASS | PASS |
 | `U-01` | out-of-the-box UX | 4.41 s | 151.3 ms | 390.7 ms | 462.8 ms | **29.11×** | 11.28× | 9.52× | **2.58×** | **3.06×** | 4.54 | 4.58 | 5.78 | 51M | 51M | 51M | **PASS** | PASS | PASS |
 | `U-02` | naive invocation (scans 6 GB .git) | 6.09 s | 236.5 ms | 390.5 ms* | 466.1 ms* | **25.74×** | 15.58× | 13.06× | **1.65×** | **1.97×** | 5.35 | 4.59 | 5.82 | 1772M | 51M | 51M | **PASS** | N/A | N/A |
 | `X-01` | git ls-files \\| xargs | 4.22 s | 479.4 ms | 1.09 s | 1.53 s | **8.81×** | 3.88× | 2.76× | **2.27×** | **3.19×** | 5.30 | 5.57 | 8.04 | 51M | 51M | 51M | **PASS** | PASS | PASS |
@@ -85,16 +85,16 @@
 
 | Scenarios | N | G1 vs G0 | U0 (12t) vs G0 | U0 (-J 32) vs G0 | G1 vs U0 (12t) | G1 vs U0 (-J 32) | W/T/L vs U0 (12t) | W/T/L vs U0 (-J 32) |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| All | 59 | 22.07× | 5.10× | 3.68× | **4.33×** | **6.00×** | 58/1/0 | 58/1/0 |
-| Category B | 14 | 19.51× | 1.83× | 1.81× | **10.65×** | **10.79×** | 14/0/0 | 14/0/0 |
-| Category T | 29 | 22.54× | 6.75× | 4.04× | **3.34×** | **5.58×** | 29/0/0 | 29/0/0 |
+| All | 59 | 22.20× | 5.10× | 3.68× | **4.35×** | **6.03×** | 58/1/0 | 58/1/0 |
+| Category B | 14 | 19.88× | 1.83× | 1.81× | **10.85×** | **10.99×** | 14/0/0 | 14/0/0 |
+| Category T | 29 | 22.59× | 6.75× | 4.04× | **3.35×** | **5.59×** | 29/0/0 | 29/0/0 |
 | Category M | 6 | 125.89× | 25.06× | 18.71× | **5.02×** | **6.73×** | 6/0/0 | 6/0/0 |
 | Category L | 4 | 1.04× | 0.71× | 0.66× | **1.47×** | **1.58×** | 3/1/0 | 3/1/0 |
 | Category U | 2 | 27.37× | 11.15× | 5.29× | **2.46×** | **5.18×** | 2/0/0 | 2/0/0 |
 | Category X | 1 | 8.81× | 2.76× | 2.19× | **3.19×** | **4.03×** | 1/0/0 | 1/0/0 |
 | Category P | 3 | 68.33× | 17.19× | 14.85× | **3.97×** | **4.60×** | 3/0/0 | 3/0/0 |
 
-> G1 at 12 threads vs U0 at its default (12 threads): **2.32×** geometric mean over 40 scenarios (40 Wins / 0 Ties / 0 Losses); Category T: **2.02×** (29 Wins / 0 Ties / 0 Losses). Ties are within ±2%.
+> G1 at 12 threads vs U0 at its default (12 threads): **2.32×** geometric mean over 40 scenarios (40 Wins / 0 Ties / 0 Losses); Category T: **2.03×** (29 Wins / 0 Ties / 0 Losses). Ties are within ±2%.
 
 ## 3. Correctness & Equivalence Gates
 
@@ -139,7 +139,7 @@ Detailed equivalence records are available in [equivalence.md](./equivalence.md)
 | `T-25b` | quiet, immediate match | 2.7 ms | 2.7 ms | 6.0 ms | 12.5 ms | **1.00×** | **2.19×** | **4.59×** | 0.00 | 0.01 | 38M | 38M | **PASS** |
 | `T-26` | byte offsets | 4.44 s | 152.0 ms | 363.0 ms | 467.2 ms | **29.18×** | **2.39×** | **3.07×** | 4.52 | 4.27 | 38M | 38M | **PASS** |
 | `T-27` | sub-scope drivers/ | 2.01 s | 73.6 ms | 165.1 ms | 212.2 ms | **27.35×** | **2.24×** | **2.88×** | 1.95 | 1.90 | 51M | 51M | **PASS** |
-| `T-28` | sub-scope kernel mm fs | 168.2 ms | 17.1 ms | 19.1 ms | 24.5 ms | **9.83×** | **1.12×** | **1.43×** | 0.17 | 0.16 | 51M | 51M | **PASS** |
+| `T-28` | sub-scope kernel mm fs | 168.2 ms | 16.0 ms | 19.1 ms | 24.5 ms | **10.54×** | **1.20×** | **1.54×** | 0.17 | 0.16 | 37M | 51M | **PASS** |
 
 ### Category B — Single Huge File ($BIG ≈ 1.45 GB)
 
@@ -150,11 +150,11 @@ Detailed equivalence records are available in [equivalence.md](./equivalence.md)
 | `B-03` | moderate, line numbers ($BIG) | 934.2 ms | 40.6 ms | 246.2 ms | 433.6 ms | **22.99×** | **6.06×** | **10.67×** | 0.87 | 0.25 | 1375M | 1392M | **PASS** |
 | `B-04` | DFA regex ($BIG) | 434.7 ms | 20.0 ms | 173.8 ms | 429.0 ms | **21.75×** | **8.69×** | **21.46×** | 0.39 | 0.17 | 1375M | 1392M | **PASS** |
 | `B-05` | case-insensitive dense ($BIG) | 1.97 s | 44.8 ms | 300.3 ms | 300.6 ms | **43.93×** | **6.71×** | **6.71×** | 0.98 | 0.30 | 1375M | 1392M | **PASS** |
-| `B-06` | word match ($BIG) | 370.8 ms | 23.0 ms | 180.6 ms | 239.2 ms | **16.12×** | **7.85×** | **10.40×** | 0.46 | 0.18 | 1377M | 1391M | **PASS** |
+| `B-06` | word match ($BIG) | 370.8 ms | 17.8 ms | 180.6 ms | 239.2 ms | **20.83×** | **10.15×** | **13.43×** | 0.35 | 0.18 | 1379M | 1391M | **PASS** |
 | `B-07` | literal-free regex ($BIG) | 663.0 ms | 30.1 ms | 1.58 s | 226.5 ms | **22.05×** | **52.40×** | **7.53×** | 0.66 | 1.58 | 1377M | 1391M | **PASS** |
 | `B-08` | PCRE2 lookaround ($BIG) | 21.40 s | 164.4 ms | 21.61 s | 20.81 s | **130.13×** | **131.41×** | **126.53×** | 2.38 | 21.63 | 1440M | 1394M | **PASS** |
 | `B-09` | context ($BIG) | 916.9 ms | 36.6 ms | 272.8 ms | 380.3 ms | **25.06×** | **7.46×** | **10.39×** | 0.82 | 0.27 | 1374M | 1391M | **PASS** |
-| `B-10` | only-matching ($BIG) | 767.3 ms | 41.9 ms | 188.0 ms | 245.6 ms | **18.32×** | **4.49×** | **5.87×** | 0.66 | 0.19 | 1377M | 1392M | **PASS** |
+| `B-10` | only-matching ($BIG) | 767.3 ms | 41.6 ms | 188.0 ms | 245.6 ms | **18.43×** | **4.51×** | **5.90×** | 0.68 | 0.19 | 1373M | 1392M | **PASS** |
 | `B-11` | inverted count ($BIG) | 978.8 ms | 46.0 ms | 1.46 s | 1.06 s | **21.28×** | **31.80×** | **22.95×** | 1.00 | 1.46 | 1380M | 1391M | **PASS** |
 | `B-12` | stdin redirect (< $BIG) | 530.7 ms | 21.3 ms | 256.7 ms | 349.8 ms | **24.89×** | **12.04×** | **16.40×** | 0.44 | 0.26 | 1377M | 38M | **PASS** |
 | `B-13` | FIFO pipe (cat $BIG \\|) | 1.14 s | 651.3 ms | 853.2 ms | 813.5 ms | **1.74×** | **1.31×** | **1.25×** | 0.88 | 0.62 | 38M | 38M | **PASS** |
@@ -400,7 +400,7 @@ Detailed equivalence records are available in [equivalence.md](./equivalence.md)
 | `T-27` | **G1** | — | — | — | — | 125.2 ms (16.1×) | — | — | — | — | — | — | — | **16.07×** |
 | `T-27` | **R0** | — | — | — | — | — | — | — | 86.9 ms (23.2×) | — | — | — | — | **23.15×** |
 | `T-27` | **U0** | — | — | — | — | — | — | — | 394.2 ms (5.1×) | — | — | — | — | **5.10×** |
-| `T-28` | **G1** | — | — | — | — | 16.1 ms (10.5×) | — | — | — | — | — | — | — | **10.47×** |
+| `T-28` | **G1** | — | — | — | — | 15.9 ms (10.6×) | — | — | — | — | — | — | — | **10.56×** |
 | `T-28` | **R0** | — | — | — | — | — | — | — | 15.1 ms (11.2×) | — | — | — | — | **11.16×** |
 | `T-28` | **U0** | — | — | — | — | — | — | — | 40.4 ms (4.2×) | — | — | — | — | **4.17×** |
 | `P-01` | **G1** | — | — | — | — | 567.5 ms (73.1×) | — | — | — | — | — | — | — | **73.09×** |
@@ -424,11 +424,11 @@ Detailed equivalence records are available in [equivalence.md](./equivalence.md)
 | `B-03` | B | moderate, line numbers ($BIG) | 934.2 ms | — | 246.2 ms | **—** | 40.6 ms | 247.9 ms | **6.10×** | **6.06×** |
 | `B-04` | B | DFA regex ($BIG) | 434.7 ms | 29.3 ms | 173.8 ms | **5.93×** | 20.0 ms | 174.0 ms | **8.70×** | **8.69×** |
 | `B-05` | B | case-insensitive dense ($BIG) | 1.97 s | — | 300.3 ms | **—** | 44.8 ms | 301.9 ms | **6.74×** | **6.71×** |
-| `B-06` | B | word match ($BIG) | 370.8 ms | — | 180.6 ms | **—** | 23.0 ms | 183.4 ms | **7.97×** | **7.85×** |
+| `B-06` | B | word match ($BIG) | 370.8 ms | — | 180.6 ms | **—** | 17.8 ms | 183.4 ms | **10.30×** | **10.15×** |
 | `B-07` | B | literal-free regex ($BIG) | 663.0 ms | — | 1.58 s | **—** | 30.1 ms | 1.57 s | **52.34×** | **52.40×** |
 | `B-08` | B | PCRE2 lookaround ($BIG) | 21.40 s | — | 21.61 s | **—** | 164.4 ms | 21.63 s | **131.52×** | **131.41×** |
 | `B-09` | B | context ($BIG) | 916.9 ms | — | 272.8 ms | **—** | 36.6 ms | 277.1 ms | **7.57×** | **7.46×** |
-| `B-10` | B | only-matching ($BIG) | 767.3 ms | — | 188.0 ms | **—** | 41.9 ms | 194.3 ms | **4.64×** | **4.49×** |
+| `B-10` | B | only-matching ($BIG) | 767.3 ms | — | 188.0 ms | **—** | 41.6 ms | 194.3 ms | **4.67×** | **4.51×** |
 | `B-11` | B | inverted count ($BIG) | 978.8 ms | — | 1.46 s | **—** | 46.0 ms | 1.46 s | **31.76×** | **31.80×** |
 | `B-12` | B | stdin redirect (< $BIG) | 530.7 ms | — | 256.7 ms | **—** | 21.3 ms | 258.9 ms | **12.14×** | **12.04×** |
 | `B-13` | B | FIFO pipe (cat $BIG \\|) | 1.14 s | — | 853.2 ms | **—** | 651.3 ms | 931.6 ms | **1.43×** | **1.31×** |
@@ -471,7 +471,7 @@ Detailed equivalence records are available in [equivalence.md](./equivalence.md)
 | `T-25b` | T | quiet, immediate match | 2.7 ms | 2.6 ms | 6.0 ms | **2.33×** | 2.7 ms | 7.1 ms | **2.60×** | **2.19×** |
 | `T-26` | T | byte offsets | 4.44 s | 283.5 ms | 363.0 ms | **1.28×** | 152.0 ms | 176.3 ms | **1.16×** | **2.39×** |
 | `T-27` | T | sub-scope drivers/ | 2.01 s | 125.2 ms | 165.1 ms | **1.32×** | 73.6 ms | 86.9 ms | **1.18×** | **2.24×** |
-| `T-28` | T | sub-scope kernel mm fs | 168.2 ms | 16.1 ms | 19.1 ms | **1.19×** | 17.1 ms | 15.1 ms | **0.88×** | **1.12×** |
+| `T-28` | T | sub-scope kernel mm fs | 168.2 ms | 15.9 ms | 19.1 ms | **1.20×** | 16.0 ms | 15.1 ms | **0.94×** | **1.20×** |
 | `U-01` | U | out-of-the-box UX | 4.41 s | — | 390.7 ms | **—** | 151.3 ms | 207.0 ms | **1.37×** | **2.58×** |
 | `U-02` | U | naive invocation (scans 6 GB .git) | 6.09 s | — | 390.5 ms | **—** | 236.5 ms | 209.5 ms | **0.89×** | **1.65×** |
 | `X-01` | X | git ls-files \\| xargs | 4.22 s | — | 1.09 s | **—** | 479.4 ms | 960.1 ms | **2.00×** | **2.27×** |
@@ -490,11 +490,11 @@ Detailed equivalence records are available in [equivalence.md](./equivalence.md)
 | `B-03` | B | moderate, line numbers ($BIG) | 934.2 ms | — | 433.6 ms | **—** | 40.6 ms | 433.2 ms | **10.66×** | **10.67×** |
 | `B-04` | B | DFA regex ($BIG) | 434.7 ms | 29.3 ms | 429.0 ms | **14.64×** | 20.0 ms | 431.5 ms | **21.58×** | **21.46×** |
 | `B-05` | B | case-insensitive dense ($BIG) | 1.97 s | — | 300.6 ms | **—** | 44.8 ms | 304.1 ms | **6.79×** | **6.71×** |
-| `B-06` | B | word match ($BIG) | 370.8 ms | — | 239.2 ms | **—** | 23.0 ms | 240.8 ms | **10.47×** | **10.40×** |
+| `B-06` | B | word match ($BIG) | 370.8 ms | — | 239.2 ms | **—** | 17.8 ms | 240.8 ms | **13.53×** | **13.43×** |
 | `B-07` | B | literal-free regex ($BIG) | 663.0 ms | — | 226.5 ms | **—** | 30.1 ms | 228.0 ms | **7.58×** | **7.53×** |
 | `B-08` | B | PCRE2 lookaround ($BIG) | 21.40 s | — | 20.81 s | **—** | 164.4 ms | 20.85 s | **126.77×** | **126.53×** |
 | `B-09` | B | context ($BIG) | 916.9 ms | — | 380.3 ms | **—** | 36.6 ms | 383.5 ms | **10.48×** | **10.39×** |
-| `B-10` | B | only-matching ($BIG) | 767.3 ms | — | 245.6 ms | **—** | 41.9 ms | 246.6 ms | **5.89×** | **5.87×** |
+| `B-10` | B | only-matching ($BIG) | 767.3 ms | — | 245.6 ms | **—** | 41.6 ms | 246.6 ms | **5.92×** | **5.90×** |
 | `B-11` | B | inverted count ($BIG) | 978.8 ms | — | 1.06 s | **—** | 46.0 ms | 1.06 s | **22.97×** | **22.95×** |
 | `B-12` | B | stdin redirect (< $BIG) | 530.7 ms | — | 349.8 ms | **—** | 21.3 ms | 352.8 ms | **16.54×** | **16.40×** |
 | `B-13` | B | FIFO pipe (cat $BIG \\|) | 1.14 s | — | 813.5 ms | **—** | 651.3 ms | 894.5 ms | **1.37×** | **1.25×** |
@@ -537,7 +537,7 @@ Detailed equivalence records are available in [equivalence.md](./equivalence.md)
 | `T-25b` | T | quiet, immediate match | 2.7 ms | 2.6 ms | 12.5 ms | **4.90×** | 2.7 ms | 11.5 ms | **4.20×** | **4.59×** |
 | `T-26` | T | byte offsets | 4.44 s | 283.5 ms | 467.2 ms | **1.65×** | 152.0 ms | 985.5 ms | **6.48×** | **3.07×** |
 | `T-27` | T | sub-scope drivers/ | 2.01 s | 125.2 ms | 212.2 ms | **1.69×** | 73.6 ms | 394.2 ms | **5.36×** | **2.88×** |
-| `T-28` | T | sub-scope kernel mm fs | 168.2 ms | 16.1 ms | 24.5 ms | **1.53×** | 17.1 ms | 40.4 ms | **2.36×** | **1.43×** |
+| `T-28` | T | sub-scope kernel mm fs | 168.2 ms | 15.9 ms | 24.5 ms | **1.54×** | 16.0 ms | 40.4 ms | **2.53×** | **1.54×** |
 | `U-01` | U | out-of-the-box UX | 4.41 s | — | 462.8 ms | **—** | 151.3 ms | 980.6 ms | **6.48×** | **3.06×** |
 | `U-02` | U | naive invocation (scans 6 GB .git) | 6.09 s | — | 466.1 ms | **—** | 236.5 ms | 978.7 ms | **4.14×** | **1.97×** |
 | `X-01` | X | git ls-files \\| xargs | 4.22 s | — | 1.53 s | **—** | 479.4 ms | 1.93 s | **4.03×** | **3.19×** |

@@ -2,7 +2,7 @@
 # Multi-Threaded GNU Grep: Benchmark & Performance Evaluation
 
 > Comprehensive performance, scalability, and correctness evaluation comparing
-> our parallel multi-threaded GNU `grep` fork (`G1`, commit `76d3503`, default 32 worker threads)
+> our parallel multi-threaded GNU `grep` fork (`G1`, commit `c632568`, default 32 worker threads)
 > against upstream GNU `grep` baseline (`G0`, version 3.12.41, 1 thread), stock `ripgrep` (`R0`,
 > version 15.1.0 with PCRE2, evaluated both at its default 12 worker threads and at thread-matched `-j 32`),
 > and stock `ugrep` (`U0`, version 7.8.5 with PCRE2, evaluated both at its default 12 worker threads and at thread-matched `-J 32`).
@@ -27,9 +27,9 @@ at its default, at thread-matched `ugrep -J 32`, and against `G1` at 12 threads.
 
 | Metric | G1 (32t) vs Stock G0 (1t) | R0 Default (12t) vs G0 (1t) | R0 Matched (-j 32) vs G0 (1t) | G1 (32t) vs R0 Default (12t) | G1 (32t) vs R0 Matched (-j 32) |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **Geometric Mean Speedup (All 59 Scenarios)** | **22.07×** | **5.70×** | **7.96×** | **3.87×** | **2.77×** |
-| **Category B — Single Huge File (14 Scenarios)** | **19.51×** | 1.99× | 1.96× | **9.81×** | **9.94×** |
-| **Category T — Tree Traversal (29 Scenarios)** | **22.54×** | 8.45× | 13.29× | **2.67×** | **1.70×** |
+| **Geometric Mean Speedup (All 59 Scenarios)** | **22.20×** | **5.70×** | **7.96×** | **3.89×** | **2.79×** |
+| **Category B — Single Huge File (14 Scenarios)** | **19.88×** | 1.99× | 1.96× | **9.99×** | **10.13×** |
+| **Category T — Tree Traversal (29 Scenarios)** | **22.59×** | 8.45× | 13.29× | **2.67×** | **1.70×** |
 | **Category M — Multi-Pattern Sets (6 Scenarios)** | **125.89×** | 15.73× | 28.16× | **8.01×** | **4.47×** |
 | **Category L — Invocation Latency (4 Scenarios)** | **1.04×** (zero pool cost) | 0.84× | 0.77× | **1.24×** | **1.36×** |
 | **Category U — UX & Defaults (2 Scenarios)** | **27.37×** | 13.26× | 24.87× | **2.06×** | **1.10×** |
@@ -48,9 +48,9 @@ at its default, at thread-matched `ugrep -J 32`, and against `G1` at 12 threads.
 
 | Metric | G1 (32t) vs Stock G0 (1t) | U0 Default (12t) vs G0 (1t) | U0 Matched (-J 32) vs G0 (1t) | G1 (32t) vs U0 Default (12t) | G1 (32t) vs U0 Matched (-J 32) |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **Geometric Mean Speedup (All 59 Scenarios)** | **22.07×** | **5.10×** | **3.68×** | **4.33×** | **6.00×** |
-| **Category B — Single Huge File (14 Scenarios)** | **19.51×** | 1.83× | 1.81× | **10.65×** | **10.79×** |
-| **Category T — Tree Traversal (29 Scenarios)** | **22.54×** | 6.75× | 4.04× | **3.34×** | **5.58×** |
+| **Geometric Mean Speedup (All 59 Scenarios)** | **22.20×** | **5.10×** | **3.68×** | **4.35×** | **6.03×** |
+| **Category B — Single Huge File (14 Scenarios)** | **19.88×** | 1.83× | 1.81× | **10.85×** | **10.99×** |
+| **Category T — Tree Traversal (29 Scenarios)** | **22.59×** | 6.75× | 4.04× | **3.35×** | **5.59×** |
 | **Category M — Multi-Pattern Sets (6 Scenarios)** | **125.89×** | 25.06× | 18.71× | **5.02×** | **6.73×** |
 | **Category L — Invocation Latency (4 Scenarios)** | **1.04×** (zero pool cost) | 0.71× | 0.66× | **1.47×** | **1.58×** |
 | **Category U — UX & Defaults (2 Scenarios)** | **27.37×** | 11.15× | 5.29× | **2.46×** | **5.18×** |
@@ -61,7 +61,7 @@ at its default, at thread-matched `ugrep -J 32`, and against `G1` at 12 threads.
 > **Fair 12-Thread Matched Comparison (G1 @ 12t vs U0 @ 12t on 40 Scenarios):**
 > Across the 40 matched scenarios (37 tree scenarios plus single-file B-01/B-04/M-06), G1 running on the same 12 threads
 > achieves a **2.32× geometric mean speedup** over `ugrep` (**40 Wins / 0 Ties / 0 Losses**)!
-> In Category T alone, G1 @ 12t beats U0 @ 12t with a **2.02× geomean** (**29 Wins / 0 Ties / 0 Losses**).
+> In Category T alone, G1 @ 12t beats U0 @ 12t with a **2.03× geomean** (**29 Wins / 0 Ties / 0 Losses**).
 
 > Win / tie / loss counts treat speedups within ±2% as ties.
 
@@ -69,20 +69,20 @@ at its default, at thread-matched `ugrep -J 32`, and against `G1` at 12 threads.
 
 1. **Decisive Multi-Core Speedup Over Stock GNU Grep:**
    - On whole-tree searches across the 96,034-file Linux kernel tree, G1 accelerates execution from seconds to sub-second
-     runtimes (**150–287 ms**, a **22.54×** category geometric mean speedup).
+     runtimes (**150–287 ms**, a **22.59×** category geometric mean speedup).
    - On massive multi-pattern dictionary searches (100 to 10,000 keywords), G1 delivers up to **513.02×** speedup over G0 (`M-04`, 186.2 ms vs 95.54 s)
      and **216.59×** on large single files (`M-06`, 41.2 ms vs 8.92 s) via parallelized dense Aho-Corasick DFA and SIMD pre-filtering.
    - On complex regexes (`Category P`), G1 achieves **159.33×** speedup on backreferences (`P-01`, 260.4 ms vs 41.48 s) and **81.17×** on 1,000-way alternations (`P-02`, 185.8 ms vs 15.08 s).
    - On a 1.45 GB single file, intra-file chunking yields up to **130.13×** speedup over G0 on PCRE2 lookaround (`B-08`, 164.4 ms vs 21.40 s) and **43.93×** on case-insensitive search (`B-05`, 44.8 ms vs 1.97 s).
 
 2. **Unprecedented Performance vs Ripgrep (Out-of-the-Box 12t AND Thread-Matched `-j 32`):**
-   - **Overall Geometric Mean:** Across all 59 scenarios, G1 is **3.87× faster** than default `ripgrep` (58 Wins / 1 Tie / 0 Losses)
-     and **2.77× faster** than thread-matched `ripgrep -j 32` (52 Wins / 3 Ties / 4 Losses).
-   - **Single Large Files (14/14 Wins at both 12t and 32t, 9.81×–9.94× geomean):** Ripgrep processes individual files using a single thread
+   - **Overall Geometric Mean:** Across all 59 scenarios, G1 is **3.89× faster** than default `ripgrep` (58 Wins / 1 Tie / 0 Losses)
+     and **2.79× faster** than thread-matched `ripgrep -j 32` (52 Wins / 3 Ties / 4 Losses).
+   - **Single Large Files (14/14 Wins at both 12t and 32t, 9.99×–10.13× geomean):** Ripgrep processes individual files using a single thread
      regardless of `-j`; our intra-file parallel chunking outperforms `ripgrep -j 32` by **1.43× to 131.52×** (and **75.36×** on 1,000-keyword matching `M-06`).
    - **Whole-Tree Traversal (2.67× geomean vs R0 12t; 1.70× geomean vs R0 `-j 32`):**
      - Against out-of-the-box `ripgrep` (12t), G1 wins **all 29 of 29** tree scenarios (including `T-25b` immediate first-file exit at **2.7 ms vs 6.0 ms**, **2.19×**).
-     - When `ripgrep` is explicitly given `-j 32` (`32` threads), G1 beats or ties `ripgrep -j 32` in **26 of 29** tree scenarios and loses only 3 (`T-02` rare literal, 198.1 ms vs 159.6 ms; `T-18` only-matching, 205.6 ms vs 194.1 ms; `T-28` sub-scope `kernel mm fs`, 17.1 ms vs 15.1 ms):
+     - When `ripgrep` is explicitly given `-j 32` (`32` threads), G1 beats or ties `ripgrep -j 32` in **26 of 29** tree scenarios and loses only 3 (`T-02` rare literal, 198.1 ms vs 159.6 ms; `T-18` only-matching, 205.6 ms vs 194.1 ms; `T-28` sub-scope `kernel mm fs`, 16.0 ms vs 15.1 ms):
        G1 dominates high-output, count-based, PCRE2, and sparse tree scans (`T-04` dense line numbers: **158.1 ms vs 512.6 ms**, **3.24×**;
        `T-05` very dense literal: **287.3 ms vs 979.0 ms**, **3.41×**; `T-08` count per file: **151.2 ms vs 1.44 s**, **9.49×**;
        `T-09` case-insensitive: **161.1 ms vs 928.0 ms**, **5.76×**; `T-12` anchored dense regex: **166.0 ms vs 682.1 ms**, **4.11×**;
@@ -95,10 +95,10 @@ at its default, at thread-matched `ugrep -J 32`, and against `G1` at 12 threads.
      `M-05` (1,000 literals `-w`: **173.5 ms vs 404.5 ms**, **2.33×**), and `M-06` (`$BIG`: **41.2 ms vs 3.11 s**, **75.36×**).
 
 3. **Performance vs ugrep (Out-of-the-Box 12t AND Thread-Matched `-J 32`):**
-   - **Overall Geometric Mean:** Across all 59 scenarios, G1 is **4.33× faster** than default `ugrep` (58 Wins / 1 Tie / 0 Losses)
-     and **6.00× faster** than thread-matched `ugrep -J 32` (58 Wins / 1 Tie / 0 Losses).
-   - **Single Large Files (10.65× geomean vs U0 12t; 10.79× vs U0 `-J 32`):** 14 Wins / 0 Ties / 0 Losses at the default, 14 Wins / 0 Ties / 0 Losses at `-J 32`.
-   - **Whole-Tree Traversal (3.34× geomean vs U0 12t; 5.58× vs U0 `-J 32`):** 29 Wins / 0 Ties / 0 Losses at the default, 29 Wins / 0 Ties / 0 Losses at `-J 32`.
+   - **Overall Geometric Mean:** Across all 59 scenarios, G1 is **4.35× faster** than default `ugrep` (58 Wins / 1 Tie / 0 Losses)
+     and **6.03× faster** than thread-matched `ugrep -J 32` (58 Wins / 1 Tie / 0 Losses).
+   - **Single Large Files (10.85× geomean vs U0 12t; 10.99× vs U0 `-J 32`):** 14 Wins / 0 Ties / 0 Losses at the default, 14 Wins / 0 Ties / 0 Losses at `-J 32`.
+   - **Whole-Tree Traversal (3.35× geomean vs U0 12t; 5.59× vs U0 `-J 32`):** 29 Wins / 0 Ties / 0 Losses at the default, 29 Wins / 0 Ties / 0 Losses at `-J 32`.
    - **Multi-Pattern Dictionary Searches (5.02× geomean vs U0 12t; 6.73× vs U0 `-J 32`):** 6 Wins / 0 Ties / 0 Losses at the default, 6 Wins / 0 Ties / 0 Losses at `-J 32`.
    - **Complex Regexes (3.97× geomean vs U0 12t; 4.60× vs U0 `-J 32`):** 3 Wins / 0 Ties / 0 Losses at the default, 3 Wins / 0 Ties / 0 Losses at `-J 32`.
 
@@ -153,7 +153,7 @@ at its default, at thread-matched `ugrep -J 32`, and against `G1` at 12 threads.
 | Tool Identifier | Binary Name & Role | Version | Compiler Flags / Build Details | Default Threads | Binary SHA-256 Checksum |
 | :--- | :--- | :---: | :--- | :---: | :--- |
 | **`G0`** | Upstream Stock Baseline GNU grep | `3.12.41` | `./configure CFLAGS='-g -O3 -march=native'` | 1 | `ffbb6be702d1af4269dd63e208fef019b408fdb14b139e705aac67e82c5d77cf` |
-| **`G1`** | Parallel Multi-Threaded GNU grep | `3.12.131` (`76d3503`) | `-pthread -O3 -march=native -flto=auto -fno-plt -fomit-frame-pointer -falign-functions=32 -falign-loops=32`, AVX2 kernels | 33 (32 workers + main) | `2bf59acfd26de0edaa50474d260a1b4a2874a0919af98dc79526070d778667fb` |
+| **`G1`** | Parallel Multi-Threaded GNU grep | `3.12.131` (`c632568`) | `-pthread -O3 -march=native -flto=auto -fno-plt -fomit-frame-pointer -falign-functions=32 -falign-loops=32`, AVX2 kernels | 33 (32 workers + main) | `ebf87ce79a233adfc9e59a501d28bcb73a13935357ee19940f178ccc4237656b` |
 | **`R0`** | Stock Ripgrep | `15.1.0` | Official release binary (`+pcre2`, SIMD/AVX2 runtime) | 13 (12 workers + main; also tested with `-j 32`) | `5c3dddf97a3a0740db7e91a91706299a01fceb9371b66a2ed076c998a9e8e04d` |
 | **`U0`** | Stock ugrep | `7.8.5` | Upstream release tarball built with its `./build.sh` defaults (`-O2`, runtime AVX2 dispatch, PCRE2 JIT) | 13 (12 workers + main; also tested with `-J 32`) | `7c952446726bceeaf0996931109d876b1bf3420aae0bec16902307554effd4c5` |
 
@@ -172,11 +172,11 @@ Both `R0 (12t)` (ripgrep's out-of-the-box 12-thread cap) and `R0 (-j 32)` (threa
 | `B-03` | moderate, line numbers ($BIG) | 934.2 ms | 40.6 ms | 246.2 ms | 247.9 ms | **22.99×** | **6.06×** | **6.10×** | 0.87 | 0.25 | 0.25 | 1375M | 1392M | **PASS** | PASS |
 | `B-04` | DFA regex ($BIG) | 434.7 ms | 20.0 ms | 173.8 ms | 174.0 ms | **21.75×** | **8.69×** | **8.70×** | 0.39 | 0.17 | 0.17 | 1375M | 1392M | **PASS** | PASS |
 | `B-05` | case-insensitive dense ($BIG) | 1.97 s | 44.8 ms | 300.3 ms | 301.9 ms | **43.93×** | **6.71×** | **6.74×** | 0.98 | 0.30 | 0.30 | 1375M | 1392M | **PASS** | PASS |
-| `B-06` | word match ($BIG) | 370.8 ms | 23.0 ms | 180.6 ms | 183.4 ms | **16.12×** | **7.85×** | **7.97×** | 0.46 | 0.18 | 0.18 | 1377M | 1391M | **PASS** | PASS |
+| `B-06` | word match ($BIG) | 370.8 ms | 17.8 ms | 180.6 ms | 183.4 ms | **20.83×** | **10.15×** | **10.30×** | 0.35 | 0.18 | 0.18 | 1379M | 1391M | **PASS** | PASS |
 | `B-07` | literal-free regex ($BIG) | 663.0 ms | 30.1 ms | 1.58 s | 1.57 s | **22.05×** | **52.40×** | **52.34×** | 0.66 | 1.58 | 1.57 | 1377M | 1391M | **PASS** | PASS |
 | `B-08` | PCRE2 lookaround ($BIG) | 21.40 s | 164.4 ms | 21.61 s | 21.63 s | **130.13×** | **131.41×** | **131.52×** | 2.38 | 21.63 | 21.61 | 1440M | 1394M | **PASS** | PASS |
 | `B-09` | context ($BIG) | 916.9 ms | 36.6 ms | 272.8 ms | 277.1 ms | **25.06×** | **7.46×** | **7.57×** | 0.82 | 0.27 | 0.28 | 1374M | 1391M | **PASS** | PASS |
-| `B-10` | only-matching ($BIG) | 767.3 ms | 41.9 ms | 188.0 ms | 194.3 ms | **18.32×** | **4.49×** | **4.64×** | 0.66 | 0.19 | 0.19 | 1377M | 1392M | **PASS** | PASS |
+| `B-10` | only-matching ($BIG) | 767.3 ms | 41.6 ms | 188.0 ms | 194.3 ms | **18.43×** | **4.51×** | **4.67×** | 0.68 | 0.19 | 0.19 | 1373M | 1392M | **PASS** | PASS |
 | `B-11` | inverted count ($BIG) | 978.8 ms | 46.0 ms | 1.46 s | 1.46 s | **21.28×** | **31.80×** | **31.76×** | 1.00 | 1.46 | 1.46 | 1380M | 1391M | **PASS** | PASS |
 | `B-12` | stdin redirect (< $BIG) | 530.7 ms | 21.3 ms | 256.7 ms | 258.9 ms | **24.89×** | **12.04×** | **12.14×** | 0.44 | 0.26 | 0.26 | 1377M | 38M | **PASS** | PASS |
 | `B-13` | FIFO pipe (cat $BIG \\|) | 1.14 s | 651.3 ms | 853.2 ms | 931.6 ms | **1.74×** | **1.31×** | **1.43×** | 0.88 | 0.62 | 0.68 | 38M | 38M | **PASS** | PASS |
@@ -222,7 +222,7 @@ Both `R0 (12t)` (ripgrep's out-of-the-box 12-thread cap) and `R0 (-j 32)` (threa
 | `T-25b` | quiet, immediate match | 2.7 ms | 2.7 ms | 6.0 ms | 7.1 ms | **1.00×** | **2.19×** | **2.60×** | 0.00 | 0.01 | 0.01 | 38M | 38M | **PASS** | PASS |
 | `T-26` | byte offsets | 4.44 s | 152.0 ms | 363.0 ms | 176.3 ms | **29.18×** | **2.39×** | **1.16×** | 4.52 | 4.27 | 5.30 | 38M | 38M | **PASS** | PASS |
 | `T-27` | sub-scope drivers/ | 2.01 s | 73.6 ms | 165.1 ms | 86.9 ms | **27.35×** | **2.24×** | **1.18×** | 1.95 | 1.90 | 2.44 | 51M | 51M | **PASS** | PASS |
-| `T-28` | sub-scope kernel mm fs | 168.2 ms | 17.1 ms | 19.1 ms | 15.1 ms | **9.83×** | **1.12×** | **0.88×** | 0.17 | 0.16 | 0.18 | 51M | 51M | **PASS** | PASS |
+| `T-28` | sub-scope kernel mm fs | 168.2 ms | 16.0 ms | 19.1 ms | 15.1 ms | **10.54×** | **1.20×** | **0.94×** | 0.17 | 0.16 | 0.18 | 37M | 51M | **PASS** | PASS |
 | `U-01` | out-of-the-box UX | 4.41 s | 151.3 ms | 390.7 ms | 207.0 ms | **29.11×** | **2.58×** | **1.37×** | 4.54 | 4.58 | 6.27 | 51M | 51M | **PASS** | PASS |
 | `U-02` | naive invocation (scans 6 GB .git) | 6.09 s | 236.5 ms | 390.5 ms* | 209.5 ms | **25.74×** | **1.65×** | **0.89×** | 5.35 | 4.59 | 6.29 | 1772M | 51M | **PASS** | N/A |
 | `X-01` | git ls-files \\| xargs | 4.22 s | 479.4 ms | 1.09 s | 960.1 ms | **8.81×** | **2.27×** | **2.00×** | 5.30 | 5.57 | 7.59 | 51M | 51M | **PASS** | PASS |
@@ -242,11 +242,11 @@ The same 59 scenarios with `ugrep` at its default (12 worker threads) and at `-J
 | `B-03` | moderate, line numbers ($BIG) | 934.2 ms | 40.6 ms | 433.6 ms | 433.2 ms | **22.99×** | **10.67×** | **10.66×** | 0.87 | 0.43 | 0.43 | 1375M | 38M | **PASS** | PASS |
 | `B-04` | DFA regex ($BIG) | 434.7 ms | 20.0 ms | 429.0 ms | 431.5 ms | **21.75×** | **21.46×** | **21.58×** | 0.39 | 0.43 | 0.43 | 1375M | 38M | **PASS** | PASS |
 | `B-05` | case-insensitive dense ($BIG) | 1.97 s | 44.8 ms | 300.6 ms | 304.1 ms | **43.93×** | **6.71×** | **6.79×** | 0.98 | 0.30 | 0.30 | 1375M | 38M | **PASS** | PASS |
-| `B-06` | word match ($BIG) | 370.8 ms | 23.0 ms | 239.2 ms | 240.8 ms | **16.12×** | **10.40×** | **10.47×** | 0.46 | 0.24 | 0.24 | 1377M | 38M | **PASS** | PASS |
+| `B-06` | word match ($BIG) | 370.8 ms | 17.8 ms | 239.2 ms | 240.8 ms | **20.83×** | **13.43×** | **13.53×** | 0.35 | 0.24 | 0.24 | 1379M | 38M | **PASS** | PASS |
 | `B-07` | literal-free regex ($BIG) | 663.0 ms | 30.1 ms | 226.5 ms | 228.0 ms | **22.05×** | **7.53×** | **7.58×** | 0.66 | 0.23 | 0.23 | 1377M | 38M | **PASS** | PASS |
 | `B-08` | PCRE2 lookaround ($BIG) | 21.40 s | 164.4 ms | 20.81 s | 20.85 s | **130.13×** | **126.53×** | **126.77×** | 2.38 | 20.79 | 20.82 | 1440M | 38M | **PASS** | PASS |
 | `B-09` | context ($BIG) | 916.9 ms | 36.6 ms | 380.3 ms | 383.5 ms | **25.06×** | **10.39×** | **10.48×** | 0.82 | 0.38 | 0.38 | 1374M | 38M | **PASS** | PASS |
-| `B-10` | only-matching ($BIG) | 767.3 ms | 41.9 ms | 245.6 ms | 246.6 ms | **18.32×** | **5.87×** | **5.89×** | 0.66 | 0.25 | 0.25 | 1377M | 38M | **PASS** | PASS |
+| `B-10` | only-matching ($BIG) | 767.3 ms | 41.6 ms | 245.6 ms | 246.6 ms | **18.43×** | **5.90×** | **5.92×** | 0.68 | 0.25 | 0.25 | 1373M | 38M | **PASS** | PASS |
 | `B-11` | inverted count ($BIG) | 978.8 ms | 46.0 ms | 1.06 s | 1.06 s | **21.28×** | **22.95×** | **22.97×** | 1.00 | 1.05 | 1.05 | 1380M | 38M | **PASS** | PASS |
 | `B-12` | stdin redirect (< $BIG) | 530.7 ms | 21.3 ms | 349.8 ms | 352.8 ms | **24.89×** | **16.40×** | **16.54×** | 0.44 | 0.35 | 0.35 | 1377M | 38M | **PASS** | PASS |
 | `B-13` | FIFO pipe (cat $BIG \\|) | 1.14 s | 651.3 ms | 813.5 ms | 894.5 ms | **1.74×** | **1.25×** | **1.37×** | 0.88 | 0.73 | 0.81 | 38M | 38M | **PASS** | PASS |
@@ -292,7 +292,7 @@ The same 59 scenarios with `ugrep` at its default (12 worker threads) and at `-J
 | `T-25b` | quiet, immediate match | 2.7 ms | 2.7 ms | 12.5 ms | 11.5 ms | **1.00×** | **4.59×** | **4.20×** | 0.00 | 0.05 | 0.03 | 38M | 38M | **PASS** | PASS |
 | `T-26` | byte offsets | 4.44 s | 152.0 ms | 467.2 ms | 985.5 ms | **29.18×** | **3.07×** | **6.48×** | 4.52 | 5.82 | 8.65 | 38M | 38M | **PASS** | KNOWN-SEMANTIC |
 | `T-27` | sub-scope drivers/ | 2.01 s | 73.6 ms | 212.2 ms | 394.2 ms | **27.35×** | **2.88×** | **5.36×** | 1.95 | 2.51 | 3.72 | 51M | 51M | **PASS** | PASS |
-| `T-28` | sub-scope kernel mm fs | 168.2 ms | 17.1 ms | 24.5 ms | 40.4 ms | **9.83×** | **1.43×** | **2.36×** | 0.17 | 0.21 | 0.34 | 51M | 51M | **PASS** | PASS |
+| `T-28` | sub-scope kernel mm fs | 168.2 ms | 16.0 ms | 24.5 ms | 40.4 ms | **10.54×** | **1.54×** | **2.53×** | 0.17 | 0.21 | 0.34 | 37M | 51M | **PASS** | PASS |
 | `U-01` | out-of-the-box UX | 4.41 s | 151.3 ms | 462.8 ms | 980.6 ms | **29.11×** | **3.06×** | **6.48×** | 4.54 | 5.78 | 8.57 | 51M | 51M | **PASS** | PASS |
 | `U-02` | naive invocation (scans 6 GB .git) | 6.09 s | 236.5 ms | 466.1 ms* | 978.7 ms | **25.74×** | **1.97×** | **4.14×** | 5.35 | 5.82 | 8.67 | 1772M | 51M | **PASS** | N/A |
 | `X-01` | git ls-files \\| xargs | 4.22 s | 479.4 ms | 1.53 s | 1.93 s | **8.81×** | **3.19×** | **4.03×** | 5.30 | 8.04 | 10.83 | 51M | 51M | **PASS** | PASS |
@@ -333,13 +333,13 @@ The same 59 scenarios with `ugrep` at its default (12 worker threads) and at `-J
 | `T-25b` | quiet, immediate match | 2.7 ms | 2.7 ms | 6.0 ms | 12.5 ms | **1.00×** | **2.19×** | **4.59×** | 0.00 | 0.01 | 38M | 38M | **PASS** |
 | `T-26` | byte offsets | 4.44 s | 152.0 ms | 363.0 ms | 467.2 ms | **29.18×** | **2.39×** | **3.07×** | 4.52 | 4.27 | 38M | 38M | **PASS** |
 | `T-27` | sub-scope drivers/ | 2.01 s | 73.6 ms | 165.1 ms | 212.2 ms | **27.35×** | **2.24×** | **2.88×** | 1.95 | 1.90 | 51M | 51M | **PASS** |
-| `T-28` | sub-scope kernel mm fs | 168.2 ms | 17.1 ms | 19.1 ms | 24.5 ms | **9.83×** | **1.12×** | **1.43×** | 0.17 | 0.16 | 51M | 51M | **PASS** |
+| `T-28` | sub-scope kernel mm fs | 168.2 ms | 16.0 ms | 19.1 ms | 24.5 ms | **10.54×** | **1.20×** | **1.54×** | 0.17 | 0.16 | 37M | 51M | **PASS** |
 
 #### Architectural Analysis (Category T):
 - **High-Density Output Dominance:** G1 dramatically outclasses ripgrep on scenarios with high match volume (`T-04` dense line numbers: **158.1 ms vs 505.1 ms / 512.6 ms**, **3.19× / 3.24×**; `T-05` very dense: **287.3 ms vs 763.0 ms / 979.0 ms**, **2.66× / 3.41×**). Ripgrep serializes line formatting and terminal output through a shared mutex-locked buffer, causing severe thread lock contention when output is dense. G1 uses thread-local output slabs combined with an in-order Sequence Reorder Buffer (ROB) that commits complete file buffers locklessly.
 - **Count Queries:** In count-per-file queries (`T-08` count: **151.2 ms vs 1.07 s / 1.44 s**, **7.10× / 9.49×**; `T-21` inverted count: **178.3 ms vs 1.09 s / 1.44 s**, **6.12× / 8.09×**), G1 performs line-counting using optimized AVX2 SIMD `nlscan` kernels while skipping all text output serialization. Ripgrep incurs heavy per-file state tracking and formatting overhead.
 - **Case-Insensitive & PCRE2 Tree Scans:** On `T-09` (`-ri copyright`), G1 achieves **161.1 ms vs 723.7 ms / 928.0 ms** (**4.49× / 5.76×** faster than ripgrep). On `T-16` (`-rP` lookaround), G1's structural anchor-pair pre-filter (`struct ` + `;`) eliminates 99.6% of non-matching lines before invoking PCRE2 JIT, finishing in **228.5 ms vs 2.49 s / 1.03 s** (**10.90× / 4.51×** faster than ripgrep and **120.91×** faster than stock G0).
-- **vs ugrep:** Against `ugrep` at its default (12t) / `-J 32`, G1's category geomean is **3.34× / 5.58×** (29 Wins / 0 Ties / 0 Losses at the default; 29 Wins / 0 Ties / 0 Losses at `-J 32`). Largest gap: `T-16` PCRE2 lookaround, dense (**228.5 ms vs 2.58 s**, **11.29×**); smallest: `T-28` sub-scope kernel mm fs (**17.1 ms vs 24.5 ms**, **1.43×**).
+- **vs ugrep:** Against `ugrep` at its default (12t) / `-J 32`, G1's category geomean is **3.35× / 5.59×** (29 Wins / 0 Ties / 0 Losses at the default; 29 Wins / 0 Ties / 0 Losses at `-J 32`). Largest gap: `T-16` PCRE2 lookaround, dense (**228.5 ms vs 2.58 s**, **11.29×**); smallest: `T-28` sub-scope kernel mm fs (**16.0 ms vs 24.5 ms**, **1.54×**).
 
 ---
 
@@ -352,11 +352,11 @@ The same 59 scenarios with `ugrep` at its default (12 worker threads) and at `-J
 | `B-03` | moderate, line numbers ($BIG) | 934.2 ms | 40.6 ms | 246.2 ms | 433.6 ms | **22.99×** | **6.06×** | **10.67×** | 0.87 | 0.25 | 1375M | 1392M | **PASS** |
 | `B-04` | DFA regex ($BIG) | 434.7 ms | 20.0 ms | 173.8 ms | 429.0 ms | **21.75×** | **8.69×** | **21.46×** | 0.39 | 0.17 | 1375M | 1392M | **PASS** |
 | `B-05` | case-insensitive dense ($BIG) | 1.97 s | 44.8 ms | 300.3 ms | 300.6 ms | **43.93×** | **6.71×** | **6.71×** | 0.98 | 0.30 | 1375M | 1392M | **PASS** |
-| `B-06` | word match ($BIG) | 370.8 ms | 23.0 ms | 180.6 ms | 239.2 ms | **16.12×** | **7.85×** | **10.40×** | 0.46 | 0.18 | 1377M | 1391M | **PASS** |
+| `B-06` | word match ($BIG) | 370.8 ms | 17.8 ms | 180.6 ms | 239.2 ms | **20.83×** | **10.15×** | **13.43×** | 0.35 | 0.18 | 1379M | 1391M | **PASS** |
 | `B-07` | literal-free regex ($BIG) | 663.0 ms | 30.1 ms | 1.58 s | 226.5 ms | **22.05×** | **52.40×** | **7.53×** | 0.66 | 1.58 | 1377M | 1391M | **PASS** |
 | `B-08` | PCRE2 lookaround ($BIG) | 21.40 s | 164.4 ms | 21.61 s | 20.81 s | **130.13×** | **131.41×** | **126.53×** | 2.38 | 21.63 | 1440M | 1394M | **PASS** |
 | `B-09` | context ($BIG) | 916.9 ms | 36.6 ms | 272.8 ms | 380.3 ms | **25.06×** | **7.46×** | **10.39×** | 0.82 | 0.27 | 1374M | 1391M | **PASS** |
-| `B-10` | only-matching ($BIG) | 767.3 ms | 41.9 ms | 188.0 ms | 245.6 ms | **18.32×** | **4.49×** | **5.87×** | 0.66 | 0.19 | 1377M | 1392M | **PASS** |
+| `B-10` | only-matching ($BIG) | 767.3 ms | 41.6 ms | 188.0 ms | 245.6 ms | **18.43×** | **4.51×** | **5.90×** | 0.68 | 0.19 | 1373M | 1392M | **PASS** |
 | `B-11` | inverted count ($BIG) | 978.8 ms | 46.0 ms | 1.46 s | 1.06 s | **21.28×** | **31.80×** | **22.95×** | 1.00 | 1.46 | 1380M | 1391M | **PASS** |
 | `B-12` | stdin redirect (< $BIG) | 530.7 ms | 21.3 ms | 256.7 ms | 349.8 ms | **24.89×** | **12.04×** | **16.40×** | 0.44 | 0.26 | 1377M | 38M | **PASS** |
 | `B-13` | FIFO pipe (cat $BIG \\|) | 1.14 s | 651.3 ms | 853.2 ms | 813.5 ms | **1.74×** | **1.31×** | **1.25×** | 0.88 | 0.62 | 38M | 38M | **PASS** |
@@ -365,7 +365,7 @@ The same 59 scenarios with `ugrep` at its default (12 worker threads) and at `-J
 #### Architectural Analysis (Category B):
 - **Intra-File Parallelism Gap:** Ripgrep processes single files with a single thread regardless of `-j` flags, taking 171 ms to 300 ms (and 21.6 s on PCRE2 lookaround). G1 maps large files and partitions them across the worker pool into parallel chunks with seamless line boundary handling, achieving **19.7 ms on literals** (**8.72× faster than ripgrep**), **44.8 ms on case-insensitive** (**6.71× faster**), and **164.4 ms on PCRE2 lookaround** (**131.41× faster**).
 - **Stream and FIFO Slicing:** Even when reading from stdin redirect (`B-12`: **21.3 ms vs 256.7 ms**, **12.04×**), G1 slices the incoming stream into chunked worker buffers for parallel execution.
-- **vs ugrep:** Against `ugrep` at its default (12t) / `-J 32`, G1's category geomean is **10.65× / 10.79×** (14 Wins / 0 Ties / 0 Losses at the default; 14 Wins / 0 Ties / 0 Losses at `-J 32`). Largest gap: `B-08` PCRE2 lookaround ($BIG) (**164.4 ms vs 20.81 s**, **126.53×**); smallest: `B-13` FIFO pipe (cat $BIG \|) (**651.3 ms vs 813.5 ms**, **1.25×**).
+- **vs ugrep:** Against `ugrep` at its default (12t) / `-J 32`, G1's category geomean is **10.85× / 10.99×** (14 Wins / 0 Ties / 0 Losses at the default; 14 Wins / 0 Ties / 0 Losses at `-J 32`). Largest gap: `B-08` PCRE2 lookaround ($BIG) (**164.4 ms vs 20.81 s**, **126.53×**); smallest: `B-13` FIFO pipe (cat $BIG \|) (**651.3 ms vs 813.5 ms**, **1.25×**).
 
 ---
 
@@ -638,7 +638,7 @@ The same 59 scenarios with `ugrep` at its default (12 worker threads) and at `-J
 | `T-27` | **G1** | — | — | — | — | 125.2 ms (16.1×) | — | — | — | — | — | — | — | **16.07×** |
 | `T-27` | **R0** | — | — | — | — | — | — | — | 86.9 ms (23.2×) | — | — | — | — | **23.15×** |
 | `T-27` | **U0** | — | — | — | — | — | — | — | 394.2 ms (5.1×) | — | — | — | — | **5.10×** |
-| `T-28` | **G1** | — | — | — | — | 16.1 ms (10.5×) | — | — | — | — | — | — | — | **10.47×** |
+| `T-28` | **G1** | — | — | — | — | 15.9 ms (10.6×) | — | — | — | — | — | — | — | **10.56×** |
 | `T-28` | **R0** | — | — | — | — | — | — | — | 15.1 ms (11.2×) | — | — | — | — | **11.16×** |
 | `T-28` | **U0** | — | — | — | — | — | — | — | 40.4 ms (4.2×) | — | — | — | — | **4.17×** |
 | `P-01` | **G1** | — | — | — | — | 567.5 ms (73.1×) | — | — | — | — | — | — | — | **73.09×** |
@@ -662,11 +662,11 @@ The same 59 scenarios with `ugrep` at its default (12 worker threads) and at `-J
 | `B-03` | B | moderate, line numbers ($BIG) | 934.2 ms | — | 246.2 ms | **—** | 40.6 ms | 247.9 ms | **6.10×** | **6.06×** |
 | `B-04` | B | DFA regex ($BIG) | 434.7 ms | 29.3 ms | 173.8 ms | **5.93×** | 20.0 ms | 174.0 ms | **8.70×** | **8.69×** |
 | `B-05` | B | case-insensitive dense ($BIG) | 1.97 s | — | 300.3 ms | **—** | 44.8 ms | 301.9 ms | **6.74×** | **6.71×** |
-| `B-06` | B | word match ($BIG) | 370.8 ms | — | 180.6 ms | **—** | 23.0 ms | 183.4 ms | **7.97×** | **7.85×** |
+| `B-06` | B | word match ($BIG) | 370.8 ms | — | 180.6 ms | **—** | 17.8 ms | 183.4 ms | **10.30×** | **10.15×** |
 | `B-07` | B | literal-free regex ($BIG) | 663.0 ms | — | 1.58 s | **—** | 30.1 ms | 1.57 s | **52.34×** | **52.40×** |
 | `B-08` | B | PCRE2 lookaround ($BIG) | 21.40 s | — | 21.61 s | **—** | 164.4 ms | 21.63 s | **131.52×** | **131.41×** |
 | `B-09` | B | context ($BIG) | 916.9 ms | — | 272.8 ms | **—** | 36.6 ms | 277.1 ms | **7.57×** | **7.46×** |
-| `B-10` | B | only-matching ($BIG) | 767.3 ms | — | 188.0 ms | **—** | 41.9 ms | 194.3 ms | **4.64×** | **4.49×** |
+| `B-10` | B | only-matching ($BIG) | 767.3 ms | — | 188.0 ms | **—** | 41.6 ms | 194.3 ms | **4.67×** | **4.51×** |
 | `B-11` | B | inverted count ($BIG) | 978.8 ms | — | 1.46 s | **—** | 46.0 ms | 1.46 s | **31.76×** | **31.80×** |
 | `B-12` | B | stdin redirect (< $BIG) | 530.7 ms | — | 256.7 ms | **—** | 21.3 ms | 258.9 ms | **12.14×** | **12.04×** |
 | `B-13` | B | FIFO pipe (cat $BIG \\|) | 1.14 s | — | 853.2 ms | **—** | 651.3 ms | 931.6 ms | **1.43×** | **1.31×** |
@@ -709,7 +709,7 @@ The same 59 scenarios with `ugrep` at its default (12 worker threads) and at `-J
 | `T-25b` | T | quiet, immediate match | 2.7 ms | 2.6 ms | 6.0 ms | **2.33×** | 2.7 ms | 7.1 ms | **2.60×** | **2.19×** |
 | `T-26` | T | byte offsets | 4.44 s | 283.5 ms | 363.0 ms | **1.28×** | 152.0 ms | 176.3 ms | **1.16×** | **2.39×** |
 | `T-27` | T | sub-scope drivers/ | 2.01 s | 125.2 ms | 165.1 ms | **1.32×** | 73.6 ms | 86.9 ms | **1.18×** | **2.24×** |
-| `T-28` | T | sub-scope kernel mm fs | 168.2 ms | 16.1 ms | 19.1 ms | **1.19×** | 17.1 ms | 15.1 ms | **0.88×** | **1.12×** |
+| `T-28` | T | sub-scope kernel mm fs | 168.2 ms | 15.9 ms | 19.1 ms | **1.20×** | 16.0 ms | 15.1 ms | **0.94×** | **1.20×** |
 | `U-01` | U | out-of-the-box UX | 4.41 s | — | 390.7 ms | **—** | 151.3 ms | 207.0 ms | **1.37×** | **2.58×** |
 | `U-02` | U | naive invocation (scans 6 GB .git) | 6.09 s | — | 390.5 ms | **—** | 236.5 ms | 209.5 ms | **0.89×** | **1.65×** |
 | `X-01` | X | git ls-files \\| xargs | 4.22 s | — | 1.09 s | **—** | 479.4 ms | 960.1 ms | **2.00×** | **2.27×** |
@@ -728,11 +728,11 @@ The same 59 scenarios with `ugrep` at its default (12 worker threads) and at `-J
 | `B-03` | B | moderate, line numbers ($BIG) | 934.2 ms | — | 433.6 ms | **—** | 40.6 ms | 433.2 ms | **10.66×** | **10.67×** |
 | `B-04` | B | DFA regex ($BIG) | 434.7 ms | 29.3 ms | 429.0 ms | **14.64×** | 20.0 ms | 431.5 ms | **21.58×** | **21.46×** |
 | `B-05` | B | case-insensitive dense ($BIG) | 1.97 s | — | 300.6 ms | **—** | 44.8 ms | 304.1 ms | **6.79×** | **6.71×** |
-| `B-06` | B | word match ($BIG) | 370.8 ms | — | 239.2 ms | **—** | 23.0 ms | 240.8 ms | **10.47×** | **10.40×** |
+| `B-06` | B | word match ($BIG) | 370.8 ms | — | 239.2 ms | **—** | 17.8 ms | 240.8 ms | **13.53×** | **13.43×** |
 | `B-07` | B | literal-free regex ($BIG) | 663.0 ms | — | 226.5 ms | **—** | 30.1 ms | 228.0 ms | **7.58×** | **7.53×** |
 | `B-08` | B | PCRE2 lookaround ($BIG) | 21.40 s | — | 20.81 s | **—** | 164.4 ms | 20.85 s | **126.77×** | **126.53×** |
 | `B-09` | B | context ($BIG) | 916.9 ms | — | 380.3 ms | **—** | 36.6 ms | 383.5 ms | **10.48×** | **10.39×** |
-| `B-10` | B | only-matching ($BIG) | 767.3 ms | — | 245.6 ms | **—** | 41.9 ms | 246.6 ms | **5.89×** | **5.87×** |
+| `B-10` | B | only-matching ($BIG) | 767.3 ms | — | 245.6 ms | **—** | 41.6 ms | 246.6 ms | **5.92×** | **5.90×** |
 | `B-11` | B | inverted count ($BIG) | 978.8 ms | — | 1.06 s | **—** | 46.0 ms | 1.06 s | **22.97×** | **22.95×** |
 | `B-12` | B | stdin redirect (< $BIG) | 530.7 ms | — | 349.8 ms | **—** | 21.3 ms | 352.8 ms | **16.54×** | **16.40×** |
 | `B-13` | B | FIFO pipe (cat $BIG \\|) | 1.14 s | — | 813.5 ms | **—** | 651.3 ms | 894.5 ms | **1.37×** | **1.25×** |
@@ -775,7 +775,7 @@ The same 59 scenarios with `ugrep` at its default (12 worker threads) and at `-J
 | `T-25b` | T | quiet, immediate match | 2.7 ms | 2.6 ms | 12.5 ms | **4.90×** | 2.7 ms | 11.5 ms | **4.20×** | **4.59×** |
 | `T-26` | T | byte offsets | 4.44 s | 283.5 ms | 467.2 ms | **1.65×** | 152.0 ms | 985.5 ms | **6.48×** | **3.07×** |
 | `T-27` | T | sub-scope drivers/ | 2.01 s | 125.2 ms | 212.2 ms | **1.69×** | 73.6 ms | 394.2 ms | **5.36×** | **2.88×** |
-| `T-28` | T | sub-scope kernel mm fs | 168.2 ms | 16.1 ms | 24.5 ms | **1.53×** | 17.1 ms | 40.4 ms | **2.36×** | **1.43×** |
+| `T-28` | T | sub-scope kernel mm fs | 168.2 ms | 15.9 ms | 24.5 ms | **1.54×** | 16.0 ms | 40.4 ms | **2.53×** | **1.54×** |
 | `U-01` | U | out-of-the-box UX | 4.41 s | — | 462.8 ms | **—** | 151.3 ms | 980.6 ms | **6.48×** | **3.06×** |
 | `U-02` | U | naive invocation (scans 6 GB .git) | 6.09 s | — | 466.1 ms | **—** | 236.5 ms | 978.7 ms | **4.14×** | **1.97×** |
 | `X-01` | X | git ls-files \\| xargs | 4.22 s | — | 1.53 s | **—** | 479.4 ms | 1.93 s | **4.03×** | **3.19×** |
@@ -789,7 +789,7 @@ The same 59 scenarios with `ugrep` at its default (12 worker threads) and at `-J
      whereas `G1` defaults to `MIN(count, 32)` (`32` worker threads).
 2. **What Happens When Ripgrep Is Given `-j 32` Across All 59 Scenarios:**
    - **Single Large Files (`B-01..B-14`, `M-06`):** `-j 32` has **zero effect** on `ripgrep` (`171–302 ms`) because `ripgrep` does not parallelize
-     within a single file. `G1` beats `ripgrep -j 32` on **14/14** `B-*` scenarios (**9.94× geomean**) and by **75.36×** on `M-06`.
+     within a single file. `G1` beats `ripgrep -j 32` on **14/14** `B-*` scenarios (**10.13× geomean**) and by **75.36×** on `M-06`.
    - **High-Output & Dense Match Tree Walks (`T-04`, `T-05`, `T-08`, `T-09`, `T-12`, `T-21`):** Increasing `ripgrep` from 12 to 32 threads
      **degrades** `ripgrep`'s runtime on 5 of these 6 scenarios (`T-05`: `763.0 ms` → `979.0 ms`; `T-08`: `1.07 s` → `1.44 s`;
      `T-09`: `723.7 ms` → `928.0 ms`; `T-12`: `592.0 ms` → `682.1 ms`; `T-21`: `1.09 s` → `1.44 s`) due to output lock contention.
@@ -804,7 +804,7 @@ The same 59 scenarios with `ugrep` at its default (12 worker threads) and at `-J
      files to the workers, which steal jobs from each other; a single file is searched by one thread whatever `-J` says.
    - Raising `ugrep` from 12 to 32 threads makes 27 of 29 tree scenarios slower and 2 faster (by more than 2%); on geometric mean, a tree scan takes 1.67× as long as at the default.
      The sweep shows where it turns: `T-01` takes 451.7 ms at 12 threads, 684.1 ms at 16 and 1.00 s at 32, while CPU time keeps rising; CPU-heavy `T-16` (PCRE2) keeps scaling to 906.9 ms at 48 threads.
-   - **Matched 12 Threads (`G1 @ 12t` vs `U0 @ 12t`):** on 40 scenarios G1 has a **2.32× geomean** (40 Wins / 0 Ties / 0 Losses); in Category T, **2.02×** (29 Wins / 0 Ties / 0 Losses).
+   - **Matched 12 Threads (`G1 @ 12t` vs `U0 @ 12t`):** on 40 scenarios G1 has a **2.32× geomean** (40 Wins / 0 Ties / 0 Losses); in Category T, **2.03×** (29 Wins / 0 Ties / 0 Losses).
 
 ---
 
