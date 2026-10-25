@@ -144,6 +144,7 @@ TESTS =						\
   multiple-begin-or-end-line			\
   null-byte					\
   options					\
+  parallel-binary-boundaries			\
   parallel-boundary-cases			\
   parallel-chunked-mmap				\
   parallel-cli-flags				\

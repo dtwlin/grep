@@ -1,0 +1,197 @@
+#! /bin/sh
+# Binary files, context and exit status in the parallel paths, adapted
+# from ripgrep's binary.rs, glue.rs and regression tests (r1159, r1380,
+# r3108, r3131, f2288) with GNU grep semantics.  Each case names the
+# route it must take (see GREP_TEST_ROUTE in src/grep.c) and must match
+# GREP_THREADS=1 src/grep byte for byte.
+#
+# The inputs are 320 KiB of 64-byte lines.  grep-shrunk cuts such a file
+# into 4 chunks starting at lines 1281, 2561 and 3841 (0-based) for any
+# thread count of 2 or more: 4 is its chunk limit, and 320 KiB / 4 is a
+# multiple of the line length, so each target offset is a line start.
+# A NUL within the first 96 KiB (line 1536) stops chunking; a later one
+# is found while the chunks are searched.
+#
+# Copyright (C) 2026 David Lin <dtwlin@gmail.com>
+#
+# Copying and distribution of this file, with or without modification,
+# are permitted in any medium without royalty provided the copyright
+# notice and this notice are preserved.
+
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+. "$abs_srcdir/parallel-lib.sh"
+
+pl_setup_bins
+pl_have_bin shrunk || skip_ "src/grep-shrunk is not built"
+pl_have_shrunk=yes
+PL_TIMEOUT=${PL_TIMEOUT:-30}
+
+# mk FILE LINE:KIND... writes FILE, a 5120-line file of 64-byte lines,
+# with line LINE replaced by KIND: M (a match), N (a NUL), MN or NM (a
+# match and a NUL, in that order on one line), B (a blank line padded
+# with spaces, matched by the empty-line tests) or E (an encoding error).
+cat <<'EOF' > mk.pl || framework_failure_
+use strict;
+use warnings;
+my ($file, @spec) = @ARGV;
+my %kind = map { my ($l, $k) = split /:/; ($l => $k) } @spec;
+my %body = (M => "MATCH here", N => "nul\0here", MN => "MATCH then \0",
+            NM => "\0 then MATCH", E => "bad \377 byte");
+open my $h, '>', $file or die "$file: $!";
+for my $i (0 .. 5119) {
+  my $k = $kind{$i};
+  my $s = defined $k ? sprintf ("%05d %s", $i, $body{$k})
+                     : sprintf ("%05d filler text", $i);
+  print $h $s, ' ' x (63 - length $s), "\n";
+}
+close $h or die "$file: $!";
+EOF
+mk () { $PERL mk.pl "$@" || framework_failure_; }
+
+# W1: a NUL at five positions relative to the matches (ripgrep binary.rs
+# P1-P5), at the line before, at and after the start of chunk 1 (within
+# the first 96 KiB) and chunk 2 (after it).
+for b in 1281 2561; do
+  for d in -1 0 1; do
+    n=$((b + d))
+    mk p1_${b}_$d.txt $n:N $((n + 5)):M
+    mk p2_${b}_$d.txt $n:MN
+    mk p2r_${b}_$d.txt $n:NM
+    mk p3_${b}_$d.txt 10:M $n:N
+    mk p4_${b}_$d.txt $((n - 3)):M $n:N
+    mk p5_${b}_$d.txt 10:M $n:N 3846:M
+  done
+done
+mk text.txt 10:M 1280:M 1281:M 2560:M 3846:M
+
+# Each run searches 9 files of one chunk boundary at once (fewer than
+# 16, which would go to the walker instead); every file is chunked on
+# its own, so the route must appear once per file.
+for b in 1281 2561; do
+  for half in 'p1 p2 p2r' 'p3 p4 p5'; do
+    files=
+    for f in $half; do
+      for d in -1 0 1; do files="$files ${f}_${b}_$d.txt"; done
+    done
+    for opts in '' '-c' '-l' '-L' '-o' '-n' '-C1' '-I' '-c -I' '-n -o'; do
+      case $b,$opts in
+        1281,*) r=chunk-fallback;;
+        *,-l|*,-L) r=chunk-count;;
+        *,-n*|*,-C1) r=chunk-nul-sequential;;
+        *) r=chunk-nul-research;;
+      esac
+      pl_route $r:9 - $opts MATCH $files
+    done
+    # -a reads binary data as text, so chunking goes on as usual.
+    pl_route chunk-stateless:9 - -a MATCH $files
+    pl_route '!chunk-fallback' - -a -n MATCH $files
+  done
+done
+# -q probes the start of the first file only, so search one at a time.
+for f in p1 p2 p2r p3 p4 p5; do
+  for b in 1281 2561; do
+    pl_route chunk-quiet-probe - -q MATCH ${f}_${b}_0.txt
+  done
+done
+
+# The same files among other operands, and a match only after the NUL
+# with -l and -c (ripgrep r3131: -l, -c and -q must agree).
+pl_route file-chunk - -l MATCH p3_2561_0.txt text.txt p5_2561_1.txt
+pl_route file-chunk - -c MATCH p1_2561_-1.txt text.txt p1_1281_1.txt
+pl_route chunk-nul-research - -c -v MATCH p5_2561_0.txt
+
+# A NUL beyond 2 MiB in a binary searched with -q -F, in one mmap scan
+# or, during a walk, in slices.
+printf 'no match here\n' > op_nomatch || framework_failure_
+$PERL -e 'print "filler line of a big binary file\n" x 70000,
+               "\0 MATCH after the NUL\n"' > bigbin.dat || framework_failure_
+mkdir walk || framework_failure_
+cp bigbin.dat op_nomatch walk/ || framework_failure_
+pl_route quiet-mmap - -q -F MATCH bigbin.dat
+pl_route quiet-mmap - -q -F NOPE bigbin.dat
+pl_route walk-bin-scan - -r -q -F MATCH walk
+pl_route walk-bin-scan - -r -q -F NOPE walk
+
+# W2: two matches G lines apart around the start of chunk 2.  With
+# -A1 -B1, a separator appears only from G = 3 (ripgrep glue.rs).
+ctx=
+for g in 0 1 2 3 4; do
+  for s in 0 1 2; do
+    m1=$((2560 - s))
+    mk ctx_${g}_$s.txt $m1:M $((m1 + g + 1)):M
+    ctx="$ctx ctx_${g}_$s.txt"
+  done
+done
+pl_route chunk-context:15 - -A1 -B1 MATCH $ctx
+pl_route chunk-context:15 - -h -A1 -B1 MATCH $ctx
+pl_route chunk-context:15 - -n -b -C1 MATCH $ctx
+pl_route chunk-context:15 - -C1 --group-separator=XX MATCH $ctx
+pl_route chunk-context:15 - -C1 --group-separator=XX --no-group-separator \
+  MATCH $ctx
+pl_route chunk-context:15 - -C1 --no-group-separator --group-separator=XX \
+  MATCH $ctx
+pl_route chunk-context:15 - -C1 --group-separator= MATCH $ctx
+# Explicit -A or -B overrides -C in either order (ripgrep f2288 differs).
+pl_route chunk-context - -C1 -A3 MATCH ctx_4_1.txt
+pl_route chunk-context - -A3 -C1 MATCH ctx_4_1.txt
+pl_route chunk-context - -B3 -C1 -n MATCH ctx_4_1.txt
+# Context and binary data: a NUL in context lines, encoding errors.
+mk ctxnul.txt 2558:N 2560:M 2562:M
+pl_route chunk-nul-sequential - -C2 MATCH ctxnul.txt
+mk ctxenc.txt 2559:E 2560:M
+pl_route chunk-context - -C1 MATCH ctxenc.txt
+# Context options with the counting modes (ripgrep r693).
+for opts in '-c' '-l' '-L' '-q'; do
+  pl_route file-chunk - -C1 $opts MATCH ctx_2_1.txt text.txt
+done
+
+# Routing guards: -m and -v with context are never chunked.  r1380: with
+# -m1 -A2, a later match within the trailing context is printed as
+# context.
+mk r1380.txt 2560:M 2561:M 2562:M 2563:M
+pl_route '!file-chunk' - -m1 -A2 -n MATCH r1380.txt text.txt
+pl_route '!file-chunk' - -m2 -A3 -n MATCH r1380.txt text.txt
+pl_route '!file-chunk' - -v -C2 -n filler ctx_2_1.txt text.txt
+pl_route '!stdin-slice' "|r1380.txt" -m1 -A2 -n MATCH
+pl_route '!stdin-slice' "|ctx_2_1.txt" -C1 MATCH
+
+# W3: exit status (ripgrep r1159).  A match or not, with -q or not, and
+# with or without a missing file before, between or after the others.
+# GNU grep exits with 0 under -q once a line is selected, even after an
+# error, and with 2 after an error otherwise.
+ops=
+for i in $(seq 1 16); do
+  printf 'op %d filler\n' $i > op$i || framework_failure_
+  ops="$ops op$i"
+done
+mkdir -p tree/sub || framework_failure_
+cp text.txt tree/a.txt && cp op1 tree/sub/b.txt || framework_failure_
+unreadable=no
+if : > tree/sub/zz.txt && chmod 0 tree/sub/zz.txt \
+   && ! cat tree/sub/zz.txt > /dev/null 2>&1; then
+  unreadable=yes
+fi
+for pat in MATCH NOPE; do
+  case $pat in MATCH) p=op;; *) p=$pat;; esac
+  for q in '' -q; do
+    pl_route file-chunk - $q $pat text.txt op1
+    pl_route file-chunk - $q $pat nosuch text.txt op1
+    pl_route file-chunk - $q $pat text.txt nosuch op1
+    pl_route file-chunk - $q $pat text.txt op1 nosuch
+    pl_route walk-files - $q $p $ops
+    pl_route walk-files - $q $p op1 op2 op3 op4 op5 op6 op7 op8 nosuch \
+      op9 op10 op11 op12 op13 op14 op15 op16
+    test $unreadable = yes && pl_route walk-dirs - -r $q $pat tree
+    pl_route walk-dirs - -r $q $pat tree nosuch
+  done
+done
+# -L and -l with -q (ripgrep r3108): the exit status follows whether
+# a line was selected.
+pl_route file-chunk - -L -q MATCH text.txt op1
+pl_route file-chunk - -L -q NOPE text.txt op1
+pl_route file-chunk - -l -q MATCH op1 text.txt
+pl_route walk-files - -L -q op $ops
+pl_route walk-files - -L op $ops nosuch
+
+pl_summary
+Exit $pl_fail
