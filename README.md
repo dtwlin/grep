@@ -21,6 +21,18 @@
 
 ---
 
+## ⚡ At a glance
+
+| Everyday search | ⚡ Supercharged grep | ripgrep | ugrep | 🚀 Speedup (vs rg / ugrep) |
+| :-- | --: | --: | --: | :-: |
+| 🔎 Search a repo: `grep -rn 'static int' .` | **158 ms** | 505 ms | 627 ms | **3.2× / 4.0×** |
+| 🔡 Ignore case: `grep -ri copyright .` | **161 ms** | 724 ms | 785 ms | **4.5× / 4.9×** |
+| 📂 List matching files: `grep -rl EXPORT_SYMBOL_GPL .` | **152 ms** | 220 ms | 461 ms | **1.4× / 3.0×** |
+| 🔢 Count per file: `grep -rc '#include <linux/' .` | **151 ms** | 1.07 s | 1.12 s | **7.1× / 7.4×** |
+| 📄 One 1.4 GB file: `grep -F kmalloc_array_node linux-all.c` | **19.7 ms** | 171 ms | 352 ms | **8.7× / 18×** |
+
+<sub>Linux kernel source tree (96,034 files, 1.64 GB), warm cache, 128-CPU server. ripgrep and ugrep get the faster of their default (12 threads) and 32-thread runs. Exact flags and the full 59-scenario matrix are in [📊 Benchmarks](#-benchmarks).</sub>
+
 ## 🚀 Why Supercharged grep?
 
 - **🔁 100% drop-in.** It *is* GNU grep 3.12 with a new engine underneath — same options, same output, same exit codes. Install it and every script, tool, and agent that calls `grep` gets faster. No new flags, no aliases, no config.
