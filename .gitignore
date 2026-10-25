@@ -61,6 +61,7 @@
 /tests/*.gcno
 /src/*.gcda
 /src/*.gcno
+/src/sc-version.h
 ABOUT-NLS
 ChangeLog
 Makefile

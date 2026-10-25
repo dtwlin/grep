@@ -21,10 +21,10 @@ done
 # Baseline expected output
 GREP_THREADS=1 grep -r 'DATA_TARGET' env_tree > exp_all || fail=1
 
-# 0. Verify --version identifies Supercharged grep and reflects GREP_THREADS
-grep --version | grep -q '^Supercharged grep (up to [0-9]* threads*, \(AVX2\|SWAR\))' || fail=1
-GREP_THREADS=1 grep --version | grep -q '^Supercharged grep (up to 1 thread, \(AVX2\|SWAR\))' || fail=1
-GREP_THREADS=8 grep --version | grep -q '^Supercharged grep (up to 8 threads, \(AVX2\|SWAR\))' || fail=1
+# 0. Verify --version identifies Supercharged grep version and reflects GREP_THREADS
+grep --version | grep -q '^Supercharged grep v[0-9]\{4\}\.[0-9]\{2\}\.[0-9]\{2\}+g[0-9a-f]*\(-dirty\)\{0,1\} (up to [0-9]* threads*, \(AVX2\|SWAR\))' || fail=1
+GREP_THREADS=1 grep --version | grep -q '^Supercharged grep v[^ ]* (up to 1 thread, \(AVX2\|SWAR\))' || fail=1
+GREP_THREADS=8 grep --version | grep -q '^Supercharged grep v[^ ]* (up to 8 threads, \(AVX2\|SWAR\))' || fail=1
 
 # 1. Invalid or boundary GREP_THREADS values
 # Non-numeric should default gracefully

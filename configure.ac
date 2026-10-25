@@ -20,7 +20,7 @@ dnl You should have received a copy of the GNU General Public License
 dnl along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 AC_INIT([GNU grep],
-        m4_esyscmd([build-aux/git-version-gen .tarball-version]),
+        [3.12],
         [dtwlin@gmail.com])
 
 AC_CONFIG_AUX_DIR([build-aux])

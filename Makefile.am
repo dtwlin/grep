@@ -27,6 +27,7 @@ EXTRA_DIST =		\
   README-alpha		\
   THANKS.in		\
   TODO			\
+  build-aux/sc-version-gen \
   cfg.mk		\
   m4/gnulib-cache.m4	\
   thanks-gen
@@ -47,6 +48,8 @@ run-syntax-check: all
 # tarball, and never in a checked-out repository.
 dist-hook: gen-ChangeLog run-syntax-check
 	$(AM_V_GEN)echo $(VERSION) > $(distdir)/.tarball-version
+	$(AM_V_GEN)$(SHELL) $(top_srcdir)/build-aux/sc-version-gen \
+	  $(top_srcdir) > $(distdir)/.sc-version
 
 gen_start_date = 2009-11-27
 .PHONY: gen-ChangeLog

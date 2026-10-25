@@ -21,6 +21,11 @@ ifeq ($(build_triplet), $(host_triplet))
 export PATH := $(builddir)/src$(PATH_SEPARATOR)$(PATH)
 endif
 
+# Upstream GNU grep version stays fixed at 3.12; Supercharged grep tracks
+# its own CalVer + git revision via build-aux/sc-version-gen.
+_is-dist-target =
+_is-install-target =
+
 # Used in maint.mk's web-manual rule
 manual_title = GNU Grep: Print lines matching a pattern
 

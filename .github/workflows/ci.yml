@@ -81,7 +81,7 @@ jobs:
       - name: Verify binary & version string
         run: |
           ./src/grep --version
-          ./src/grep --version | ./src/grep -F "Supercharged grep"
+          ./src/grep --version | ./src/grep -E '^Supercharged grep v[0-9]{4}\.[0-9]{2}\.[0-9]{2}\+g[0-9a-f]+'
           ./src/grep --version | ./src/grep -F "${{ matrix.simd_tag }})"
 
       - name: Run test suite
@@ -272,7 +272,7 @@ jobs:
       - name: Verify binary & version string
         run: |
           ./src/grep --version
-          ./src/grep --version | ./src/grep -F "Supercharged grep"
+          ./src/grep --version | ./src/grep -E '^Supercharged grep v[0-9]{4}\.[0-9]{2}\.[0-9]{2}\+g[0-9a-f]+'
           ./src/grep --version | ./src/grep -F "SWAR)"
 
       - name: Run parallel test suite

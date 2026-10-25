@@ -82,6 +82,7 @@
 #include "safe-read.h"
 #include <search.h>
 #include "c-strcase.h"
+#include "sc-version.h"
 #include "version-etc.h"
 #include "xalloc.h"
 #include "xbinary-io.h"
@@ -8413,8 +8414,9 @@ print_version_info (void)
   char const *simd = "SWAR";
 #endif
   int nthreads = get_num_threads ();
-  printf (_("Supercharged grep (up to %d %s, %s)"
+  printf (_("Supercharged grep %s (up to %d %s, %s)"
             " <https://github.com/dtwlin/grep>\n"),
+          SUPERCHARGED_VERSION,
           nthreads, nthreads == 1 ? "thread" : "threads", simd);
 }
 

@@ -79,6 +79,21 @@ localedir = $(datadir)/locale
 AM_CPPFLAGS = -I$(top_builddir)/lib -I$(top_srcdir)/lib
 
 EXTRA_DIST = egrep.sh
+BUILT_SOURCES = sc-version.h
+
+grep.$(OBJEXT) grep_hooks-grep.$(OBJEXT) grep_shrunk-grep.$(OBJEXT): \
+  sc-version.h
+
+.PHONY: sc-version-force
+sc-version.h: sc-version-force
+	$(AM_V_at)ver=`$(SHELL) $(top_srcdir)/build-aux/sc-version-gen \
+	  $(top_srcdir)` && \
+	printf '#define SUPERCHARGED_VERSION "%s"\n' "$$ver" > $@-t$$$$ && \
+	if test -f $@ && cmp -s $@-t$$$$ $@; then \
+	  rm -f $@-t$$$$; \
+	else \
+	  mv -f $@-t$$$$ $@; \
+	fi
 
 egrep fgrep: egrep.sh Makefile
 	$(AM_V_GEN)grep=`echo grep | sed -e '$(transform)'` &&		\
@@ -96,4 +111,4 @@ egrep fgrep: egrep.sh Makefile
 	$(AM_V_at)chmod +x $@-t
 	$(AM_V_at)mv $@-t $@
 
-CLEANFILES = egrep fgrep *-t
+CLEANFILES = egrep fgrep *-t sc-version.h sc-version.h-t*

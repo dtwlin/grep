@@ -1,0 +1,63 @@
+#!/bin/sh
+# Print the Supercharged grep CalVer + git revision string
+# (for example, v2026.10.25+gf3d08df).
+#
+# Copyright (C) 2026 David Lin <dtwlin@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+srcdir=${1:-.}
+tarball_ver_file="$srcdir/.sc-version"
+
+# Populated by 'git archive' (such as GitHub source archives) when
+# export-subst is enabled for this file in .gitattributes.
+git_archive_info='$Format:%cs %h$'
+
+v=
+if test -f "$tarball_ver_file"; then
+  v=$(sed -n '1p' "$tarball_ver_file" 2>/dev/null)
+fi
+
+if test -z "$v" && (git --version) >/dev/null 2>&1; then
+  date_part=$(TZ=UTC0 git -C "$srcdir" log -1 --format=%cd \
+    --date=format-local:%Y.%m.%d HEAD 2>/dev/null \
+    || git -C "$srcdir" log -1 --format=%cd --date=short HEAD 2>/dev/null \
+       | tr '-' '.')
+  sha_part=$(git -C "$srcdir" rev-parse --short=7 HEAD 2>/dev/null)
+  if test -n "$date_part" && test -n "$sha_part"; then
+    v="v${date_part}+g${sha_part}"
+    git -C "$srcdir" update-index -q --refresh >/dev/null 2>&1
+    dirty=$(git -C "$srcdir" diff-index --name-only HEAD -- 2>/dev/null)
+    if test -n "$dirty"; then
+      v="${v}-dirty"
+    fi
+  fi
+fi
+
+if test -z "$v"; then
+  case "$git_archive_info" in
+    '$Format:'*) ;;
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\ ?*)
+      date_part=$(printf '%s' "${git_archive_info%% *}" | tr '-' '.')
+      sha_part=${git_archive_info#* }
+      v="v${date_part}+g${sha_part}"
+      ;;
+  esac
+fi
+
+if test -z "$v"; then
+  v="v2026.10.25"
+fi
+
+printf '%s\n' "$v"
