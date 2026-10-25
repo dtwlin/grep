@@ -21,6 +21,34 @@ literals, in the C, ISO-8859-15 and UTF-8 locales, at several
 GREP_THREADS values, on small files, files large enough to be split
 into chunks, and directory trees.
 
+After the random cases a deterministic sweep runs (--sweep runs only
+the sweep, --no-sweep skips it).  Read buffers are page aligned and
+chunk maps 2 MiB aligned, so the file offset of a match fixes its
+alignment within the vector loads, and one file with a match at every
+offset modulo 64 covers all alignments in one invocation:
+
+  * single keywords of 16 lengths from 1 to 64 bytes (every length
+    with --full), one per line at offsets 0..63, plus a keyword that
+    straddles a page boundary, a line that is just the keyword, and a
+    keyword ending at the end of the file with and without a trailing
+    newline; with -F, -F -o -b, -F -c and, by turns (all with --full),
+    -E -o -b, -F -i -o -b, -F -w -o -b and -F -x -n;
+  * Teddy: 2, 8, 16 and 32 keywords with minimum lengths 1, 2, 3, 4,
+    8 and 16, sharing prefixes and suffixes, at offsets 0..63, -o -b;
+  * the dense Aho-Corasick DFA: 33, 64 and 100 keywords, and 40
+    identical keywords (ripgrep issue 1334);
+  * self-overlapping and repetitive haystacks (ripgrep issue 1319,
+    "153.230000", runs of '0', "abab...") at the 32 offsets of an AVX2
+    vector, with -E, -P and -F.
+
+Every sweep case runs on the baseline and on the candidate at each
+--threads value, and through a pipe at one of them (all with --full),
+and must match the baseline exactly.  Where the output can be computed
+independently (every case but -w, and the haystacks, whose output is
+hard-coded), it must also match that, which keeps the sweep useful
+when the baseline is the candidate itself.  The default sweep is about
+100 configurations and 400 runs.
+
 Example:
   benchmarks/kwset_diff.py --baseline benchmarks/grep-baseline \\
       --candidate src/grep --corpus /path/to/source/tree --cases 3000
@@ -30,10 +58,12 @@ import argparse
 import concurrent.futures
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 SET_SIZES = [1, 2, 8, 32, 64, 65, 100, 1000, 10000]
 SET_WEIGHTS = [8, 8, 8, 8, 8, 8, 6, 4, 1]
@@ -317,7 +347,7 @@ def build_case(idx, seed, workdir, corpus, locales, sizes_only=None):
     return case
 
 
-def run(binary, args, env, threads, merge):
+def run(binary, args, env, threads, merge, stdin_path=None):
     e = dict(os.environ)
     e.pop('GREP_COLOR', None)
     e.pop('GREP_COLORS', None)
@@ -325,8 +355,14 @@ def run(binary, args, env, threads, merge):
     if threads is not None:
         e['GREP_THREADS'] = str(threads)
     # With MERGE, stderr goes to the same pipe as stdout, which also
-    # checks how diagnostics interleave with output.
+    # checks how diagnostics interleave with output.  With STDIN_PATH,
+    # the input is fed through a pipe rather than given as a file.
+    stdin = None
+    if stdin_path is not None:
+        with open(stdin_path, 'rb') as f:
+            stdin = f.read()
     p = subprocess.run(['grep'] + args, executable=binary,
+                       input=stdin,
                        stdout=subprocess.PIPE,
                        stderr=subprocess.STDOUT if merge else subprocess.PIPE,
                        env=e, timeout=600)
@@ -349,6 +385,341 @@ def check_case(case, baseline, candidate, threads):
     return want, failures
 
 
+# Deterministic sweep.  Read buffers are page aligned and chunk maps
+# are 2 MiB aligned, so the file offset of a match fixes its alignment
+# within the vector loads; one file holding a match at every offset
+# modulo 64 therefore covers every alignment in one invocation.
+
+SWEEP_LENGTHS = [1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64]
+SWEEP_CORE_OPTS = [['-F'], ['-F', '-o', '-b'], ['-F', '-c']]
+SWEEP_EXTRA_OPTS = [['-E', '-o', '-b'], ['-F', '-i', '-o', '-b'],
+                    ['-F', '-w', '-o', '-b'], ['-F', '-x', '-n']]
+SWEEP_TEDDY_SIZES = [2, 8, 16, 32]
+SWEEP_TEDDY_MINLENS = [1, 2, 3, 4, 8, 16]
+SWEEP_AC_SIZES = [33, 64, 100]
+SWEEP_SEPS = b' .-_,;:'
+LIT_ALPHABET = b'abcdefghijklmnopqrstuvwxyz0123456789'
+
+# Self-overlapping and repetitive haystacks with output that does not
+# depend on the build: (name, options, haystack, expected match).  Each
+# haystack is placed at the 32 offsets of an AVX2 vector, one per line,
+# so -o prints the expected match 32 times.  The expectations were
+# checked against stock GNU grep 3.12.
+SWEEP_TRAPS = [
+    ('ere-overlap', ['-o', '-E', '[0-9]{3}00'], b'153.230000', b'23000'),
+    ('pcre-overlap', ['-o', '-P', r'\d\d\d000'], b'153.230000', b'230000'),
+    # ripgrep issue 1319.
+    ('ere-dna', ['-o', '-E', 'TTGAGTCCAGGAG[ATCG]{2}C'],
+     b'CCAGCTACTCGGGAGGCTGAGGCTGGAGGATCGCTTGAGTCCAGGAGTTC',
+     b'TTGAGTCCAGGAGTTC'),
+    ('zeros', ['-F', '-o', '-e', '00001'], b'0' * 69 + b'1', b'00001'),
+    ('abab', ['-F', '-o', '-e', 'abababac'], b'ab' * 40 + b'ac', b'abababac'),
+    # Two keywords: the leftmost match is the longer one.
+    ('aaab', ['-F', '-o', '-e', 'aaab', '-e', 'aaaab'], b'a' * 60 + b'b',
+     b'aaaab'),
+]
+
+
+class SweepCase:
+    def __init__(self, name, args, path, env, expect=None):
+        self.name = name
+        self.args = args        # options and patterns, without the input
+        self.path = path        # the single input file
+        self.env = env
+        self.expect = expect    # (status, stdout, stderr), or None
+
+
+def cyc(unit, start, n):
+    """Return N bytes of UNIT repeated, starting at offset START."""
+    if n <= 0:
+        return b''
+    reps = (start % len(unit) + n) // len(unit) + 1
+    s = start % len(unit)
+    return (unit * reps)[s:s + n]
+
+
+def width_for(longest):
+    """Line width, a multiple of 64, that fits 63 filler bytes, a match
+    of LONGEST bytes and a newline."""
+    return 64 * ((63 + longest + 1 + 63) // 64)
+
+
+def sweep_literal(n):
+    rng = random.Random(0x5EED + n)
+    lit = bytes([rng.choice(LIT_ALPHABET[:26])])
+    lit += bytes(rng.choices(LIT_ALPHABET, k=n - 1))
+    return lit
+
+
+def mixed_case(s):
+    return bytes(c ^ 0x20 if 0x61 <= c <= 0x7A and i % 2 == 0 else c
+                 for i, c in enumerate(s))
+
+
+def oracle(data, pats, flags):
+    """Return the expected (status, stdout, stderr) of grep -F with the
+    keyword list PATS and the one-letter options in FLAGS (any of
+    'b', 'c', 'i', 'n', 'o', 'x'; not -w) on DATA, in a locale where DATA
+    is ASCII.  Matches are leftmost-longest and do not overlap."""
+    alts = sorted(set(pats), key=len, reverse=True)
+    rx = re.compile(b'|'.join(re.escape(p) for p in alts),
+                    re.IGNORECASE if 'i' in flags else 0)
+    lines = data.split(b'\n')
+    if data.endswith(b'\n'):
+        lines.pop()
+    out = []
+    count = 0
+    off = 0
+    for no, line in enumerate(lines, 1):
+        if 'x' in flags:
+            found = [(0, line)] if rx.fullmatch(line) else []
+        else:
+            found = [(m.start(), m.group()) for m in rx.finditer(line)]
+        if found:
+            count += 1
+            prefix = f'{no}:'.encode() if 'n' in flags else b''
+            if 'o' in flags:
+                for s, m in found:
+                    b = f'{off + s}:'.encode() if 'b' in flags else b''
+                    out.append(prefix + b + m + b'\n')
+            elif 'c' not in flags:
+                b = f'{off}:'.encode() if 'b' in flags else b''
+                out.append(prefix + b + line + b'\n')
+        off += len(line) + 1
+    if 'c' in flags:
+        out = [f'{count}\n'.encode()]
+    return (0 if count else 1, b''.join(out), b'')
+
+
+def oracle_flags(opts):
+    """Return the oracle flags for OPTS, or None if there is no oracle."""
+    flags = ''
+    for o in opts:
+        if o in ('-F', '-E'):
+            continue
+        if o not in ('-b', '-c', '-i', '-n', '-o', '-x'):
+            return None
+        flags += o[1]
+    return flags
+
+
+def write(path, data):
+    with open(path, 'wb') as f:
+        f.write(data)
+    return path
+
+
+def alignment_file(lit, nl):
+    """One line per offset 0..63 of LIT, a line where LIT straddles a
+    page boundary, a line that is exactly LIT, and a last line that ends
+    in LIT at the end of the file, followed by a newline if NL."""
+    n = len(lit)
+    w = width_for(n)
+    unit = lit[:max(1, n - 1)] + SWEEP_SEPS[n % len(SWEEP_SEPS):][:1]
+    out = bytearray()
+    for k in range(64):
+        # Every fourth line has the case-swapped literal, for -i.
+        word = lit.swapcase() if k % 4 == 3 else lit
+        out += cyc(unit, 7 * k, k) + word + cyc(unit, 3 * k, w - k - n - 1)
+        out += b'\n'
+    # Make the next literal straddle the next page (and so 64-byte)
+    # boundary.
+    page = (len(out) // 4096 + 1) * 4096
+    start = page - n // 2
+    out += cyc(unit, 5, start - len(out)) + lit + cyc(unit, 11, 9) + b'\n'
+    out += lit + b'\n'
+    out += (cyc(unit, 1, n % 13) if n % 2 else b'') + lit
+    if nl:
+        out += b'\n'
+    return bytes(out)
+
+
+def multi_patterns(count, minlen, seed, alphabet):
+    """COUNT keywords of at least MINLEN bytes, the first of length
+    MINLEN, many sharing prefixes or suffixes with each other."""
+    rng = random.Random(seed)
+    pats = [bytes(rng.choices(alphabet, k=minlen))]
+    while len(pats) < count:
+        n = minlen + rng.randint(0, max(2, minlen // 2))
+        r = rng.random()
+        o = rng.choice(pats)
+        if r < 0.3:
+            # Share a prefix.
+            k = min(len(o), max(1, n - 1))
+            p = o[:k] + bytes(rng.choices(alphabet, k=n - k))
+        elif r < 0.6:
+            # Share a suffix.
+            k = min(len(o), max(1, n - 1))
+            p = bytes(rng.choices(alphabet, k=n - k)) + o[-k:]
+        else:
+            p = bytes(rng.choices(alphabet, k=n))
+        if len(p) < minlen:
+            p += bytes(rng.choices(alphabet, k=minlen - len(p)))
+        if minlen > 1 and len(p) == minlen:
+            p += alphabet[:1]
+        pats.append(p)
+    return pats
+
+
+def multi_file(pats, nlines):
+    """NLINES lines, line K holding keyword K at offset K modulo 64,
+    every fifth line followed directly by another keyword."""
+    longest = max(len(p) for p in pats)
+    w = width_for(2 * longest)
+    out = bytearray()
+    for k in range(nlines):
+        p = pats[k % len(pats)]
+        q = pats[(7 * k + 3) % len(pats)]
+        unit = (p[:-1] or p) + b' ' + (q[1:] or q) + b'.'
+        word = p + (q if k % 5 == 0 else b'')
+        a = k % 64
+        out += cyc(unit, k, a) + word + cyc(unit, 2 * k, w - a - len(word) - 1)
+        out += b'\n'
+    return bytes(out)
+
+
+def build_sweep(workdir, full, locales):
+    """Return the list of SweepCase, and the number of skipped cases."""
+    root = os.path.join(workdir, 'sweep')
+    os.makedirs(root, exist_ok=True)
+    locs = ['C'] + [x for x in locales if 'utf' in x.lower()][:1]
+    cases = []
+
+    def add(name, args, path, flags_from=None, pats=None, expect=None):
+        env = {'LC_ALL': locs[len(cases) % len(locs)]}
+        if expect is None and pats is not None:
+            flags = oracle_flags(flags_from)
+            if flags is not None:
+                with open(path, 'rb') as f:
+                    expect = oracle(f.read(), pats, flags)
+        cases.append(SweepCase(name, args, path, env, expect))
+
+    # 1. Alignment x length, single keyword.
+    lengths = range(1, 65) if full else SWEEP_LENGTHS
+    for li, n in enumerate(lengths):
+        lit = sweep_literal(n)
+        files = [write(os.path.join(root, f'align-L{n:02d}-nl{nl}'),
+                       alignment_file(lit, nl)) for nl in (0, 1)]
+        optsets = SWEEP_CORE_OPTS + (
+            SWEEP_EXTRA_OPTS if full
+            else [SWEEP_EXTRA_OPTS[li % len(SWEEP_EXTRA_OPTS)]])
+        for oi, o in enumerate(optsets):
+            pat = mixed_case(lit) if '-i' in o else lit
+            path = files[(n + oi) % 2]
+            add(f'align L={n} {" ".join(o)} {os.path.basename(path)}',
+                o + ['-e', pat.decode()], path, o, [pat])
+
+    # 2. Teddy: 2..32 keywords.
+    for count in SWEEP_TEDDY_SIZES:
+        for minlen in SWEEP_TEDDY_MINLENS:
+            pats = multi_patterns(count, minlen, count * 100 + minlen,
+                                  b'abcdefgh0123')
+            tag = f'teddy-n{count:02d}-m{minlen:02d}'
+            pf = write(os.path.join(root, tag + '.pats'),
+                       b'\n'.join(pats) + b'\n')
+            path = write(os.path.join(root, tag), multi_file(pats, 64))
+            o = ['-F', '-o', '-b']
+            add(f'teddy n={count} minlen={minlen}', o + ['-f', pf], path,
+                o, pats)
+
+    # 3. Dense Aho-Corasick DFA: more than 32 keywords.
+    for count in SWEEP_AC_SIZES:
+        pats = multi_patterns(count, 3, 7000 + count,
+                              b'abcdefghijklmnop')
+        tag = f'ac-n{count:03d}'
+        pf = write(os.path.join(root, tag + '.pats'), b'\n'.join(pats) + b'\n')
+        path = write(os.path.join(root, tag),
+                     multi_file(pats, max(64, count)))
+        o = ['-F', '-o', '-b']
+        add(f'ac n={count}', o + ['-f', pf], path, o, pats)
+    # ripgrep issue 1334: 40 identical keywords.
+    dup = b'1.208.0.0/12'
+    pf = write(os.path.join(root, 'ac-dup.pats'), (dup + b'\n') * 40)
+    lines = []
+    for k in range(64):
+        near = [b'1.208.0.0/1 ', b'1.208.0.0/13', b'1.208.0.1/12'][k % 3]
+        word = dup if k % 2 == 0 else near
+        lines.append(b'x' * k + word + b' 10.0.0.0/8' + b'x' * (64 - k))
+    path = write(os.path.join(root, 'ac-dup'), b'\n'.join(lines) + b'\n')
+    add('ac duplicate keywords', ['-F', '-n', '-f', pf], path,
+        ['-F', '-n'], [dup])
+
+    # 4. Self-overlapping traps with fixed expected output.
+    for name, o, hay, match in SWEEP_TRAPS:
+        w = width_for(len(hay)) - 32
+        lines = [b'x' * k + hay + b'x' * (w - k - len(hay) - 1)
+                 for k in range(32)]
+        path = write(os.path.join(root, 'trap-' + name),
+                     b'\n'.join(lines) + b'\n')
+        add(f'trap {name}', o, path, expect=(0, (match + b'\n') * 32, b''))
+    # The traps run in the C locale.
+    for c in cases[-len(SWEEP_TRAPS):]:
+        c.env = {'LC_ALL': 'C'}
+    return cases
+
+
+def check_sweep(case, baseline, candidate, threads, stdin_threads):
+    """Run CASE through the baseline, then the candidate at each of
+    THREADS on the file and at STDIN_THREADS on a pipe.  Return the
+    number of runs and a list of failures."""
+    same = os.path.realpath(baseline) == os.path.realpath(candidate)
+    want = run(baseline, case.args + [case.path], case.env,
+               1 if same else None, False)
+    runs = 1
+    failures = []
+    if case.expect is not None and want != case.expect:
+        what = [n for n, a, b in zip(('status', 'stdout', 'stderr'),
+                                     case.expect, want) if a != b]
+        failures.append(('baseline vs expected', what))
+    for t in threads:
+        got = run(candidate, case.args + [case.path], case.env, t, False)
+        runs += 1
+        if got != want:
+            what = [n for n, a, b in zip(('status', 'stdout', 'stderr'),
+                                         want, got) if a != b]
+            failures.append((t, what))
+    for t in stdin_threads:
+        got = run(candidate, case.args, case.env, t, False,
+                  stdin_path=case.path)
+        runs += 1
+        if got != want:
+            what = [n for n, a, b in zip(('status', 'stdout', 'stderr'),
+                                         want, got) if a != b]
+            failures.append((f'stdin/{t}', what))
+    return runs, failures
+
+
+def run_sweep(baseline, candidate, threads, workdir, full, locales, jobs):
+    """Run the sweep; return the number of failures."""
+    start = time.monotonic()
+    cases = build_sweep(workdir, full, locales)
+
+    def one(item):
+        i, case = item
+        # Feed each case through a pipe at one of the thread counts,
+        # in turn, or at all of them with --full.
+        st = threads if full else [threads[i % len(threads)]]
+        return case, check_sweep(case, baseline, candidate, threads, st)
+
+    nfail = nruns = 0
+    with concurrent.futures.ThreadPoolExecutor(jobs) as ex:
+        for case, (runs, failures) in ex.map(one, enumerate(cases)):
+            nruns += runs
+            if failures:
+                nfail += 1
+                with open(case.path + '.cmd', 'w') as f:
+                    f.write(f'{case.env} grep {case.args!r} {case.path}\n'
+                            f'{case.name}\nFAIL {failures}\n')
+                print(f'FAIL sweep {case.name}: {case.env} '
+                      f'args={case.args!r} input={case.path} {failures}',
+                      flush=True)
+    nexp = sum(c.expect is not None for c in cases)
+    print(f'sweep{" (full)" if full else ""}: {len(cases)} configurations '
+          f'({nexp} with an expected output), {nruns} runs, '
+          f'{nfail} failures, {time.monotonic() - start:.1f}s', flush=True)
+    return nfail
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -366,6 +737,13 @@ def main():
     ap.add_argument('--control',
                     help='another build to rerun failing cases with; failures '
                     'that it shares are reported as pre-existing')
+    ap.add_argument('--sweep', action='store_true',
+                    help='run only the deterministic sweep, no random cases')
+    ap.add_argument('--full', action='store_true',
+                    help='run the full sweep: every keyword length 1..64, '
+                    'every option set, pipes at every thread count')
+    ap.add_argument('--no-sweep', action='store_true',
+                    help='run only the random cases')
     opts = ap.parse_args()
     if opts.baseline == 'benchmarks/grep-baseline' and not os.path.exists(opts.baseline):
         opts.baseline = opts.candidate
@@ -395,9 +773,10 @@ def main():
 
     nfail = npre = 0
     stats = {'match': 0, 'nomatch': 0, 'trouble': 0}
+    ncases = 0 if opts.sweep else opts.cases
     with concurrent.futures.ThreadPoolExecutor(opts.jobs) as ex:
         for i, (case, want, failures, shared) in enumerate(
-                ex.map(one, range(opts.cases))):
+                ex.map(one, range(ncases))):
             stats['match' if want[0] == 0 else 'nomatch' if want[0] == 1
                   else 'trouble'] += 1
             if failures:
@@ -414,8 +793,11 @@ def main():
             if (i + 1) % 250 == 0:
                 print(f'{i + 1} cases, {nfail} failures, {npre} pre-existing',
                       flush=True)
-    print(f'{opts.cases} cases ({stats}), {nfail} failures, '
+    print(f'{ncases} cases ({stats}), {nfail} failures, '
           f'{npre} pre-existing failures shared with the control build')
+    if not opts.no_sweep:
+        nfail += run_sweep(baseline, candidate, threads, workdir, opts.full,
+                           locales, opts.jobs)
     if not opts.workdir and nfail == 0:
         shutil.rmtree(workdir, ignore_errors=True)
     return 1 if nfail else 0
