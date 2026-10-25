@@ -100,6 +100,83 @@ static void grep_test_delay (char const *site);
 # define GREP_TEST_DELAY(site) ((void) 0)
 #endif
 
+/* Route trace.  Each place where grep decides how to search an operand
+   calls GREP_TEST_ROUTE (ROUTE, NAME).  In a build with
+   -DGREP_TEST_HOOKS, setting the environment variable
+   GREP_ROUTE_LOG=FILE appends one line "ROUTE<TAB>NAME" to FILE for
+   each such call, so a test can check which path searched its input.
+   GREP_ROUTE_LOG=list prints every route and exits.  Lines from
+   different threads may appear in any order.  NAME is the operand (or
+   nullptr for none); a tab or newline in it is written as '?'.
+
+   Other builds compile the trace away: the macro expands to a no-op
+   that only checks at compile time that ROUTE names a route, and does
+   not evaluate NAME.  NAME must therefore have no side effects.
+
+   To add a route, add a line to GREP_ROUTES, call GREP_TEST_ROUTE at
+   the new decision point, and add a case to tests/parallel-route-trace,
+   which fails if a route has no case.
+
+   Route                 Taken when
+   serial                single-threaded search of an operand
+   file-queue            a file operand goes to the worker queue
+   file-chunk            a large file operand is searched in chunks
+   stdin-queue           standard input goes to the worker queue
+   stdin-chunk           a large regular-file stdin is searched in chunks
+   stdin-slice           a pipe on stdin is cut into slices
+   walk-files            16 or more file operands go to the walker
+   walk-dirs             directory operands go to the recursive walker
+   walk-bin-scan         -q on a large binary file in a walk, in slices
+   quiet-mmap            -q on a large binary file, in one mmap scan
+   chunk-quiet-probe     -q probes the first 96 KiB before chunking
+   chunk-fallback        chunking gave up (NUL early, mmap failure)
+   chunk-count           chunks counted (-c, -l, -L, -q)
+   chunk-stateless       chunks printed without line numbers or context
+   chunk-nul-sequential  pass 1 found a NUL after the first 96 KiB; the
+                         file is searched sequentially instead
+   chunk-nul-research    single-pass chunks found a NUL; the file is
+                         searched again sequentially
+   chunk-context         pass-1 matches formatted directly (context, or
+                         fewer matches than the cap)
+   chunk-enc-sequential  context output dropped a line with an encoding
+                         error; the file is searched sequentially
+   chunk-lineno          chunks searched again with line numbers (-v,
+                         or too many matches)  */
+#define GREP_ROUTES(X)                                  \
+  X (SERIAL, "serial")                                  \
+  X (FILE_QUEUE, "file-queue")                          \
+  X (FILE_CHUNK, "file-chunk")                          \
+  X (STDIN_QUEUE, "stdin-queue")                        \
+  X (STDIN_CHUNK, "stdin-chunk")                        \
+  X (STDIN_SLICE, "stdin-slice")                        \
+  X (WALK_FILES, "walk-files")                          \
+  X (WALK_DIRS, "walk-dirs")                            \
+  X (WALK_BIN_SCAN, "walk-bin-scan")                    \
+  X (QUIET_MMAP, "quiet-mmap")                          \
+  X (CHUNK_QUIET_PROBE, "chunk-quiet-probe")            \
+  X (CHUNK_FALLBACK, "chunk-fallback")                  \
+  X (CHUNK_COUNT, "chunk-count")                        \
+  X (CHUNK_STATELESS, "chunk-stateless")                \
+  X (CHUNK_NUL_SEQUENTIAL, "chunk-nul-sequential")      \
+  X (CHUNK_NUL_RESEARCH, "chunk-nul-research")          \
+  X (CHUNK_CONTEXT, "chunk-context")                    \
+  X (CHUNK_ENC_SEQUENTIAL, "chunk-enc-sequential")      \
+  X (CHUNK_LINENO, "chunk-lineno")
+
+enum grep_route
+{
+#define GREP_ROUTE_ENUM(id, name) GREP_ROUTE_##id,
+  GREP_ROUTES (GREP_ROUTE_ENUM)
+#undef GREP_ROUTE_ENUM
+};
+
+#ifdef GREP_TEST_HOOKS
+static void grep_test_route (enum grep_route route, char const *name);
+# define GREP_TEST_ROUTE(route, name) grep_test_route (GREP_ROUTE_##route, name)
+#else
+# define GREP_TEST_ROUTE(route, name) ((void) GREP_ROUTE_##route)
+#endif
+
 enum { SEP_CHAR_SELECTED = ':' };
 enum { SEP_CHAR_REJECTED = '-' };
 static char const SEP_STR_GROUP[] = "--";
@@ -2306,11 +2383,13 @@ grep_try_fast_binary_mmap (int fd, struct stat *st, idx_t residue,
 #endif
   if (walk_cur_task && st->st_size >= WALK_BIN_SCAN_MIN && pool_target > 1)
     {
+      GREP_TEST_ROUTE (WALK_BIN_SCAN, input_filename ());
       if (walk_bin_scan (map, st->st_size, scan_start))
         *nlines_inout = 1;
     }
   else if (scan_start < (size_t) st->st_size)
     {
+      GREP_TEST_ROUTE (QUIET_MMAP, input_filename ());
       idx_t msize = 0;
       ptrdiff_t off = execute (compiled_pattern, map + scan_start,
                                st->st_size - scan_start, &msize, nullptr);
@@ -5346,6 +5425,7 @@ chunk_slot_done_locked (struct chunk_file_state *state)
 
   if (atomic_load_explicit (&state->has_nul, memory_order_relaxed))
     {
+      GREP_TEST_ROUTE (CHUNK_NUL_RESEARCH, state->fname);
       struct rob_slot *result = xzalloc (sizeof *result);
       pthread_mutex_unlock (&pool_mutex);
       chunk_search_to_slot (state, result);
@@ -5485,6 +5565,7 @@ format_context_matches_to_rob (char const *fname, struct chunk_file_state *state
       /* After omitting a line with an encoding error, single-threaded
          grep prints context lines that depend on where its read buffers
          happen to end.  Search the file as it does.  */
+      GREP_TEST_ROUTE (CHUNK_ENC_SEQUENTIAL, fname);
       task_reset ();
       pthread_mutex_unlock (&pool_mutex);
       status = chunk_search_sequentially (state, fname);
@@ -5530,6 +5611,7 @@ rob_enqueue_empty_last_chunk (char const *fname)
 static void
 chunked_fallback_enqueue (int fd, bool close_fd, char const *fname)
 {
+  GREP_TEST_ROUTE (CHUNK_FALLBACK, fname);
   if (close_fd)
     {
       close (fd);
@@ -5925,7 +6007,10 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname,
   struct stat st = *st_in;
 
   if (exit_on_match && !out_invert && !pool_started)
-    chunk_try_early_quiet_match (fd, fname, &st);
+    {
+      GREP_TEST_ROUTE (CHUNK_QUIET_PROBE, fname);
+      chunk_try_early_quiet_match (fd, fname, &st);
+    }
   ensure_pool ();
 
   if (!out_quiet && list_files == LISTFILES_NONE && 1 < max_count
@@ -5953,12 +6038,14 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname,
 
   if (count_matches || exit_on_match || list_files != LISTFILES_NONE)
     {
+      GREP_TEST_ROUTE (CHUNK_COUNT, fname);
       enqueue_single_pass_chunks (state, fname, CHUNK_MODE_COUNT);
       return;
     }
 
   if (!out_line && out_before < 0 && out_after < 0 && max_count == INTMAX_MAX)
     {
+      GREP_TEST_ROUTE (CHUNK_STATELESS, fname);
       enqueue_single_pass_chunks (state, fname, CHUNK_MODE_STATELESS);
       return;
     }
@@ -5966,6 +6053,7 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname,
   chunk_run_mmap_scan_pass1 (state);
   if (atomic_load (&state->has_nul))
     {
+      GREP_TEST_ROUTE (CHUNK_NUL_SEQUENTIAL, fname);
       chunk_sequential_to_rob (fname, state);
       return;
     }
@@ -5975,10 +6063,12 @@ chunked_grep_fd (int fd, bool close_fd, char const *fname,
           && !atomic_load (&state->match_overflow)
           && state->match_count < state->match_cap))
     {
+      GREP_TEST_ROUTE (CHUNK_CONTEXT, fname);
       format_context_matches_to_rob (fname, state);
       return;
     }
 
+  GREP_TEST_ROUTE (CHUNK_LINENO, fname);
   chunk_enqueue_line_number_pass2 (state, fname);
 }
 
@@ -8119,6 +8209,7 @@ producer_run (char *const *files)
     }
   if (!has_stdin && nfiles >= 16 && pool_target > 1 && directories != RECURSE_DIRECTORIES)
     {
+      GREP_TEST_ROUTE (WALK_FILES, files[0]);
       walk_run_cmd_files (files, nfiles);
       return;
     }
@@ -8141,6 +8232,7 @@ producer_run (char *const *files)
               && list_files == LISTFILES_NONE && !exit_on_match
               && max_count == INTMAX_MAX)
             {
+              GREP_TEST_ROUTE (STDIN_CHUNK, label);
               chunked_grep_fd (STDIN_FILENO, false, label ? label : _("(standard input)"), &st);
               rob_wait_all_committed ();
             }
@@ -8149,9 +8241,15 @@ producer_run (char *const *files)
                    && out_before < 0 && out_after < 0 && max_count == INTMAX_MAX
                    && !done_on_match && !line_buffered && !possibly_tty
                    && binary_files != WITHOUT_MATCH_BINARY_FILES)
-            stream_slicer_stdin ();
+            {
+              GREP_TEST_ROUTE (STDIN_SLICE, label);
+              stream_slicer_stdin ();
+            }
           else
-            producer_enqueue_stdin ();
+            {
+              GREP_TEST_ROUTE (STDIN_QUEUE, label);
+              producer_enqueue_stdin ();
+            }
         }
       else
         {
@@ -8171,6 +8269,7 @@ producer_run (char *const *files)
                       else
                         break;
                     }
+                  GREP_TEST_ROUTE (WALK_DIRS, *f);
                   walk_run_dirs (f, f_end - f);
                   f = f_end - 1;
                 }
@@ -8178,12 +8277,21 @@ producer_run (char *const *files)
                        && pool_target > 1
                        && (!out_invert || (out_before < 0 && out_after < 0))
                        && max_count == INTMAX_MAX)
-                chunked_grep_file (*f, &st);
+                {
+                  GREP_TEST_ROUTE (FILE_CHUNK, *f);
+                  chunked_grep_file (*f, &st);
+                }
               else
-                producer_enqueue_file (*f, true, true);
+                {
+                  GREP_TEST_ROUTE (FILE_QUEUE, *f);
+                  producer_enqueue_file (*f, true, true);
+                }
             }
           else
-            producer_enqueue_file (*f, true, true);
+            {
+              GREP_TEST_ROUTE (FILE_QUEUE, *f);
+              producer_enqueue_file (*f, true, true);
+            }
         }
     }
   producer_flush_batch ();
@@ -8959,6 +9067,68 @@ grep_test_delay (char const *site)
         return;
       }
 }
+
+/* The names of the routes; see GREP_TEST_ROUTE.  */
+static char const *const test_route_names[] =
+{
+#define GREP_ROUTE_NAME(id, name) name,
+  GREP_ROUTES (GREP_ROUTE_NAME)
+#undef GREP_ROUTE_NAME
+};
+
+/* The descriptor of the GREP_ROUTE_LOG file, or -1 if there is none.  */
+static int test_route_fd = -1;
+
+/* Open the file named by GREP_ROUTE_LOG.  Call this before starting
+   threads.  */
+static void
+init_test_routes (void)
+{
+  char const *env = getenv ("GREP_ROUTE_LOG");
+  if (!env || !*env)
+    return;
+  if (STREQ (env, "list"))
+    {
+      for (size_t i = 0;
+           i < sizeof test_route_names / sizeof *test_route_names; i++)
+        puts (test_route_names[i]);
+      exit (EXIT_SUCCESS);
+    }
+  int fd = open (env, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
+  if (fd < 0)
+    die (EXIT_TROUBLE, errno, "GREP_ROUTE_LOG=%s", env);
+  /* Keep descriptors 0-2 free, so that a closed standard stream stays
+     closed as far as the rest of grep can tell.  */
+  if (fd <= STDERR_FILENO)
+    {
+      int high = fcntl (fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+      if (high < 0)
+        die (EXIT_TROUBLE, errno, "GREP_ROUTE_LOG=%s", env);
+      close (fd);
+      fd = high;
+    }
+  test_route_fd = fd;
+}
+
+static void
+grep_test_route (enum grep_route route, char const *name)
+{
+  if (test_route_fd < 0)
+    return;
+  int saved_errno = errno;
+  char line[512];
+  char const *r = test_route_names[route];
+  size_t n = strlen (r);
+  memcpy (line, r, n);
+  line[n++] = '\t';
+  for (char const *p = name ? name : "-"; *p && n < sizeof line - 1; p++)
+    line[n++] = *p == '\t' || *p == '\n' ? '?' : *p;
+  line[n++] = '\n';
+  /* One write per line, so that lines from different threads do not
+     interleave in the O_APPEND file.  */
+  ignore_value (write (test_route_fd, line, n));
+  errno = saved_errno;
+}
 #endif
 
 int
@@ -9005,6 +9175,7 @@ main (int argc, char **argv)
   c_stack_action (nullptr);
 #ifdef GREP_TEST_HOOKS
   init_test_delays ();
+  init_test_routes ();
 #endif
 
   pattern_table = hash_initialize (0, nullptr, hash_pattern, compare_patterns,
@@ -9130,7 +9301,10 @@ main (int argc, char **argv)
       init_worker_buffer ();
       bool status = true;
       do
-        status &= grep_command_line_arg (*files++);
+        {
+          GREP_TEST_ROUTE (SERIAL, *files);
+          status &= grep_command_line_arg (*files++);
+        }
       while (*files);
 
       free_compiled_pattern (primary_compiled_pattern);

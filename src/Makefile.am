@@ -37,9 +37,13 @@ endif
 noinst_HEADERS = grep.h search.h system.h
 
 # Test-only builds of grep, never installed.  grep-hooks honors
-# GREP_DELAY_AT (see GREP_TEST_DELAY in grep.c).  grep-shrunk also uses
+# GREP_DELAY_AT (see GREP_TEST_DELAY in grep.c) and GREP_ROUTE_LOG,
+# which logs the path that searched each operand (see GREP_TEST_ROUTE
+# in grep.c and tests/parallel-route-trace).  grep-shrunk also uses
 # tiny queues, buffers and batches, so that every path that waits for
 # space or splits work runs often, and recruits and splits eagerly.
+# Only -DGREP_TEST_HOOKS enables the hooks; the installed grep is built
+# without it and compiles them away.
 check_PROGRAMS = grep-hooks grep-shrunk
 grep_hooks_SOURCES = $(grep_SOURCES)
 grep_hooks_CPPFLAGS = $(AM_CPPFLAGS) -DGREP_TEST_HOOKS

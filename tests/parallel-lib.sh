@@ -25,6 +25,19 @@
 #   ioregN       likewise, with short reads from regular files too
 #   delay=SPEC   run with GREP_DELAY_AT=SPEC (SPEC uses ";" for ",")
 # A failing case prints a command line that replays it.
+#
+# pl_route ROUTE INPUT ARGS... checks which path searches the input.  It
+# runs grep ARGS with the route binary (PL_ROUTE_BIN, default shrunk) at
+# PL_ROUTE_THREADS threads (default 4) and GREP_ROUTE_LOG set, requires
+# ROUTE in the route log, and requires the same stdout, stderr and exit
+# status as GREP_THREADS=1 src/grep.  ROUTE written as ROUTE:N requires
+# exactly N such lines, e.g. one per chunked operand; ROUTE written as
+# !ROUTE requires that the route was not taken.  pl_route_coverage [ROUTE...] then fails
+# unless every route the binary lists was required by some pl_route,
+# except the ROUTEs given, which the caller could not reach here.  The
+# routes and how to add one are described at GREP_TEST_ROUTE in
+# src/grep.c.  The route trace exists only in grep-hooks and
+# grep-shrunk; src/grep ignores GREP_ROUTE_LOG.
 
 pl_fail=0
 pl_cases=0
@@ -452,6 +465,90 @@ pl_check_outfile ()
     pr_replay="env $po_env grep $* > tree/zz_out.txt"
     pl_same pl_of_got pl_of_ref \
       || pl_report "$po_cand, output in tree" pl_of_got pl_of_ref "$@"
+  done
+}
+
+# pl_route ROUTE INPUT ARGS...
+pl_route ()
+{
+  pr_route=$1 pr_in=$2
+  shift 2
+  pr_bin=${PL_ROUTE_BIN-shrunk}
+  test "$(eval echo \$pl_have_$pr_bin)" = yes \
+    || framework_failure_ "pl_route needs src/grep-$pr_bin"
+  pl_cases=$((pl_cases + 1))
+  pr_dir=pl_res/r$pl_cases
+  mkdir -p $pr_dir || framework_failure_
+  pl_exec rel $pr_dir/ref "$pr_in" "GREP_THREADS=1 $PL_ENV" -- "$@"
+  pr_log=$PWD/$pr_dir/route.log
+  pr_env="GREP_THREADS=${PL_ROUTE_THREADS-4} GREP_ROUTE_LOG=$pr_log $PL_ENV"
+  pl_exec $pr_bin $pr_dir/got "$pr_in" "$pr_env" -- "$@"
+  pr_replay="env $pr_env PATH=$(pl_bin_dir $pr_bin):\$PATH grep $*"
+  case $pr_in in
+    -) ;;
+    \|*) pr_replay="cat ${pr_in#|} | $pr_replay";;
+    *) pr_replay="$pr_replay < $pr_in";;
+  esac
+  pr_ok=yes
+  pl_same $pr_dir/got $pr_dir/ref || {
+    pl_report "route $pr_route" $pr_dir/got $pr_dir/ref "$@"
+    pr_ok=no
+  }
+  pr_name=${pr_route#!}
+  pr_want=
+  case $pr_name in
+    *:*) pr_want=${pr_name##*:} pr_name=${pr_name%:*};;
+  esac
+  pr_n=0
+  test -f "$pr_log" \
+    && pr_n=$(awk -F '\t' -v r="$pr_name" '$1 == r { n++ } END { print n + 0 }' \
+                "$pr_log")
+  if test $pr_n -gt 0; then pr_taken=yes; else pr_taken=no; fi
+  case $pr_route in
+    !*) test $pr_taken = no || pr_ok=no;;
+    *) test $pr_taken = yes || pr_ok=no
+       test -z "$pr_want" || test $pr_n = "$pr_want" || pr_ok=no;;
+  esac
+  if test $pr_ok = yes; then
+    case $pr_route in
+      !*) ;;
+      *) echo "$pr_name" >> pl_routes_required;;
+    esac
+    rm -rf $pr_dir
+  else
+    if test "$pr_taken" = yes; then pr_what="taken $pr_n times"
+    else pr_what='not taken'; fi
+    echo "FAIL [route $pr_route: $pr_name $pr_what]: grep $*" >&2
+    echo "  replay: (cd $PWD && $pr_replay)" >&2
+    echo "  routes:" $(cut -f1 "$pr_log" 2>/dev/null | sort -u) >&2
+    pl_fail=1
+  fi
+}
+
+# pl_route_coverage [ROUTE...]
+pl_route_coverage ()
+{
+  pc_all=$(env GREP_ROUTE_LOG=list pl_bin/${PL_ROUTE_BIN-shrunk}/grep) \
+    || framework_failure_
+  test -n "$pc_all" || framework_failure_
+  touch pl_routes_required
+  for pc_r in $pc_all; do
+    case " $* " in
+      *" $pc_r "*) continue;;
+    esac
+    awk -v r="$pc_r" '$0 == r { f = 1 } END { exit !f }' pl_routes_required \
+      || {
+        echo "FAIL [route coverage]: no pl_route case requires $pc_r" >&2
+        pl_fail=1
+      }
+  done
+  # Catch exemptions that name no route, e.g. after a rename.
+  for pc_r in "$@"; do
+    case " $(echo $pc_all) " in
+      *" $pc_r "*) ;;
+      *) echo "FAIL [route coverage]: unknown route $pc_r" >&2
+         pl_fail=1;;
+    esac
   done
 }
 

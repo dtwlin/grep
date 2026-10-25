@@ -235,6 +235,15 @@ GREP_THREADS=1 grep -rn pattern .   # single-threaded
 
 Changing `GREP_THREADS` only affects speed — the output and line order are always identical.
 
+### 🧪 Test-only builds
+
+`make check` also builds `src/grep-hooks` and `src/grep-shrunk`; neither is installed. They are compiled with `-DGREP_TEST_HOOKS`, which enables two environment variables used by the tests:
+
+- `GREP_DELAY_AT=SITE:USEC[,...]` sleeps at thread hand-off points to widen race windows.
+- `GREP_ROUTE_LOG=FILE` appends one line per operand naming the search path taken (`file-chunk`, `stdin-slice`, `walk-dirs`, ...); `GREP_ROUTE_LOG=list` prints every route. `tests/parallel-route-trace` requires a case for each route.
+
+The installed `grep` is built without `-DGREP_TEST_HOOKS`: the hooks compile to nothing, it ignores both variables, and its machine code is identical to a build without them. The route list and the steps for adding one are documented at `GREP_TEST_ROUTE` in `src/grep.c`.
+
 ## ⚠️ Honest notes
 
 - **CPU and memory for time.** Parallel runs burn more CPU-seconds to finish sooner, and a whole-tree search peaks at ~37–132 MB of resident memory (GNU grep, ripgrep, and ugrep: ≤ 51 MB). Lower `GREP_THREADS` on shared machines.

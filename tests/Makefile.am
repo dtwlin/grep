@@ -161,6 +161,7 @@ TESTS =						\
   parallel-multithread-cases			\
   parallel-pcre-must				\
   parallel-refactor				\
+  parallel-route-trace				\
   parallel-sched-fuzz				\
   parallel-shrunk-limits			\
   parallel-stage1-optim				\

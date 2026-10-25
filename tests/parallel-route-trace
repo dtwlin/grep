@@ -1,0 +1,128 @@
+#! /bin/sh
+# Check the route trace of the test builds, and that each input reaches
+# the path meant for it.  A test build run with GREP_ROUTE_LOG=FILE
+# writes to FILE one line per decision about how to search an operand;
+# see GREP_TEST_ROUTE in src/grep.c.  Every route needs a case below:
+# the test fails if the build lists a route that no case requires, so
+# adding a route to src/grep.c means adding a case here.  The "!ROUTE"
+# cases are routing guards: they pin paths that some options must avoid.
+#
+# The trace must not exist in the release build: src/grep must ignore
+# GREP_ROUTE_LOG and must not contain the route names.
+#
+# Copyright (C) 2026 David Lin <dtwlin@gmail.com>
+#
+# Copying and distribution of this file, with or without modification,
+# are permitted in any medium without royalty provided the copyright
+# notice and this notice are preserved.
+
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+. "$abs_srcdir/parallel-lib.sh"
+
+pl_setup_bins
+pl_have_bin shrunk || skip_ "src/grep-shrunk is not built"
+pl_have_shrunk=yes
+PL_TIMEOUT=${PL_TIMEOUT:-30}
+
+# The release build compiles the trace away.
+env GREP_ROUTE_LOG="$PWD/rel.log" grep -c x /dev/null > /dev/null
+test -e rel.log && { echo "FAIL: src/grep wrote GREP_ROUTE_LOG" >&2; pl_fail=1; }
+test "$(env GREP_ROUTE_LOG=list grep -c x /dev/null)" = 0 \
+  || { echo "FAIL: src/grep honors GREP_ROUTE_LOG=list" >&2; pl_fail=1; }
+if LC_ALL=C grep -a -q -F chunk-nul-sequential "$abs_top_builddir/src/grep"
+then
+  echo "FAIL: src/grep contains route names" >&2
+  pl_fail=1
+fi
+
+# Inputs, sized for grep-shrunk: files of at least 128 KiB are chunked,
+# the first 96 KiB decide whether a NUL stops chunking, and a -q search
+# of a binary file uses one mmap scan from 2 MiB.
+$PERL -e '
+  sub put { my ($f, $s) = @_; open my $h, ">", $f or die "$f: $!";
+            print $h $s; close $h or die "$f: $!"; }
+  my $big = join "", map { "line $_ text\n" } 1 .. 40000;
+  put ("big.txt", $big);
+  put ("nul_early.txt", substr ($big, 0, 50000) . "x\0y\n" . $big);
+  put ("nul_late.txt", $big . "x\0y\n" . $big);
+  put ("enc.txt", substr ($big, 0, 300000) . "ctx \377 byte\nneedle\n" . $big);
+  my $bin = ("z" x 1023 . "\n") x 2100;
+  put ("bin.dat", $bin . "\0needle\n");
+  put ("s1", "small 7\n");
+  put ("s2", "small 8\n");
+  put ("ops$_", "op $_\n") for 1 .. 16;
+  mkdir "tree"; put ("tree/a", "small 7\n"); put ("tree/bin.dat", $bin . "\0needle\n");
+' || framework_failure_
+
+# Top-level dispatch.
+PL_ROUTE_THREADS=1 pl_route serial - 7 s1 s2
+pl_route serial - 7 s1
+pl_route file-queue - 7 s1 s2
+pl_route walk-files - -c op ops1 ops2 ops3 ops4 ops5 ops6 ops7 ops8 ops9 \
+  ops10 ops11 ops12 ops13 ops14 ops15 ops16
+pl_route walk-dirs - -r small tree s1
+pl_route file-chunk - 777 big.txt s1
+pl_route stdin-chunk big.txt 777
+pl_route stdin-slice "|big.txt" 777
+pl_route stdin-queue s1 7 - s2
+
+# Modes of a chunked file.
+pl_route chunk-stateless - 777 big.txt
+pl_route chunk-count - -c 777 big.txt
+pl_route chunk-count - -l 777 big.txt s1
+pl_route chunk-context - -n 777 big.txt
+pl_route chunk-context - -C1 777 big.txt
+pl_route chunk-lineno - -n text big.txt
+pl_route chunk-lineno - -v -n 777 big.txt
+pl_route chunk-quiet-probe - -q 777 big.txt
+pl_route chunk-fallback - -n 777 nul_early.txt
+pl_route chunk-nul-sequential - -n 777 nul_late.txt
+pl_route chunk-nul-research - -c 777 nul_late.txt
+pl_route quiet-mmap - -q -F needle bin.dat
+pl_route walk-bin-scan - -r -q -F needle tree s1
+exempt=
+path_prepend_ .
+case $(get-mb-cur-max en_US.UTF-8) in
+  [3456]) utf8=yes;;
+  *) utf8=no;;
+esac
+if test $utf8 = yes; then
+  PL_ENV=LC_ALL=en_US.UTF-8 pl_route chunk-enc-sequential - -C1 needle enc.txt
+else
+  exempt=chunk-enc-sequential
+fi
+
+# Routing guards: options that a path does not support must avoid it.
+pl_route '!file-chunk' - -m1 777 big.txt s1
+pl_route '!file-chunk' - -v -C1 777 big.txt s1
+pl_route '!stdin-slice' "|big.txt" -C1 777
+pl_route '!stdin-slice' "|big.txt" -m1 777
+pl_route '!stdin-slice' "|big.txt" -q 777
+pl_route '!stdin-slice' "|big.txt" -l 777
+pl_route '!stdin-slice' "|big.txt" --binary-files=without-match 777
+pl_route '!stdin-chunk' big.txt -l 777
+pl_route '!stdin-chunk' big.txt -m1 777
+pl_route '!chunk-stateless' - -n 777 nul_late.txt
+
+# Trace lines from worker threads.
+pl_route walk-bin-scan - -r -q -F needle tree tree
+
+# The log must not take over a closed standard input: grep must still
+# diagnose "-" exactly as GREP_THREADS=1 src/grep does.
+env GREP_THREADS=1 grep -c 7 s1 s2 - > closed.exp 2>&1 0<&-
+echo $? >> closed.exp
+rm -f closed.log
+env GREP_THREADS=4 GREP_ROUTE_LOG="$PWD/closed.log" pl_bin/shrunk/grep \
+  -c 7 s1 s2 - > closed.out 2>&1 0<&-
+echo $? >> closed.out
+sed "s,pl_bin/shrunk/grep,grep," closed.out > closed.got || framework_failure_
+compare closed.exp closed.got || pl_fail=1
+awk -F '\t' '$1 == "stdin-queue" { f = 1 } END { exit !f }' closed.log || {
+  echo "FAIL: closed standard input not traced as stdin-queue" >&2
+  pl_fail=1
+}
+
+pl_route_coverage $exempt
+
+pl_summary
+Exit $pl_fail
