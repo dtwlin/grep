@@ -27,6 +27,20 @@ Regression entries in the adversarial tree:
   longdiag/   an unreadable file whose diagnostic exceeds 2 KiB
   bin/        binary files, so -C/-A/-B runs see quiet matches
   out*/       hold the output file in the output-file-in-tree runs
+The "walk" tree holds directory-walk cases from the ripgrep and ugrep
+test suites; its comparisons are labeled "walk-*":
+  cycle2/     sibling directories linking to each other (d1/d2 -> ../d2,
+              d2/d1 -> ../d1) and a link to a file in the parent
+  cycle3/     a cycle through three directories (a/b -> ../b, ...)
+  badname/    file and directory names that are not valid UTF-8,
+              searched with LC_ALL=C and LC_ALL=en_US.UTF-8
+  dots/       asdf., asdf, asdf.x and .dir., searched with --exclude-dir
+  ops/dir/    one directory named "./dir", "dir/" and "dir", with
+              --include, --exclude and --exclude-dir
+  dup/        a file and two links to it, named several times among
+              fewer and more than 16 operands
+  symop/      foo -> bar, searched as foo and foo/ with -r, -R and
+              -d recurse
 A separate tree holds names longer than PATH_MAX, which fts-based grep
 handles with -r but not with -R; its comparisons are labeled
 "deep_path_max".  Another one is deep and has a leaf directory at every
@@ -87,6 +101,12 @@ LARGE_OPTION_SETS = [
     ["-A2"], ["-B1"], ["-C3", "-n"], ["-A1", "--group-separator=XX"],
     ["-C1"], ["--binary-files=text"], ["-n", "-o"], ["-m5", "-n"],
 ]
+
+# Option sets for the directory-walk trees.
+WALK_OPTION_SETS = [[], ["-n"], ["-c"], ["-l"], ["-L"], ["-s"], ["-Z", "-l"],
+                    ["-h"]]
+WALK_EXTRA_OPTION_SETS = [["-q"], ["-m1"], ["-o"], ["-H", "-c"], ["-i", "-l"],
+                          ["--color=always", "-n"], ["-v", "-c"]]
 
 PATTERN = "needle"
 
@@ -279,6 +299,77 @@ def build_many_tree(root, count=48):
         write_file(os.path.join(root, f"f{i:03d}.txt"), "".join(lines))
 
 
+def build_walk_tree(root):
+    """Small trees for directory-walk corner cases taken from the ripgrep
+    and ugrep test suites; see run_walk_cases.  Names with invalid UTF-8
+    bytes are created as bytes."""
+    j = lambda *p: os.path.join(root, *p)
+
+    # Mutual directory symbolic links between siblings, and a file
+    # symbolic link to a file in the parent directory.
+    os.makedirs(j("cycle2", "d1"))
+    os.makedirs(j("cycle2", "d2"))
+    write_file(j("cycle2", "top.txt"), "needle top\n")
+    write_file(j("cycle2", "d1", "f.txt"), "needle d1\n")
+    write_file(j("cycle2", "d2", "f.txt"), "needle d2\n")
+    os.symlink("../d2", j("cycle2", "d1", "d2"))
+    os.symlink("../d1", j("cycle2", "d2", "d1"))
+    os.symlink("../top.txt", j("cycle2", "d1", "up.txt"))
+
+    # A cycle through three directories.
+    for d, nxt in (("a", "b"), ("b", "c"), ("c", "a")):
+        os.makedirs(j("cycle3", d))
+        write_file(j("cycle3", d, "f.txt"), f"needle {d}\n")
+        os.symlink(f"../{nxt}", j("cycle3", d, nxt))
+
+    # Names that are not valid UTF-8, including an unreadable file and
+    # a dangling symbolic link, whose diagnostics quote the name.
+    bad = os.fsencode(j("badname"))
+    os.makedirs(bad)
+    jb = lambda *p: os.path.join(bad, *p)
+    write_file(jb(b"foo\xffbar"), "needle in foo\\xffbar\n")
+    write_file(jb(b"plain.txt"), "needle plain\n")
+    write_file(jb(b"content.txt"), b"needle caf\xe9\nneedle \xc3\xa9t\xc3\xa9\n")
+    os.makedirs(jb(b"d\xfe", b"sub\xc3("))
+    write_file(jb(b"d\xfe", b"x\xfey.txt"), "needle in d\\xfe\n")
+    write_file(jb(b"d\xfe", b"sub\xc3(", b"z.txt"), "needle deeper\n")
+    write_file(jb(b"d\xfe", b"\xe2\x82\xac.txt"), "needle euro\n")
+    write_file(jb(b"noperm\xff.txt"), "needle unreadable\n", mode=0)
+    os.symlink(b"missing\xff", jb(b"dangling\xfe"))
+
+    # Trailing dots, which --exclude-dir globs must not strip.
+    for d in ("asdf.", "asdf", ".dir.", "asdf.x"):
+        os.makedirs(j("dots", d))
+        write_file(j("dots", d, "a.txt"), f"needle in {d}\n")
+    write_file(j("dots", "top.txt"), "needle top\n")
+
+    # One directory, to be named "./dir", "dir/" and "dir".
+    os.makedirs(j("ops", "dir", "sub", "deeper"))
+    os.makedirs(j("ops", "dir", "dir"))
+    for name in ("x.c", "x.h", "y.txt"):
+        write_file(j("ops", "dir", name), f"needle in {name}\n")
+    write_file(j("ops", "dir", "sub", "z.c"), "needle in sub/z.c\n")
+    write_file(j("ops", "dir", "sub", "deeper", "w.h"), "needle in w.h\n")
+    write_file(j("ops", "dir", "dir", "n.c"), "needle in dir/dir/n.c\n")
+
+    # A file and symbolic links to it, plus small files to pad the
+    # number of operands.
+    os.makedirs(j("dup"))
+    write_file(j("dup", "realfile"), "needle real\nplain\nneedle again\n")
+    os.symlink("realfile", j("dup", "sym1"))
+    os.symlink("realfile", j("dup", "sym2"))
+    for i in range(16):
+        write_file(j("dup", f"pad{i:02d}"),
+                   f"needle pad {i}\n" if i % 3 == 0 else f"pad {i}\n")
+
+    # A symbolic link to a directory, as an operand.
+    os.makedirs(j("symop", "bar", "sub"))
+    write_file(j("symop", "bar", "f.txt"), "needle bar\n")
+    write_file(j("symop", "bar", "sub", "g.txt"), "needle bar sub\n")
+    os.symlink("sub", j("symop", "bar", "lnk"))
+    os.symlink("bar", j("symop", "foo"))
+
+
 def large_base_lines(count=200000, seed=7):
     """About 11 MiB of text lines, with a matching line now and then."""
     lines = []
@@ -367,6 +458,19 @@ def build_large_files(root):
         os.rename(path + ".tmp", path)
 
 
+def locale_available(name):
+    """Whether the C library knows the locale NAME."""
+    import locale
+    saved = locale.setlocale(locale.LC_CTYPE)
+    try:
+        locale.setlocale(locale.LC_CTYPE, name)
+        return True
+    except locale.Error:
+        return False
+    finally:
+        locale.setlocale(locale.LC_CTYPE, saved)
+
+
 def fix_perms_for_removal(root):
     for dirpath, dirnames, filenames in os.walk(root):
         for d in dirnames:
@@ -418,8 +522,11 @@ class Runner:
 
     def run(self, binary, opts, roots, threads=None, cwd=None,
             stdout_path=None, timeout=300, argv0=ARGV0, combined=False,
-            pattern=None, nofile=None, stdin_path=None, pipe_path=None):
+            pattern=None, nofile=None, stdin_path=None, pipe_path=None,
+            locale=None):
         env = dict(self.env)
+        if locale:
+            env["LC_ALL"] = locale
         if threads is not None:
             env["GREP_THREADS"] = str(threads)
         # Same argv[0] for both binaries, so that diagnostics (which
@@ -477,7 +584,7 @@ class Runner:
 
     def compare(self, label, opts, roots, cwd=None, stdout_path=None,
                 fifo=None, argv0=ARGV0, combined=False, pattern=None,
-                nofile=None, stdin_path=None, pipe_path=None):
+                nofile=None, stdin_path=None, pipe_path=None, locale=None):
         if self.args.only and not any(o in label for o in self.args.only):
             return True
         def go(binary, threads):
@@ -489,7 +596,7 @@ class Runner:
             r = self.run(binary, opts, roots, threads, cwd, stdout_path,
                          argv0=argv0, combined=combined, pattern=pattern,
                          nofile=nofile, stdin_path=stdin_path,
-                         pipe_path=pipe_path)
+                         pipe_path=pipe_path, locale=locale)
             if fifo:
                 fifo.disarm()
             return r
@@ -568,6 +675,129 @@ class FifoWriter:
             time.sleep(0.3)
 
 
+def run_walk_cases(r, wd, quick):
+    """Directory-walk cases from the ripgrep and ugrep test suites, on the
+    tree built by build_walk_tree.  Output is compared unsorted, since
+    the walk must reproduce the fts order."""
+    walk = os.path.join(wd, "walk")
+    sets = WALK_OPTION_SETS + ([] if quick else WALK_EXTRA_OPTION_SETS)
+
+    # Symbolic link cycles.  -R prints each file once per name and warns
+    # once per looping name; -r does not follow links inside the tree.
+    for tree, operands in (
+            ("cycle2", [["cycle2"], ["cycle2/d1"], ["cycle2/d1/d2"],
+                        ["cycle2/d1", "cycle2/d2/d1"]]),
+            ("cycle3", [["cycle3"], ["cycle3/a/b"], ["cycle3/b", "cycle3/a"]])):
+        log(f"[{wd}] walk: {tree}")
+        for mode in ("-r", "-R"):
+            for opts in sets:
+                r.compare(f"walk-{tree}{mode}", [mode] + opts, operands[0],
+                          cwd=walk)
+            for opts in COMBINED_OPTION_SETS:
+                r.compare(f"walk-{tree}-2>&1{mode}", [mode] + opts,
+                          operands[0], cwd=walk, combined=True)
+            for ops in operands[1:]:
+                for opts in ([], ["-c"], ["-l"]):
+                    r.compare(f"walk-{tree}-operands{mode}", [mode] + opts,
+                              ops, cwd=walk, combined=True)
+            r.compare(f"walk-{tree}-dot{mode}", [mode, "-n"], [],
+                      cwd=os.path.join(walk, tree), combined=True)
+
+    # Names with invalid UTF-8 bytes, in a single-byte and in a UTF-8
+    # locale (if it is available).
+    log(f"[{wd}] walk: badname")
+    locales = ["C"] + (["en_US.UTF-8"] if locale_available("en_US.UTF-8")
+                       else [])
+    for loc in locales:
+        for mode in ("-r", "-R"):
+            for opts in sets + [["-a", "-n"], ["-o", "-b"]]:
+                r.compare(f"walk-badname-{loc}{mode}", [mode] + opts,
+                          ["badname"], cwd=walk, locale=loc)
+            for opts in ([], ["-c"], ["-l", "-s"]):
+                r.compare(f"walk-badname-{loc}-2>&1{mode}", [mode] + opts,
+                          ["badname"], cwd=walk, locale=loc, combined=True)
+            for opts in (["--exclude-dir=d?"], ["--include=foo*"],
+                         ["--exclude=*bar"], ["--exclude-dir=sub*", "-l"]):
+                r.compare(f"walk-badname-{loc}-glob{mode}", [mode] + opts,
+                          ["badname"], cwd=walk, locale=loc, combined=True)
+        bad = os.fsdecode(b"badname/d\xfe")
+        r.compare(f"walk-badname-{loc}-operands", ["-r", "-c"],
+                  [bad, bad + "/", os.fsdecode(b"badname/foo\xffbar"),
+                   os.fsdecode(b"badname/noperm\xff.txt")],
+                  cwd=walk, locale=loc, combined=True)
+
+    # Trailing dots: --exclude-dir=asdf. must not exclude asdf, and
+    # neither must --exclude-dir=asdf exclude asdf.
+    log(f"[{wd}] walk: trailing dots")
+    for mode in ("-r", "-R"):
+        for excl in (["--exclude-dir=asdf."], ["--exclude-dir=asdf"],
+                     ["--exclude-dir=asdf*"], ["--exclude-dir=.dir."],
+                     ["--exclude-dir=*."], ["--exclude-dir=asdf.",
+                                            "--exclude-dir=asdf"]):
+            for opts in ([], ["-l"], ["-c"]):
+                r.compare(f"walk-dots{mode}", [mode] + excl + opts, ["dots"],
+                          cwd=walk)
+            r.compare(f"walk-dots-operands{mode}", [mode, "-c"] + excl,
+                      ["dots/asdf.", "dots/asdf./", "dots/asdf", "dots/.dir."],
+                      cwd=walk, combined=True)
+
+    # One directory spelled as "./dir", "dir/" and "dir", alone and
+    # with the other spellings; --exclude-dir and --exclude also apply
+    # to command-line operands.
+    log(f"[{wd}] walk: operand spellings")
+    ops = os.path.join(walk, "ops")
+    globs = [[], ["--include=*.c"], ["--exclude=*.c"], ["--exclude=x*"],
+             ["--exclude-dir=sub"], ["--exclude-dir=dir"],
+             ["--exclude-dir=deep*"], ["--exclude=dir"], ["--exclude-dir=."],
+             ["--include=*.h", "--exclude-dir=sub"],
+             ["--exclude-dir=*", "--include=*.c"]]
+    for mode in ("-r", "-R"):
+        for spelling in ("./dir", "dir/", "dir"):
+            for opts in globs:
+                r.compare(f"walk-ops{mode}", [mode] + opts, [spelling],
+                          cwd=ops)
+        for opts in (globs[:6] if quick else globs):
+            r.compare(f"walk-ops-all{mode}", [mode, "-c"] + opts,
+                      ["./dir", "dir/", "dir", "dir/x.c", "./dir/sub"],
+                      cwd=ops, combined=True)
+            r.compare(f"walk-ops-dot{mode}", [mode] + opts, [],
+                      cwd=os.path.join(ops, "dir"))
+
+    # A file named several times, directly and through symbolic links,
+    # with fewer and with more than 16 operands.
+    log(f"[{wd}] walk: duplicate operands")
+    dup = os.path.join(walk, "dup")
+    few = ["realfile", "sym1", "sym2", "./realfile"]
+    pads = [f"pad{i:02d}" for i in range(16)]
+    many = (few[:2] + pads[:8] + few[2:] + ["realfile"] + pads[8:]
+            + ["sym1"])
+    for name, operands in (("few", few), ("many", many)):
+        for opts in sets:
+            r.compare(f"walk-dup-{name}", opts, operands, cwd=dup)
+        for opts in ([], ["-c"], ["-l"]):
+            for mode in ("-r", "-R"):
+                r.compare(f"walk-dup-{name}{mode}", [mode] + opts, operands,
+                          cwd=dup)
+            r.compare(f"walk-dup-{name}-2>&1", opts, operands
+                      + ["missing"], cwd=dup, combined=True)
+
+    # A symbolic link to a directory as an operand: command-line links
+    # are followed with -r too, but links below them only with -R.
+    log(f"[{wd}] walk: symbolic link operand")
+    symop = os.path.join(walk, "symop")
+    for recurse, operand in ((["-r"], "foo"), (["-r"], "foo/"),
+                             (["-R"], "foo"), (["-R"], "foo/"),
+                             (["-d", "recurse"], "foo"),
+                             (["-d", "recurse"], "foo/"),
+                             (["--directories=recurse"], "foo"),
+                             ([], "foo"), (["-d", "read"], "foo")):
+        for opts in ([], ["-c"], ["-l"], ["-H", "-n"], ["-h"],
+                     ["--exclude-dir=foo"], ["--exclude-dir=bar"],
+                     ["--exclude-dir=lnk"]):
+            r.compare(f"walk-symop{''.join(recurse)}", recurse + opts,
+                      [operand], cwd=symop, combined=True)
+
+
 def link_binaries(work, base, cand):
     hb = os.path.join(work, "bin-base")
     hc = os.path.join(work, "bin-cand")
@@ -628,6 +858,7 @@ def main():
             ("comb", build_comb_tree),
             ("fifo", build_fifo_tree),
             ("many", build_many_tree),
+            ("walk", build_walk_tree),
         ):
             sub_path = os.path.join(wd, sub_name)
             stamp = os.path.join(wd, f".{sub_name}.done")
@@ -741,6 +972,8 @@ def main():
                           fifo=fifo if needs_writer else None)
         finally:
             fifo.stop.set()
+
+        run_walk_cases(r, wd, args.quick)
 
     for tree in args.tree:
         r.pattern = args.tree_pattern
