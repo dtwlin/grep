@@ -47,7 +47,6 @@ fi
 
 if test -z "$v"; then
   case "$git_archive_info" in
-    '$Format:'*) ;;
     [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\ ?*)
       date_part=$(printf '%s' "${git_archive_info%% *}" | tr '-' '.')
       sha_part=${git_archive_info#* }
