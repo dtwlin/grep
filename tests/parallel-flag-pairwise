@@ -1,0 +1,258 @@
+#! /bin/sh
+# Option interactions and engine regressions adapted from ugrep's
+# tests/verify.sh and from ripgrep's regression tests, with GNU grep
+# semantics.
+#
+# Part 1 crosses patterns, binary-file options, ugrep's option bundles,
+# matchers and -w/-x, and file versus pipe input, using a pairwise
+# covering array: every pair of values of any two factors occurs in some
+# row.  Each row must take its route (see GREP_TEST_ROUTE in src/grep.c)
+# and must match GREP_THREADS=1 src/grep.  The full product runs in
+# benchmarks/exhaustive_gap_fuzzer.py.
+#
+# Part 2 checks fixed expected output, because a comparison with
+# GREP_THREADS=1 cannot catch a bug that the single-threaded path shares.
+# The expectations agree with stock GNU grep 3.12.
+#
+# Copyright (C) 2026 David Lin <dtwlin@gmail.com>
+#
+# Copying and distribution of this file, with or without modification,
+# are permitted in any medium without royalty provided the copyright
+# notice and this notice are preserved.
+
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+. "$abs_srcdir/parallel-lib.sh"
+
+pl_setup_bins
+pl_have_bin shrunk || skip_ "src/grep-shrunk is not built"
+pl_have_shrunk=yes
+PL_TIMEOUT=${PL_TIMEOUT:-30}
+
+pcre=yes
+echo x | grep -P x > /dev/null 2>&1 || pcre=no
+
+# ugrep's inputs, padded past grep-shrunk's 128 KiB chunking threshold
+# except for the empty files: no final newline, a NUL after the first
+# 96 KiB, a NUL within it, and source code with several cases of Hello.
+$PERL -e '
+  sub put { my ($f, $s) = @_; open my $h, ">", $f or die "$f: $!";
+            print $h $s; close $h or die "$f: $!"; }
+  my $pad = join "", map { "filler line $_ with words\n" } 1 .. 5000;
+  my $java = join "", map { "class Hello$_ { // say Hello, hello\n"
+                            . "  String s = \"HelloWorld $_\";\n"
+                            . "  int x$_ = 0; // nothing\n\n" } 1 .. 1500;
+  put ("empty.txt", "");
+  put ("emptyline.txt", "\n");
+  put ("hello_nonl.txt", $pad . "Hello World");
+  put ("hello.bin", $pad . "Hello\0binary\nHello again\n");
+  put ("mixed.txt", substr ($pad, 0, 50000) . "\0\n" . $pad . "Hello\n");
+  put ("hello.java", $java);
+' || framework_failure_
+files="empty.txt emptyline.txt hello_nonl.txt hello.bin mixed.txt hello.java"
+
+# The covering array, one row per line: pattern|binary|options|matcher|
+# anchor|input, with "-" for no option and EMPTY for the empty pattern.
+cat <<'EOF' > pairwise.pl || framework_failure_
+use strict;
+use warnings;
+my @f = (
+  ['EMPTY', 'Hello', 'H[a-z]+o', 'nomatch'],
+  ['-', '-I', '-a'],
+  ['-l', '-l -v', '-L -v', '-c', '-c -o', '-c -v', '-v -o', '-n',
+   '-n -b -T', '-o -n', '-o -n -b -T', '-n -v -C2', '-o -n -C10'],
+  ['-F', '-G', '-E', '-P'],
+  ['-', '-w', '-x'],
+  ['files', 'pipe'],
+);
+my %unc;
+for my $i (0 .. $#f) {
+  for my $j ($i + 1 .. $#f) {
+    for my $a (0 .. $#{$f[$i]}) {
+      $unc{"$i,$a,$j,$_"} = 1 for 0 .. $#{$f[$j]};
+    }
+  }
+}
+sub gain {
+  my ($row, $x, $v) = @_;
+  my $n = 0;
+  for my $y (0 .. $#f) {
+    next if $y == $x || !defined $row->[$y];
+    my $k = $x < $y ? "$x,$v,$y,$row->[$y]" : "$y,$row->[$y],$x,$v";
+    $n++ if $unc{$k};
+  }
+  return $n;
+}
+while (%unc) {
+  my ($seed) = sort keys %unc;
+  my ($i, $a, $j, $b) = split /,/, $seed;
+  my @row;
+  @row[$i, $j] = ($a, $b);
+  for my $x (0 .. $#f) {
+    next if defined $row[$x];
+    my ($best, $bg) = (0, -1);
+    for my $v (0 .. $#{$f[$x]}) {
+      my $g = gain (\@row, $x, $v);
+      ($best, $bg) = ($v, $g) if $g > $bg;
+    }
+    $row[$x] = $best;
+  }
+  for my $x (0 .. $#f) {
+    for my $y ($x + 1 .. $#f) { delete $unc{"$x,$row[$x],$y,$row[$y]"}; }
+  }
+  print join ('|', map { $f[$_][$row[$_]] } 0 .. $#f), "\n";
+}
+EOF
+$PERL pairwise.pl > rows || framework_failure_
+test $(wc -l < rows) -ge 52 || framework_failure_
+
+while IFS='|' read pat bin opts eng anc input; do
+  case $pat in EMPTY) pat=;; esac
+  case $bin in -) bin=;; esac
+  case $anc in -) anc=;; esac
+  case $eng in -P) test $pcre = yes || eng=-E;; esac
+  context=no listing=no
+  case " $opts " in *" -C"*) context=yes;; esac
+  case " $opts " in *" -l "*|*" -L "*) listing=yes;; esac
+  invert=no
+  case " $opts " in *" -v "*) invert=yes;; esac
+  if test -z "$pat$anc" && test $invert = yes \
+     && case " $opts " in *" -L "*) false;; *) true;; esac; then
+    # -v with an empty pattern selects nothing; grep exits at once.
+    pl_route '!file-chunk' - $bin $opts $eng $anc -e "$pat" $files
+  elif test $input = files; then
+    if test $invert,$context = yes,yes; then
+      pl_route '!file-chunk' - $bin $opts $eng $anc -e "$pat" $files
+    else
+      pl_route file-chunk:4 - $bin $opts $eng $anc -e "$pat" $files
+    fi
+  elif test $context = no && test $listing = no && test "$bin" != -I; then
+    pl_route stdin-slice "|hello.java" $bin $opts $eng $anc -e "$pat"
+  else
+    pl_route serial "|hello.java" $bin $opts $eng $anc -e "$pat"
+  fi
+done < rows
+
+# Part 2.  fx ARGS... runs GREP_THREADS=1 grep ARGS and compares its
+# output, standard error and then "rc=STATUS", with standard input.
+fx ()
+{
+  cat > fx.exp || framework_failure_
+  env GREP_THREADS=1 grep "$@" > fx.out 2>&1
+  echo "rc=$?" >> fx.out
+  compare fx.exp fx.out || {
+    echo "FAIL [fixed output]: grep $*" >&2
+    pl_fail=1
+  }
+}
+
+# Pattern files (ripgrep r1334, r1259, r1176): no patterns match nothing
+# and, inverted, everything; one empty pattern is the reverse.
+printf 'a\nb\n' > ab
+: > zero
+printf '\n' > one
+printf 'rc=1\n' | fx -f zero ab
+printf 'a\nb\nrc=0\n' | fx -v -f zero ab
+printf 'a\nb\nrc=0\n' | fx -f one ab
+printf 'rc=1\n' | fx -v -f one ab
+printf '2\nrc=0\n' | fx -v -c -f zero ab
+printf '[foo]' > pat_nonl
+printf 'f\n]\n[foo]\nfoo\n' > in_nonl
+printf 'f\n[foo]\nfoo\nrc=0\n' | fx -f pat_nonl in_nonl
+printf '[foo]\nrc=0\n' | fx -F -f pat_nonl in_nonl
+printf 'foo(bar\n' > pat_paren
+printf 'foo(bar\nfoobar\nfoo(bar)\n' > in_paren
+printf 'foo(bar\nfoo(bar)\nrc=0\n' | fx -F -f pat_paren in_paren
+printf 'foo(bar\nrc=0\n' | fx -F -x -f pat_paren in_paren
+# The same, chunked: -v with no patterns selects every line.
+pl_route file-chunk - -v -c -f zero hello.java ab
+pl_route file-chunk - -c -f one hello.java ab
+pl_route chunk-stateless - -v -f zero hello.java
+pl_route stdin-slice "|hello.java" -v -c -f zero
+
+# UTF-8 words from a file and from standard input (ugrep verify.sh).
+path_prepend_ .
+case $(get-mb-cur-max en_US.UTF-8) in
+  [3456])
+    printf 'Lor\303\252m\n\303\257ps\303\273m\ndolor\nsit\nam\303\251t\n' \
+      > words
+    printf 'LOR\303\212M \303\257ps\303\273m Dolor\nsitter am\303\251t\n' \
+      > in_words
+    printf 'nothing here\nSIT\n' >> in_words
+    for e in -F -G -E; do
+      printf 'LOR\303\212M\n\303\257ps\303\273m\nDolor\nam\303\251t\nSIT\nrc=0\n' \
+        | LC_ALL=en_US.UTF-8 fx $e -i -w -o -f words in_words
+      test "$(env LC_ALL=en_US.UTF-8 GREP_THREADS=1 grep $e -i -w -c -f - \
+                in_words < words)" = 3 \
+        || { echo "FAIL [fixed output]: grep $e -i -w -c -f - in_words" >&2
+             pl_fail=1; }
+    done
+    if test $pcre = yes; then
+      printf 'grep: the -P option only supports a single pattern\nrc=2\n' \
+        | LC_ALL=en_US.UTF-8 fx -P -i -w -o -f words in_words
+    fi;;
+esac
+
+# Regular expressions (ripgrep r506, r1401, r2658, r2884, word tests).
+printf 'min minimum amin\nmax maximum amax\n' > minmax
+printf 'min\nmax\nrc=0\n' | fx -w -o -E 'min|max' minmax
+printf 'min\nmax\nrc=0\n' | fx -w -o -G 'min\|max' minmax
+printf 'Ex\neAx\nex\nEAX\nzz\n' > ex
+printf 'Ex\neAx\nex\nEAX\nrc=0\n' | fx -i -o -E 'e.x|ex' ex
+printf '...\n' > dots
+printf 'abc -2 foo\nabc-2foo\n' > minus2
+for e in -F -G -E; do
+  printf '.\n.\n.\nrc=0\n' | fx $e -w -o . dots
+  printf 'abc -2 foo\nrc=0\n' | fx $e -w -e -2 minus2
+done
+printf 'foo\0bar\0quux\0' > nz
+for e in -F -G -E; do
+  test "$(env GREP_THREADS=1 grep $e -z -x bar nz | tr '\0' @)" = bar@ \
+    || { echo "FAIL [fixed output]: grep $e -z -x bar nz" >&2; pl_fail=1; }
+done
+if test $pcre = yes; then
+  printf 'min\nmax\nrc=0\n' | fx -w -o -P 'min|max' minmax
+  printf 'foo 42\nxoyz\ncat\tdog\nfoo' > la
+  printf 'xo\ncat\tdo\nfoo\nrc=0\n' | fx -P -o '.*o(?!.*\s)' la
+  printf '.\n.\n.\nrc=0\n' | fx -P -w -o . dots
+  printf 'abc -2 foo\nrc=0\n' | fx -P -w -e -2 minus2
+  test "$(env GREP_THREADS=1 grep -P -z -x bar nz | tr '\0' @)" = bar@ \
+    || { echo "FAIL [fixed output]: grep -P -z -x bar nz" >&2; pl_fail=1; }
+fi
+# Overlapping literals that can mislead a skip loop (r1203, r1319).
+printf '153.230000\n' > num
+printf '23000\nrc=0\n' | fx -o -E '[0-9]{3}00' num
+test $pcre = yes && printf '230000\nrc=0\n' | fx -o -P '\d\d\d000' num
+printf 'CCAGCTACTCGGGAGGCTGAGGCTGGAGGATCGCTTGAGTCCAGGAGTTC\n' > dna
+printf 'TTGAGTCCAGGAGTTC\nrc=0\n' | fx -o -E 'TTGAGTCCAGGAG[ATCG]{2}C' dna
+
+# Only the line terminator ends a line (ripgrep r128), also when chunked.
+printf 'foo\013\n\013\nbar\n\014baz\rbar\r\n' > vt
+printf '3:bar\n4:\014baz\rbar\r\nrc=0\n' | fx -n bar vt
+printf '4\nrc=0\n' | fx -c '' vt
+$PERL -e 'print "a\013b\014c\rd line $_\n" for 1 .. 30000;
+          print "bar at the end\n"' > vtbig.txt || framework_failure_
+pl_route chunk-lineno - -n line vtbig.txt
+pl_route chunk-context - -n bar vtbig.txt
+
+# Empty lines (ripgrep glue.rs empty_line1-6), also when chunked.
+printf '' > e1
+printf '\n' > e2
+printf '\n\n' > e3
+printf 'a\nb\n\nc\n\n\nd\n' > e4
+printf 'a\nb\n\nc\n\n\nd' > e5
+printf 'a\nb\n\nc\n\n\nd\n\n' > e6
+printf 'rc=1\n' | fx -n -b '^$' e1
+printf '1:0:\nrc=0\n' | fx -n -b '^$' e2
+printf '1:0:\n2:1:\nrc=0\n' | fx -n -b '^$' e3
+printf '3:4:\n5:7:\n6:8:\nrc=0\n' | fx -n -b '^$' e4
+printf '3:4:\n5:7:\n6:8:\nrc=0\n' | fx -n -b '^$' e5
+printf '3:4:\n5:7:\n6:8:\n8:11:\nrc=0\n' | fx -n -b '^$' e6
+$PERL -e 'print +("x" x 60) . "\n" . ("\n" x ($_ % 4)) for 1 .. 4000' \
+  > ebig.txt || framework_failure_
+pl_route chunk-lineno - -n -b '^$' ebig.txt
+pl_route chunk-count - -c '^$' ebig.txt
+pl_route chunk-stateless - '^$' ebig.txt
+pl_route chunk-context - -n -b -C1 '^$' e4 ebig.txt
+
+pl_summary
+Exit $pl_fail

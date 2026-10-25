@@ -156,6 +156,7 @@ TESTS =						\
   parallel-exhaustive-gaps			\
   parallel-fault-injection			\
   parallel-io-faults				\
+  parallel-flag-pairwise			\
   parallel-gcov-branches			\
   parallel-kwset-ac				\
   parallel-matrix				\

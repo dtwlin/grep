@@ -702,10 +702,111 @@ def suite_cross_path_consistency(
     return failures
 
 
+# ugrep's tests/verify.sh crosses patterns, binary-file options, option
+# bundles, matchers and -w/-x.  tests/parallel-flag-pairwise runs a
+# pairwise subset of that product in make check; this suite runs the
+# whole product (with --full-matrix) or a seeded sample of it, on file
+# operands padded past the chunking threshold of grep-shrunk (and, with
+# --full-matrix, of the release build) and on a pipe.  The sample keeps
+# this suite to a few seconds, as tests/parallel-exhaustive-gaps runs it
+# in make check.
+UGREP_PATTERNS = ["", "Hello", "H[a-z]+o", "nomatch"]
+UGREP_BINARY = [[], ["-I"], ["-a"]]
+UGREP_OPTIONS = [
+    ["-l"], ["-l", "-v"], ["-L", "-v"], ["-c"], ["-c", "-o"], ["-c", "-v"],
+    ["-v", "-o"], ["-n"], ["-n", "-b", "-T"], ["-o", "-n"],
+    ["-o", "-n", "-b", "-T"], ["-n", "-v", "-C2"], ["-o", "-n", "-C10"],
+]
+UGREP_MATCHERS = ["-F", "-G", "-E", "-P"]
+UGREP_ANCHORS = [[], ["-w"], ["-x"]]
+
+
+def write_nul_layout(path: str, rng: random.Random, size: int, boundary: int) -> None:
+    """Write about SIZE bytes of numbered lines with matches and NULs placed
+    within a few lines of multiples of BOUNDARY."""
+    line_len = 48
+    nlines = size // line_len
+    per = max(1, boundary // line_len)
+    special = {}
+    for _ in range(rng.randint(1, 4)):
+        k = rng.randint(1, max(1, nlines // per - 1)) * per + rng.randint(-2, 2)
+        special[k] = rng.choice(["M", "N", "MN", "NM"])
+    body = {"M": "MATCH here", "N": "nul\0here", "MN": "MATCH \0 here", "NM": "\0 MATCH"}
+    with open(path, "wb") as f:
+        for i in range(nlines):
+            kind = special.get(i)
+            text = f"{i:07d} {body[kind]}" if kind else f"{i:07d} filler"
+            f.write(text.encode("latin1").ljust(line_len - 1, b" ") + b"\n")
+
+
+def suite_ugrep_matrix_and_nul_layouts(
+    ref_bin: str, cand_bins: list[tuple[str, dict[str, str]]], td: str,
+    seed: int, full: bool,
+) -> list[str]:
+    failures = []
+    rng = random.Random(seed ^ 0x9E3779B9)
+    d = os.path.join(td, "ugrep_matrix")
+    os.makedirs(d, exist_ok=True)
+    scale = 20 if full else 1
+    pad = b"".join(b"filler line %d with words\n" % i
+                   for i in range(1, 5000 * scale + 1))
+    java = b"".join(
+        b"class Hello%d { // say Hello, hello\n  String s = \"HelloWorld %d\";\n\n"
+        % (i, i) for i in range(1, 2000 * scale + 1))
+    inputs = {
+        "empty.txt": b"",
+        "emptyline.txt": b"\n",
+        "hello_nonl.txt": pad + b"Hello World",
+        "hello.bin": pad + b"Hello\0binary\nHello again\n",
+        "mixed.txt": pad[:50000] + b"\0\n" + pad + b"Hello\n",
+        "hello.java": java,
+    }
+    for name, data in inputs.items():
+        with open(os.path.join(d, name), "wb") as f:
+            f.write(data)
+    files = [os.path.join(d, n) for n in inputs]
+
+    _, _, pcre_rc = run_cmd(ref_bin, ["-P", "x"], stdin_bytes=b"x\n")
+    matchers = UGREP_MATCHERS if pcre_rc == 0 else UGREP_MATCHERS[:3]
+    combos = [
+        (p, b, o, m, a)
+        for p in UGREP_PATTERNS for b in UGREP_BINARY for o in UGREP_OPTIONS
+        for m in matchers for a in UGREP_ANCHORS
+    ]
+    if not full:
+        combos = rng.sample(combos, min(len(combos), 48))
+    for p, b, o, m, a in combos:
+        args = b + o + [m] + a + ["-e", p]
+        label = f"ugrep_matrix:{args}"
+        failures.extend(assert_equiv(label + ":files", ref_bin, cand_bins, args + files))
+        context = any(x.startswith("-C") for x in o)
+        if not context:
+            failures.extend(assert_equiv(label + ":pipe", ref_bin, cand_bins, args,
+                                         stdin_bytes=java))
+
+    # Random NUL and match layouts around the 16 KiB chunks of grep-shrunk
+    # and the 2 MiB chunks of the release build.
+    nul_opts = [[], ["-c"], ["-l"], ["-n"], ["-o"], ["-C1"], ["-q"], ["-a", "-n"], ["-I", "-c"]]
+    layouts = [(300 * 1024, 16 * 1024)]
+    if full:
+        layouts.append((5 * 1024 * 1024, 2 * 1024 * 1024))
+    for i in range(12 if full else 3):
+        for size, boundary in layouts:
+            path = os.path.join(d, f"nul_{i}_{size}.txt")
+            write_nul_layout(path, rng, size, boundary)
+            for opts in nul_opts:
+                failures.extend(assert_equiv(f"nul_layout:{i}:{size}:{opts}", ref_bin,
+                                             cand_bins, opts + ["MATCH", path]))
+    return failures
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo-root", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     parser.add_argument("--seed", type=int, default=20261018)
+    parser.add_argument("--full-matrix", action="store_true",
+                        default=bool(os.environ.get("RUN_EXPENSIVE_TESTS")),
+                        help="run the whole ugrep option product and more NUL layouts")
     args = parser.parse_args()
 
     repo = os.path.abspath(args.repo_root)
@@ -734,6 +835,8 @@ def main() -> int:
         all_failures.extend(suite_stream_and_chunked_edges(ref_bin, cand_bins, td))
         all_failures.extend(suite_fault_injection_and_walker_defer(src_grep, shrunk_bin, hooks_bin, td))
         all_failures.extend(suite_cross_path_consistency(ref_bin, cand_bins, td))
+        all_failures.extend(suite_ugrep_matrix_and_nul_layouts(
+            ref_bin, cand_bins, td, args.seed, args.full_matrix))
 
     if all_failures:
         for msg in all_failures:
