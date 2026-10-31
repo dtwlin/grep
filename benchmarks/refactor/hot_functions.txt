@@ -1,0 +1,64 @@
+# Hot functions for asmdiff.py --watch: the code that runs per line,
+# per buffer or per file in the benchmark scenarios.  A refactor that
+# changes the machine code of any of these needs an A/B timing run.
+# Each line is a function name or a shell pattern; a name also matches
+# its GCC clones (NAME.part, NAME.isra, NAME.constprop, NAME.cold).
+# A function that a build inlines everywhere has no code of its own and
+# shows up only through its callers, so the callers that inline the
+# per-chunk and per-file loops are listed too; asmdiff.py names the
+# patterns that match no out-of-line function.
+
+# Line loop and output (src/grep.c).
+grep
+grepbuf
+fillbuf
+prtext
+prline
+print_line_head
+print_line_middle
+print_line_tail
+nlscan
+count_newlines
+all_zeros
+buf_has_nulls
+buf_has_encoding_errors
+zap_nuls
+
+# Per file (src/grep.c).
+grepdesc
+grepfile
+walk_search
+walk_search_files
+walk_classify
+walk_read_dir
+walk_participate
+walk_run_task
+walk_commit
+
+# Workers, chunks and slices (src/grep.c).
+worker_thread_func
+worker_execute_task
+chunk_grepbuf
+chunk_search_to_slot
+chunk_count_newlines
+worker_run_file_chunk
+worker_run_mmap_scan
+worker_run_stream_chunk
+stream_commit_binary
+
+# Matchers (src/dfasearch.c, src/kwsearch.c, src/pcresearch.c).
+EGexecute
+dfa_narrow_candidate_line
+Fexecute
+Fexecute_core
+Fexecute_with_utf8_quirk
+Pexecute
+
+# Engines (lib/kwset.c, lib/dfa.c, lib/regexec.c).
+kwsexec
+bmexec*
+acexec*
+dfaexec*
+re_search_internal
+sift_states_backward
+transit_state_bkref

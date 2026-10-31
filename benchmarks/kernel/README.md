@@ -27,6 +27,7 @@ benchmarks/kernel/
 ├── report.py                 # Generates summary.md, scaling.csv, equivalence.md
 ├── merge_results.py          # Merges one session's runs of some tools into a results directory
 ├── publish.py                # Generates BENCHMARK_RESULTS.md and the README headline table
+├── ab_bench.py               # Interleaved A/B timing of two grep builds
 ├── patterns/                 # Committed deterministic pattern files (seed 42)
 └── results/                  # Benchmark output directories
 ```
@@ -131,6 +132,20 @@ python3 benchmarks/kernel/publish.py --readme-table  # README headline table
 `publish.py` computes every table and figure of `BENCHMARK_RESULTS.md` from
 the newest results directory (or `--results-dir`), except the host and corpus
 description, build flags, and the synthetic-suite section.
+
+### 4.6 A/B Comparison of Two Builds
+
+`ab_bench.py` times two builds of Supercharged grep against each other on
+any scenarios, alternating A and B run by run, and checks that both print
+the same output:
+
+```bash
+python3 benchmarks/kernel/ab_bench.py --a A/src/grep --b B/src/grep \
+    --out /tmp/ab --scenarios T-01,B-01,L-01 --precise --summarize
+```
+
+`--summarize` applies the decision rule for refactors described in
+[`benchmarks/refactor/README.md`](../refactor/README.md).
 
 ## 5. Fairness and Rigor Rules
 
