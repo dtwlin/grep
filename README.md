@@ -196,14 +196,19 @@ Changing `GREP_THREADS` only affects speed — the output and line order are alw
 
 ### 🧪 Test-only builds
 
-`make check` also builds `src/grep-hooks` and `src/grep-shrunk`; neither is installed. They are compiled with `-DGREP_TEST_HOOKS`, which enables two environment variables used by the tests:
+`make check` also builds `src/grep-hooks`, `src/grep-shrunk`, and
+`src/dfa-prefilter-test`; none of them is installed. `grep-hooks` and
+`grep-shrunk` are compiled with `-DGREP_TEST_HOOKS`, which enables three
+environment variables used by the tests:
 
 - `GREP_DELAY_AT=SITE:USEC[,...]` sleeps at thread hand-off points to widen race windows.
 - `GREP_ROUTE_LOG=FILE` appends one line per operand naming the search path taken (`file-chunk`, `stdin-slice`, `walk-dirs`, ...); `GREP_ROUTE_LOG=list` prints every route. `tests/parallel-route-trace` requires a case for each route.
+- `GREP_PREFILTER_LOG=FILE` appends one line per compiled regex pattern
+  recording the literal and back-reference prefilters extracted before search.
 
 The installed `grep` is built without `-DGREP_TEST_HOOKS`: the hooks compile
-to nothing, it ignores both variables, and its machine code is identical to
-a build without them. The route list and the steps for adding one are
+to nothing, it ignores all three variables, and its machine code is identical
+to a build without them. The route list and the steps for adding one are
 documented at `GREP_TEST_ROUTE` in `src/grep-test-hooks.h`, and the
 capacities that `src/grep-shrunk` shrinks are in `src/grep-tunables.h`.
 

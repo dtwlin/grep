@@ -24,7 +24,7 @@ buf_has_nulls
 buf_has_encoding_errors
 zap_nuls
 
-# Per file (src/grep.c).
+# Per file and directory walk (src/grep.c, src/walk.c).
 grepdesc
 grepfile
 walk_search
@@ -35,7 +35,7 @@ walk_participate
 walk_run_task
 walk_commit
 
-# Workers, chunks and slices (src/grep.c).
+# Workers, chunks and slices (src/parallel.c, src/chunksearch.c).
 worker_thread_func
 worker_execute_task
 chunk_grepbuf

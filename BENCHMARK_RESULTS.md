@@ -14,7 +14,10 @@
 This document presents the complete benchmark results for the parallel GNU `grep` drop-in replacement.
 All measurements were conducted on a 128-logical-CPU dual-socket AMD EPYC 7B13 server across the full
 Linux kernel codebase (v7.3-rc3, 96,034 tracked files, 1.64 GB working tree) and a 1.45 GB unified source
-concatenation (`linux-all.c`), alongside a 266-test automated edge-case, boundary, and multithreaded conformance suite, 151 Automake tests, continuous stress testing, and 13 synthetic workloads.
+concatenation (`linux-all.c`), alongside a 266-test automated
+edge-case, boundary, and multithreaded conformance suite, 156
+Automake tests, continuous stress testing, and 13 synthetic
+workloads.
 
 To ensure complete fairness when comparing against `ripgrep` (`R0`) — which heuristically caps its default directory-walk
 thread pool at `min(cores, 12)` (12 worker threads) while `G1` defaults to `min(cores, 32)` (32 worker threads) —
@@ -116,7 +119,10 @@ at its default, at thread-matched `ugrep -J 32`, and against `G1` at 12 threads.
    - **Gate A (100% Pass):** In all 59 benchmark scenarios, G1's output matches stock G0 byte-for-byte on `stdout`, `stderr`, and exit codes
      (whereas `ripgrep` prints files in non-deterministic thread-completion order unless `--sort=path` is passed).
    - **Gate D (100% Pass):** Output across 1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, and 128 threads produces identical SHA-256 hashes.
-   - **Synthetic Conformance (266/266 Pass) & Automake Suite (141 Pass, 8 Skip, 2 XFail, 0 Fail):** All edge-case regressions, context overlap rules, max-count limits, and memory limits pass.
+   - **Synthetic Conformance (266/266 Pass) & Automake Suite**
+     **(146 Pass, 8 Skip, 2 XFail, 0 Fail):** All edge-case
+     regressions, context overlap rules, max-count limits, and
+     memory limits pass.
 
 ---
 
@@ -811,7 +817,9 @@ The same 59 scenarios with `ugrep` at its default (12 worker threads) and at `-J
 ## 8. Synthetic Benchmark Suite & Edge-Case Conformance
 
 In addition to real-world kernel tree benchmarks, the project maintains an automated 13-workload synthetic benchmark
-suite (`benchmarks/run_benchmarks.py`), a 266-test automated edge-case, boundary, and multithreaded conformance harness, 151 Automake tests, and a continuous stress test harness (`benchmarks/stress_test.py`).
+suite (`benchmarks/run_benchmarks.py`), a 266-test automated edge-case,
+boundary, and multithreaded conformance harness, 156 Automake tests, and a
+continuous stress test harness (`benchmarks/stress_test.py`).
 
 ### 13-Workload Synthetic Benchmark (5 Iterations per Workload)
 
@@ -852,7 +860,14 @@ The 266 automated conformance checks verify boundary and concurrency conditions 
 - **Buffer, Chunk & File Size Boundaries (Checks 98–139):** 0-byte, 1-byte, missing trailing newline, exact 64 KiB `SMALL_FILE_MAX`, exact 96 KiB pipe buffer, exact 2 MiB `CHUNK_SIZE` and $2\times$ `CHUNK_SIZE` (4 MiB) seam splits, lines > 64 KiB, and 1, 2, 32, 33, and 257 multi-pattern keyword thresholds match byte-for-byte.
 - **Multithreaded Concurrency & Stress (Checks 150–159 + `stress_test.py`):** Concurrent multi-chunk files, Reorder Buffer (ROB) wrap-around (> 1,024 slots), head-of-line blocking, and a continuous 5-minute stress test (30,800+ randomized cycles across 1–64 threads) pass with zero discrepancies.
 - **Round 2 & 3 Regression Edge Cases (Checks 160–200):** Zero-context `-C 0`, `-A 0`, `-B 0`, `-0` chunk boundary matches, fast-mmap binary/text separator and `-q` ordering, `kwsmusts_multi` quantifier handling (`\+`, `{m,n}`), stacked backreference quantifiers, PCRE `(*ACCEPT)` must-literals, DFA 17-branch alternations, disjoint bracket sets, multi-character backreference separators, and shorter `-w -o` fallback passes 100% byte-for-byte.
-- **Pairwise Matrix, Fault Injection & Coverage Edge Cases (Checks 201–266 + 151 Automake Tests):** Exhaustive pairwise engine × input-path × modifier × cross-file transition matrix (`tests/parallel-matrix`), fault-injection boundary shrinking (`WALK_FD_CAP_MAX=2`, `MMAP_SCAN` match overflow, `mmap` failure fallback, short pipe reads, `EINTR`, `EPIPE`, `/dev/full` `ENOSPC` in `tests/parallel-fault-injection`), and full gcov line/branch coverage exercises (`tests/parallel-gcov-coverage`) pass 100% byte-for-byte.
+- **Pairwise Matrix, Fault Injection & Coverage Edge Cases**
+  **(Checks 201–266 + 156 Automake Tests):** Exhaustive pairwise
+  engine × input-path × modifier × cross-file transition matrix
+  (`tests/parallel-matrix`), fault-injection boundary shrinking
+  (`WALK_FD_CAP_MAX=2`, `MMAP_SCAN` match overflow, `mmap` failure fallback,
+  short pipe reads, `EINTR`, `EPIPE`, `/dev/full` `ENOSPC` in
+  `tests/parallel-fault-injection`), and full gcov line/branch coverage
+  exercises (`tests/parallel-gcov-coverage`) pass 100% byte-for-byte.
 
 ---
 
