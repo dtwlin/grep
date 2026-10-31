@@ -1,5 +1,5 @@
-/* Test hooks of grep: delays at thread hand-off points and the
-   route trace.
+/* Test hooks of grep: delays at thread hand-off points, the route
+   trace, and the prefilter extraction trace.
    Copyright (C) 2026 David Lin <dtwlin@gmail.com>
 
    This program is free software; you can redistribute it and/or modify
@@ -121,5 +121,85 @@ grep_test_route (enum grep_route route, char const *name)
   /* One write per line, so that lines from different threads do not
      interleave in the O_APPEND file.  */
   ignore_value (write (test_route_fd, line, n));
+  errno = saved_errno;
+}
+
+/* The descriptor of the GREP_PREFILTER_LOG file, or -1 if none.  */
+static int test_prefilter_fd = -1;
+
+/* Open the file named by GREP_PREFILTER_LOG.  Call this before
+   compiling patterns or starting threads.  */
+static void
+init_test_prefilter (void)
+{
+  char const *env = getenv ("GREP_PREFILTER_LOG");
+  if (!env || !*env)
+    return;
+  int fd = open (env, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
+  if (fd < 0)
+    die (EXIT_TROUBLE, errno, "GREP_PREFILTER_LOG=%s", env);
+  if (fd <= STDERR_FILENO)
+    {
+      int high = fcntl (fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+      if (high < 0)
+        die (EXIT_TROUBLE, errno, "GREP_PREFILTER_LOG=%s", env);
+      close (fd);
+      fd = high;
+    }
+  test_prefilter_fd = fd;
+}
+
+void
+grep_test_prefilter (char const *kind, char const *pat, idx_t patlen,
+                     char const *fmt, ...)
+{
+  if (test_prefilter_fd < 0)
+    return;
+  int saved_errno = errno;
+  char tail[256];
+  va_list ap;
+  va_start (ap, fmt);
+  int tail_len = vsnprintf (tail, sizeof tail, fmt, ap);
+  va_end (ap);
+  if (tail_len < 0)
+    tail_len = 0;
+  else if ((size_t) tail_len >= sizeof tail)
+    tail_len = sizeof tail - 1;
+
+  size_t klen = strlen (kind);
+  idx_t plen = 0 < patlen ? patlen : 0;
+  char *buf = ximalloc (klen + 1 + 4 * plen + 1 + tail_len + 1);
+  size_t n = 0;
+  memcpy (buf + n, kind, klen);
+  n += klen;
+  buf[n++] = '\t';
+  static char const hex[] = "0123456789abcdef";
+  for (idx_t i = 0; i < plen; i++)
+    {
+      unsigned char uc = pat[i];
+      if (0x21 <= uc && uc <= 0x7e && uc != '\\')
+        buf[n++] = uc;
+      else
+        {
+          buf[n++] = '\\';
+          buf[n++] = 'x';
+          buf[n++] = hex[uc >> 4];
+          buf[n++] = hex[uc & 0xf];
+        }
+    }
+  buf[n++] = '\t';
+  memcpy (buf + n, tail, tail_len);
+  n += tail_len;
+  buf[n++] = '\n';
+
+  size_t off = 0;
+  while (off < n)
+    {
+      ssize_t w = write (test_prefilter_fd, buf + off, n - off);
+      if (w <= 0)
+        break;
+      off += w;
+    }
+  free (buf);
   errno = saved_errno;
 }

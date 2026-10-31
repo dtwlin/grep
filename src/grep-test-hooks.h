@@ -1,5 +1,5 @@
-/* Test hooks of grep: delays at thread hand-off points and the
-   route trace.
+/* Test hooks of grep: delays at thread hand-off points, the route
+   trace, and the prefilter extraction trace.
    Copyright (C) 2026 David Lin <dtwlin@gmail.com>
 
    This program is free software; you can redistribute it and/or modify
@@ -15,10 +15,11 @@
    You should have received a copy of the GNU General Public License
    along with this program.  If not, see <https://www.gnu.org/licenses/>.  */
 
-/* Only grep.c includes this file.  It defines the hooks in
-   grep-test-hooks.c, which it includes only when compiled with
-   -DGREP_TEST_HOOKS, as the test builds grep-hooks and grep-shrunk
-   are (see src/Makefile.am).  */
+/* grep.c defines GREP_TEST_HOOKS_INTERNAL before including this file,
+   and defines the hooks in grep-test-hooks.c when compiled with
+   -DGREP_TEST_HOOKS (grep-hooks and grep-shrunk; see src/Makefile.am).
+   dfasearch.c and pcresearch.c also include this file for
+   GREP_TEST_PREFILTER.  */
 
 #ifndef GREP_TEST_HOOKS_H
 #define GREP_TEST_HOOKS_H
@@ -29,7 +30,7 @@
    where SITE "*" matches every point.  This widens race windows so
    that tests can catch races deterministically.  Other builds compile
    the hooks away.  */
-#ifdef GREP_TEST_HOOKS
+#if defined GREP_TEST_HOOKS && defined GREP_TEST_HOOKS_INTERNAL
 static void grep_test_delay (char const *site);
 # define GREP_TEST_DELAY(site) grep_test_delay (site)
 #else
@@ -106,11 +107,24 @@ enum grep_route
 #undef GREP_ROUTE_ENUM
 };
 
-#ifdef GREP_TEST_HOOKS
+#if defined GREP_TEST_HOOKS && defined GREP_TEST_HOOKS_INTERNAL
 static void grep_test_route (enum grep_route route, char const *name);
 # define GREP_TEST_ROUTE(route, name) grep_test_route (GREP_ROUTE_##route, name)
 #else
 # define GREP_TEST_ROUTE(route, name) ((void) GREP_ROUTE_##route)
+#endif
+
+/* Prefilter extraction trace.  In a build with -DGREP_TEST_HOOKS,
+   setting GREP_PREFILTER_LOG=FILE appends one line per prefilter step
+   to FILE: KIND, a byte-escaped copy of PAT[0..PATLEN), and the
+   formatted extraction fields.  Other builds compile it away.  */
+#ifdef GREP_TEST_HOOKS
+extern void grep_test_prefilter (char const *kind, char const *pat,
+                                 idx_t patlen, char const *fmt, ...)
+  _GL_ATTRIBUTE_FORMAT_PRINTF_STANDARD (4, 5);
+# define GREP_TEST_PREFILTER(...) grep_test_prefilter (__VA_ARGS__)
+#else
+# define GREP_TEST_PREFILTER(...) ((void) 0)
 #endif
 
 #endif /* GREP_TEST_HOOKS_H */

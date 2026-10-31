@@ -19,6 +19,7 @@
 
 #include <search.h>
 #include "die.h"
+#include "grep-test-hooks.h"
 
 #include <stdckdint.h>
 
@@ -704,8 +705,11 @@ Pcompile (char *pattern, idx_t size, reg_syntax_t ignored, bool exact)
     {
       idx_t lit_len = 0;
       char *lit = find_must_literal (raw_pat, raw_size, &lit_len);
+      GREP_TEST_PREFILTER ("pcre-pat", raw_pat, raw_size,
+                           "found=%d", lit != nullptr);
       if (lit)
         {
+          GREP_TEST_PREFILTER ("pcre-must", lit, lit_len, "len=%td", lit_len);
           kwset_t kws = kwsinit (true);
           kwsincr (kws, lit, lit_len);
           kwsprep (kws);

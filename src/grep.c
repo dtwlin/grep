@@ -88,6 +88,7 @@
 #include "xbinary-io.h"
 #include "xstrtol.h"
 
+#define GREP_TEST_HOOKS_INTERNAL 1
 #include "grep-test-hooks.h"
 #include "grep-tunables.h"
 
@@ -4220,6 +4221,7 @@ main (int argc, char **argv)
 #ifdef GREP_TEST_HOOKS
   init_test_delays ();
   init_test_routes ();
+  init_test_prefilter ();
 #endif
 
   pattern_table = hash_initialize (0, nullptr, hash_pattern, compare_patterns,

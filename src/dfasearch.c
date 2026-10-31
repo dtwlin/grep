@@ -21,6 +21,7 @@
 #include "intprops.h"
 #include <search.h>
 #include "die.h"
+#include "grep-test-hooks.h"
 #include <error.h>
 #include <stdatomic.h>
 
@@ -613,6 +614,8 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
   for (idx_t i = 0; i < nbranches; i++)
     if (branches[i].is_exact)
       {
+        GREP_TEST_PREFILTER ("dfa-kws", branches[i].best_lit,
+                             branches[i].best_len, "exact=1");
         kwsincr (dc->kwset, branches[i].best_lit, branches[i].best_len);
         dc->kwset_exact_matches++;
       }
@@ -620,7 +623,11 @@ kwsmusts_multi (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
   /* Pass 2: non-exact keywords.  */
   for (idx_t i = 0; i < nbranches; i++)
     if (!branches[i].is_exact)
-      kwsincr (dc->kwset, branches[i].best_lit, branches[i].best_len);
+      {
+        GREP_TEST_PREFILTER ("dfa-kws", branches[i].best_lit,
+                             branches[i].best_len, "exact=0");
+        kwsincr (dc->kwset, branches[i].best_lit, branches[i].best_len);
+      }
 
   kwsprep (dc->kwset);
 
@@ -718,12 +725,16 @@ kwsmusts (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
           reg_syntax_t syntax_bits)
 {
   struct dfamust *dm = dfamust (dc->dfa);
+  GREP_TEST_PREFILTER ("dfa-pat", raw_pat, raw_size, "dm=%d", dm != nullptr);
   if (!dm)
     {
       if (dc->pcount == 0
           && (!localeinfo.multibyte || localeinfo.using_utf8)
           && (!match_icase || !localeinfo.multibyte))
         kwsmusts_multi (dc, raw_pat, raw_size, syntax_bits);
+      GREP_TEST_PREFILTER ("dfa-done", dc->must2, dc->must2_len,
+                           "exact_matches=%td begline=%d",
+                           dc->kwset_exact_matches, (int) dc->begline);
       return;
     }
   dc->kwset = kwsinit (false);
@@ -743,6 +754,7 @@ kwsmusts (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
       memcpy (mp, dm->must, old_len);
       if (dm->endline)
         mp[old_len] = eolbyte;
+      GREP_TEST_PREFILTER ("dfa-kws", must, new_len, "exact=1");
       kwsincr (dc->kwset, must, new_len);
       free (must);
     }
@@ -750,12 +762,17 @@ kwsmusts (struct dfa_comp *dc, char const *raw_pat, idx_t raw_size,
     {
       /* Otherwise, filtering with this substring should help reduce the
          search space, but we'll still have to use the regexp matcher.  */
+      GREP_TEST_PREFILTER ("dfa-kws", dm->must, (idx_t) strlen (dm->must),
+                           "exact=0");
       kwsincr (dc->kwset, dm->must, strlen (dm->must));
       if (!match_icase && (!localeinfo.multibyte || localeinfo.using_utf8))
         extract_secondary_must (dc, raw_pat, raw_size, syntax_bits, dm->must);
     }
   kwsprep (dc->kwset);
   dfamustfree (dm);
+  GREP_TEST_PREFILTER ("dfa-done", dc->must2, dc->must2_len,
+                       "exact_matches=%td begline=%d",
+                       dc->kwset_exact_matches, (int) dc->begline);
 }
 
 /* Return true if KEYS, of length LEN, might contain a back-reference.
@@ -1261,8 +1278,19 @@ compile_pattern_lines (struct dfa_comp *dc, char *pattern, idx_t size,
           if (ok)
             {
               if (!match_icase)
-                analyze_backref_filter (pat_line, len, syntax_bits,
-                                        &dc->bref_filters[dc->pcount]);
+                {
+                  analyze_backref_filter (pat_line, len, syntax_bits,
+                                          &dc->bref_filters[dc->pcount]);
+#ifdef GREP_TEST_HOOKS
+                  struct backref_filter *bf = &dc->bref_filters[dc->pcount];
+                  GREP_TEST_PREFILTER ("backref-pat", pat_line, len,
+                                       "enabled=%d min_len=%td sep_len=%td",
+                                       (int) bf->enabled, bf->min_len,
+                                       bf->sep_len);
+                  GREP_TEST_PREFILTER ("backref-sep", bf->sep, bf->sep_len,
+                                       "enabled=%d", (int) bf->enabled);
+#endif
+                }
               dc->pcount++;
             }
           prev = p;
