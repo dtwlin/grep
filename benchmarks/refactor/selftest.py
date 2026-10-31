@@ -180,6 +180,154 @@ touch (long x)
 int main (int argc, char **argv) { touch (argc); return flag; }
 """
 
+# Functions that keep the thread pointer across a call, as GCC does in
+# cold code: spill spills it to the stack and reloads it, and keep
+# holds it in a callee-saved register.
+SPILL_PROGRAM = r"""
+struct buf { long len, cap; };
+_Thread_local struct buf TLS_BUFS;
+__attribute__ ((noipa, used)) void
+fill (struct buf *b)
+{
+  b->len++;
+}
+void spill (void);
+void keep (void);
+__asm__ (".text\n"
+         ".globl spill\n"
+         ".type spill, @function\n"
+         "spill:\n"
+         "  sub $24, %rsp\n"
+         "  mov %fs:0, %rax\n"
+         "  mov %rax, 8(%rsp)\n"
+         "  lea b_one@tpoff(%rax), %rdi\n"
+         "  call fill\n"
+         "  mov 8(%rsp), %rax\n"
+         "  lea b_two@tpoff(%rax), %rdi\n"
+         "  call fill\n"
+         "  add $24, %rsp\n"
+         "  ret\n"
+         ".size spill, .-spill\n"
+         ".globl keep\n"
+         ".type keep, @function\n"
+         "keep:\n"
+         "  push %rbx\n"
+         "  mov %fs:0, %rbx\n"
+         "  lea b_one@tpoff(%rbx), %rdi\n"
+         "  call fill\n"
+         "  lea b_two@tpoff(%rbx), %rdi\n"
+         "  call fill\n"
+         "  pop %rbx\n"
+         "  ret\n"
+         ".size keep, .-keep\n");
+int
+main (void)
+{
+  spill ();
+  keep ();
+  return (int) (b_one.len + b_two[1].len);
+}
+"""
+
+# Thread pointers that do not reach an instruction on every path into
+# it: join reaches label 1 from a path that never loads the thread
+# pointer, outer jumps into inner past its load, and swap and wide
+# overwrite the register that held it (xchg, and mul's implicit %rdx).
+JOIN_PROGRAM = r"""
+_Thread_local long TLS_VARS;
+long join (int, long);
+long inner (void);
+long outer (long);
+long swap (long);
+long wide (long);
+__asm__ (".text\n"
+         ".globl join\n"
+         ".type join, @function\n"
+         "join:\n"
+         "  test %edi, %edi\n"
+         "  jne 1f\n"
+         "  mov %fs:0, %rsi\n"
+         "1:\n"
+         "  lea j_two@tpoff(%rsi), %rax\n"
+         "  ret\n"
+         ".size join, .-join\n"
+         ".globl inner\n"
+         ".type inner, @function\n"
+         "inner:\n"
+         "  mov %fs:0, %rdi\n"
+         "2:\n"
+         "  lea j_two@tpoff(%rdi), %rax\n"
+         "  ret\n"
+         ".size inner, .-inner\n"
+         ".globl outer\n"
+         ".type outer, @function\n"
+         "outer:\n"
+         "  jmp 2b\n"
+         ".size outer, .-outer\n"
+         ".globl swap\n"
+         ".type swap, @function\n"
+         "swap:\n"
+         "  mov %fs:0, %rsi\n"
+         "  xchg %rsi, %rdi\n"
+         "  lea j_two@tpoff(%rsi), %rax\n"
+         "  ret\n"
+         ".size swap, .-swap\n"
+         ".globl wide\n"
+         ".type wide, @function\n"
+         "wide:\n"
+         "  mov %fs:0, %rdx\n"
+         "  mov %rdi, %rax\n"
+         "  mul %rdi\n"
+         "  lea j_two@tpoff(%rdx), %rax\n"
+         "  ret\n"
+         ".size wide, .-wide\n");
+int
+main (int argc, char **argv)
+{
+  j_one = argc;
+  return (int) (join (argc, (long) argv) + inner () + outer (j_one)
+                + swap (argc) + wide (argc) + j_two[1]);
+}
+"""
+
+# A thread pointer offset into the padding at the end of the block,
+# which names no thread-local symbol.
+PAD_PROGRAM = r"""
+_Thread_local _Alignas (16) long pad_a;
+_Thread_local char pad_b;
+int peek (void);
+__asm__ (".text\n"
+         ".globl peek\n"
+         ".type peek, @function\n"
+         "peek:\n"
+         "  mov %fs:0, %rax\n"
+         "  movzbl " OFF_REG "(%rax), %eax\n"
+         "  movzbl %fs:" OFF_FS ", %ecx\n"
+         "  add %ecx, %eax\n"
+         "  ret\n"
+         ".size peek, .-peek\n");
+int
+main (void)
+{
+  pad_a = 1;
+  pad_b = 2;
+  return peek ();
+}
+"""
+
+# Two thread-local variables that share a cache line unless aligned.
+TLS_LINES = r"""
+_Thread_local ALIGN long x;
+_Thread_local ALIGN long y;
+int
+main (int argc, char **argv)
+{
+  x = argc;
+  y = x + 1;
+  return (int) y;
+}
+"""
+
 # Object-file references to global symbols, which relocations name.
 OBJ_PROGRAM = r"""
 _Thread_local int t_first, t_second[4];
@@ -379,6 +527,59 @@ class CompiledTest(unittest.TestCase):
                        **args)
         self.assert_changed("touch", a, c)
 
+    def test_thread_pointer_across_calls(self):
+        # A call may not return, so asmdiff does not follow the thread
+        # pointer across one: a new layout shows after the call.
+        args = {"program": SPILL_PROGRAM, "base": {}}
+        a = self.build(TLS_BUFS="b_one, b_two[2]", **args)
+        b = self.build(TLS_BUFS="b_two[2], b_one", **args)
+        self.assert_changed("spill", a, b)
+        self.assert_changed("keep", a, b)
+        _, funcs = asmdiff.functions(a, "objdump")
+        for name in ("spill", "keep"):
+            text = "\n".join(funcs[name])
+            self.assertIn("b_one(%", text)       # before the call
+            self.assertNotIn("b_two", text)      # after it
+
+    def test_thread_pointer_at_joins(self):
+        # The thread pointer reaches label 1 of join and label 2 of inner
+        # on only one of their paths, and swap and wide overwrite it.
+        args = {"program": JOIN_PROGRAM, "base": {}}
+        a = self.build(TLS_VARS="j_one, j_two[2]", **args)
+        b = self.build(TLS_VARS="j_two[2], j_one", **args)
+        for name in ("join", "inner", "swap", "wide"):
+            self.assert_changed(name, a, b)
+        status, out = self.asmdiff(a, b)
+        self.assertNotIn("    main (", out)
+
+    def test_unknown_thread_local_offset(self):
+        # Offsets that name no thread-local symbol stay apart, both
+        # through a register and in %fs:OFFSET.
+        args = {"program": PAD_PROGRAM, "base": {}}
+        a = self.build(OFF_REG='"-1"', OFF_FS='"-1"', **args)
+        for change in ({"OFF_REG": '"-2"'}, {"OFF_FS": '"-2"'}):
+            macros = dict({"OFF_REG": '"-1"', "OFF_FS": '"-1"'}, **change)
+            self.assert_changed("peek", a, self.build(**macros, **args))
+
+    def test_thread_local_lines(self):
+        args = {"program": TLS_LINES, "base": {}}
+        a = self.build(ALIGN="", **args)
+        status, out = self.asmdiff(a, self.build(ALIGN="_Alignas (64)",
+                                                 **args))
+        self.assertEqual(status, 0, out)
+        self.assertIn("0 pairs of thread-local objects now share a line, "
+                      "1 no longer do", out)
+        self.assertIn("now apart: x, y", out)
+        status, out = self.asmdiff(a, a)
+        self.assertIn("thread-local objects share lines as before", out)
+        # Offsets from the thread pointer, at the end of the block.
+        syms = asmdiff.Symbols(a)
+        placed = asmdiff.data_objects(syms)[2]
+        self.assertEqual(sorted(name for _, _, name in placed), ["x", "y"])
+        for start, size, name in placed:
+            self.assertTrue(-syms.tls_size <= start < start + size <= 0,
+                            (name, start, size, syms.tls_size))
+
     def test_jump_table(self):
         args = {"program": SWITCH_PROGRAM, "base": {}}
         a = self.build(ORDER="0", **args)
@@ -445,6 +646,12 @@ class SharedLinesTest(unittest.TestCase):
                                       (64, 4, "c"), (96, 64, "d#2"),
                                       (140, 4, "e")])
         self.assertEqual(pairs, {("a", "b"), ("c", "d"), ("d", "e")})
+
+    def test_thread_pointer_offsets(self):
+        # Offsets below a 64-byte aligned thread pointer.
+        pairs = asmdiff.shared_lines([(-72, 8, "a"), (-64, 8, "b"),
+                                      (-56, 8, "c")])
+        self.assertEqual(pairs, {("b", "c")})
 
 
 SC_LOG = """\

@@ -23,7 +23,10 @@ after normalizing what changes when code only moves:
   section;
 - a thread-local operand (%fs:OFFSET, an offset from the thread
   pointer loaded from %fs:0x0, or an offset loaded into the register
-  of %fs:(REG)) becomes the thread-local symbol;
+  of %fs:(REG)) becomes the thread-local symbol; what a register holds
+  is followed only along straight-line code, up to a call or an
+  instruction that another path can reach, and an offset that names
+  no thread-local symbol stays as it is;
 - alignment padding is dropped;
 - GCC clone and local-static numbers (.part.N, .isra.N, used.0) and
   LTO partition names (.lto_priv.N, .localalias) are dropped.
@@ -32,8 +35,10 @@ In object files, relocations name the referenced symbols.
 
 asmdiff also compares the contents of every named data object, with
 pointers written as what they point to, and reports pairs of writable
-objects that start or stop sharing a 64-byte cache line: a new data
-layout can change speed without changing any instruction.
+objects that start or stop sharing a 64-byte cache line, and likewise
+pairs of thread-local objects (assuming a 64-byte aligned thread
+pointer, as in glibc): a new data layout can change speed without
+changing any instruction.
 
 Not checked: anonymous constants whose size no instruction shows,
 and code or data reached only through computed addresses.  Two local
@@ -101,8 +106,33 @@ SYM_ADDEND = re.compile(r"(.*?)([-+]0x[0-9a-f]+)?")
 PC_RELATIVE = ("R_X86_64_PC32", "R_X86_64_PLT32", "R_X86_64_PC64",
                "R_X86_64_GOTPCREL", "R_X86_64_GOTPCRELX",
                "R_X86_64_REX_GOTPCRELX")
-ONE_OPERAND_WRITE = ("pop", "inc", "dec", "neg", "not", "bswap")
 NO_WRITE = ("push", "cmp", "test", "bt ", "call", "jmp", "notrack")
+# Instruction prefixes, and the registers that instructions (without
+# their size suffix) write without naming them as their last operand.
+PREFIXES = ("lock", "rep", "repz", "repnz", "repe", "repne", "bnd",
+            "notrack", "data16", "addr32")
+IMPLICIT_WRITES = {
+    "mul": ("rax", "rdx"), "imul": ("rax", "rdx"), "div": ("rax", "rdx"),
+    "idiv": ("rax", "rdx"), "cqto": ("rdx",), "cltd": ("rdx",),
+    "cwtd": ("rdx",), "cltq": ("rax",), "cwtl": ("rax",), "cbtw": ("rax",),
+    "cpuid": ("rax", "rbx", "rcx", "rdx"), "rdtsc": ("rax", "rdx"),
+    "rdtscp": ("rax", "rcx", "rdx"), "syscall": ("rax", "rcx", "r11"),
+    "xchg": ("rax",), "xadd": ("rax",), "cmpxchg": ("rax", "rdx"),
+    "cmpxchg8b": ("rax", "rdx"), "cmpxchg16b": ("rax", "rdx"),
+    "lods": ("rax", "rsi"), "stos": ("rdi",), "movs": ("rsi", "rdi"),
+    "scas": ("rdi",), "cmps": ("rsi", "rdi"),
+}
+# Instructions that write each register they name.
+WRITE_ALL = ("xchg", "xadd", "cmpxchg")
+# A call, and an instruction after which execution does not go on to
+# the next one.
+CALL = re.compile(r"(?:(?:bnd|notrack) )?call\b")
+NO_FALLTHROUGH = re.compile(r"(?:(?:rep|repz|bnd|notrack) )?(?:ret|jmp)\b"
+                            r"|(?:ud2|hlt)\b")
+# In normalized text, an instruction of the current function (L7), and
+# one of another function (name+L7).
+LOCAL_LABEL = re.compile(r"(?<![^\s,(\[])L(\d+)\b")
+FOREIGN_LABEL = re.compile(r"([^\s,(\[\]<>+]+)\+L(\d+)\b")
 TEXT_CONTROLS = b"\t\n\r\x07\x08\x0b\x0c\x1b"
 SIZE_BY_MNEMONIC = {
     "vpbroadcastb": 1, "vpbroadcastw": 2, "vpbroadcastd": 4,
@@ -145,6 +175,29 @@ def base_name(name):
 def signed64(value):
     """Interpret VALUE, printed by objdump as unsigned, as signed."""
     return value - (1 << 64) if value >= 1 << 63 else value
+
+
+def written_registers(ins):
+    """Return the 64-bit registers that instruction INS may write, as a
+    superset: its last register operand unless the instruction only
+    reads it, each register an exchange names, and implicit outputs
+    such as those of mul, cpuid or rep stos."""
+    words = ins.split()
+    rep = False
+    while len(words) > 1 and words[0] in PREFIXES:
+        rep = rep or words[0].startswith("rep")
+        words = words[1:]
+    op = words[0] if words else ""
+    written = set(IMPLICIT_WRITES.get(op)
+                  or IMPLICIT_WRITES.get(op[:-1], ()))
+    if rep:
+        written.update(("rcx", "rsi", "rdi"))
+    if op.startswith(WRITE_ALL):
+        written.update(REGS.get(r, r) for r in re.findall(r"%(\w+)", ins))
+    lm = LAST_REG.search(ins)
+    if lm and not op.startswith(NO_WRITE):
+        written.add(REGS.get(lm.group(1), lm.group(1)))
+    return written
 
 
 def short_hash(data):
@@ -476,20 +529,38 @@ class Normalizer:
         self.syms = syms
         self.cur = self.section = self.shndx = None
 
-    def function(self, key, section, insns):
-        syms = self.syms
+    def texts(self, key, section, insns):
+        """Return the instructions INSNS of function KEY in SECTION as
+        normalized text, except for thread-local offsets in registers
+        (see thread_pointers)."""
         self.cur, self.section = key, section
-        self.shndx = syms.section_index.get(section)
+        self.shndx = self.syms.section_index.get(section)
         tables = self.jump_tables(insns)
+        return [self.insn(text, comment, relocs, addr + length,
+                          tables.get(i))
+                for i, (addr, length, text, comment, relocs)
+                in enumerate(insns)]
+
+    def thread_pointers(self, texts, entries=()):
+        """Resolve the thread-local offsets held in registers in TEXTS,
+        the normalized instructions of one function of a linked file.
+        What the registers hold is followed only along straight-line
+        code: it is forgotten at each call and at each instruction that
+        another path can reach, namely one that a branch, jump table or
+        address of the function names, or whose index is in ENTRIES (a
+        branch target in another function)."""
+        joins = set(entries)
+        for ins in texts:
+            joins.update(int(k) for k in LOCAL_LABEL.findall(ins))
         result = []
         tp_regs = set()
         imm_regs = {}
-        for i, (addr, length, text, comment, relocs) in enumerate(insns):
-            ins = self.insn(text, comment, relocs, addr + length,
-                            tables.get(i))
-            if not syms.relocatable:
-                ins = self.thread_pointer(ins, result, tp_regs, imm_regs)
-            result.append(ins)
+        for i, ins in enumerate(texts):
+            if i in joins:
+                tp_regs.clear()
+                imm_regs.clear()
+            result.append(self.thread_pointer(ins, result, tp_regs,
+                                              imm_regs))
         return result
 
     @staticmethod
@@ -581,7 +652,9 @@ class Normalizer:
         if off >= 0:                      # the thread control block
             return m.group(0)
         what = self.syms.thread_local(off)
-        return f"%fs:{what}" if what else "%fs:X"
+        # An offset that names no thread-local symbol stays as it is,
+        # so that two different such offsets still differ.
+        return f"%fs:{what}" if what else m.group(0)
 
     def reloc_text(self, rtype, target, site, end, size):
         """Describe relocation RTYPE against TARGET (SYMBOL[+-ADDEND])
@@ -626,7 +699,7 @@ class Normalizer:
         for reg in list(tp_regs):
             def disp(mm):
                 what = syms.thread_local(int(mm.group(1), 16))
-                return f"{what or 'X'}(%{mm.group(2)}"
+                return f"{what}(%{mm.group(2)}" if what else mm.group(0)
             ins = re.sub(r"(-0x[0-9a-f]+)\(%(" + reg + r")\b", disp, ins)
             am = IMM_ARITH.match(ins)
             if am and REGS.get(am.group(3)) == reg:
@@ -645,14 +718,13 @@ class Normalizer:
             tp_regs.discard(reg)
             imm_regs[reg] = (len(result), signed64(int(im.group(1), 16)))
             return ins
-        if ins.startswith(("call", "jmp")):
+        # A call may not return, so the instruction after it may be
+        # reached only from elsewhere.
+        if CALL.match(ins) or NO_FALLTHROUGH.match(ins):
             tp_regs.clear()
             imm_regs.clear()
             return ins
-        lm = LAST_REG.search(ins)
-        if lm and ("," in ins and not ins.startswith(NO_WRITE)
-                   or ins.split()[0] in ONE_OPERAND_WRITE):
-            reg = REGS.get(lm.group(1), lm.group(1))
+        for reg in written_registers(ins):
             tp_regs.discard(reg)
             imm_regs.pop(reg, None)
         return ins
@@ -671,9 +743,17 @@ def functions(path, objdump):
                     addr = int(cm.group(1), 16)
                     old = syms.jump_table_sizes.get(addr, 0)
                     syms.jump_table_sizes[addr] = max(old, count)
-    result = collections.OrderedDict()
-    for key, section, insns in funcs:
-        result[key] = norm.function(key, section, insns)
+    result = collections.OrderedDict(
+        (key, norm.texts(key, section, insns))
+        for key, section, insns in funcs)
+    if syms.relocatable:
+        return syms, result
+    entries = collections.defaultdict(set)
+    for ins in itertools.chain.from_iterable(result.values()):
+        for name, idx in FOREIGN_LABEL.findall(ins):
+            entries[name].add(int(idx))
+    for key in result:
+        result[key] = norm.thread_pointers(result[key], entries[key])
     return syms, result
 
 
@@ -749,8 +829,10 @@ def describe_object(syms, s, sec):
 
 
 def data_objects(syms):
-    """Return ({name: description} of the named data objects, and
-    [(start, size, name)] of the writable ones of a linked file)."""
+    """Return ({name: description} of the named data objects,
+    [(start, size, name)] of the writable ones of a linked file, and
+    [(offset from the thread pointer, size, name)] of its thread-local
+    ones)."""
     elf = syms.elf
     syms.dyn_sorted = sorted(syms.dyn)
     relro = [(vaddr, vaddr + memsz)
@@ -769,22 +851,27 @@ def data_objects(syms):
                                           s, sec))
     objects = {}
     writable = []
+    thread_local = []
     for name, members in groups.items():
         members.sort(key=lambda m: m[0])
         for k, (desc, s, sec) in enumerate(members):
             key = name if k == 0 else f"{name}#{k + 1}"
             objects[key] = desc
-            if (not syms.relocatable and s.type == STT_OBJECT
-                    and sec.flags & SHF_WRITE
+            if syms.relocatable:
+                continue
+            if (s.type == STT_OBJECT and sec.flags & SHF_WRITE
                     and not any(lo <= s.value < hi for lo, hi in relro)):
                 writable.append((s.value, s.size, key))
-    return objects, writable
+            elif s.type == STT_TLS and syms.tls_size is not None:
+                thread_local.append((s.value - syms.tls_size, s.size, key))
+    return objects, writable, thread_local
 
 
-def shared_lines(writable):
-    """Return the pairs of writable objects that share a cache line."""
+def shared_lines(placed):
+    """Return the pairs of objects in PLACED, a list of (start, size,
+    name), that share a cache line."""
     lines = collections.defaultdict(set)
-    for start, size, key in writable:
+    for start, size, key in placed:
         # Objects of the same name are told apart only by their
         # contents, so leave them unnumbered here.
         for line in range(start // CACHE_LINE,
@@ -865,8 +952,8 @@ def main(argv=None):
         patterns = read_watch(args.watch) if args.watch else []
         syms_a, fa = functions(args.a, args.objdump)
         syms_b, fb = functions(args.b, args.objdump)
-        da, wa = data_objects(syms_a)
-        db, wb = data_objects(syms_b)
+        da, wa, ta = data_objects(syms_a)
+        db, wb, tb = data_objects(syms_b)
     except (OSError, elfcmp.ElfError, ToolError,
             subprocess.CalledProcessError) as e:
         print(f"asmdiff: {e}", file=sys.stderr)
@@ -877,19 +964,21 @@ def main(argv=None):
 
     code = report("functions", fa, fb, args.show, mark)
     data = report("data objects", da, db, args.show, lambda f: "")
-    pairs_a, pairs_b = shared_lines(wa), shared_lines(wb)
-    added, removed = sorted(pairs_b - pairs_a), sorted(pairs_a - pairs_b)
-    if added or removed:
-        print(f"asmdiff: cache lines: {len(added)} pairs of writable "
-              f"objects now share a line, {len(removed)} no longer do; "
-              "time this change")
-        for x, y in added[:5]:
-            print(f"    now together: {x}, {y}")
-        for x, y in removed[:5]:
-            print(f"    now apart: {x}, {y}")
-    elif wa or wb:
-        print("asmdiff: cache lines: writable objects share lines as "
-              "before")
+    for kind, xa, xb in (("writable", wa, wb), ("thread-local", ta, tb)):
+        pairs_a, pairs_b = shared_lines(xa), shared_lines(xb)
+        added = sorted(pairs_b - pairs_a)
+        removed = sorted(pairs_a - pairs_b)
+        if added or removed:
+            print(f"asmdiff: cache lines: {len(added)} pairs of {kind} "
+                  f"objects now share a line, {len(removed)} no longer "
+                  "do; time this change")
+            for x, y in added[:5]:
+                print(f"    now together: {x}, {y}")
+            for x, y in removed[:5]:
+                print(f"    now apart: {x}, {y}")
+        elif xa or xb:
+            print(f"asmdiff: cache lines: {kind} objects share lines as "
+                  "before")
 
     hits = [f for f in code[0] + code[1] + code[2]
             if patterns and watched(f, patterns)]

@@ -8,9 +8,10 @@ change, and each class has a gate that proves its claim:
   load the same bytes.  Gate: `elfcmp.py`.  No timing is needed.
 - **Instruction-identical:** every function keeps its instructions and
   every data object its contents; only addresses change.  Gate:
-  `asmdiff.py`.  If `asmdiff.py` reports that writable objects now
-  share cache lines differently, also run a short A/B timing: moving
-  data can change speed without changing any instruction.
+  `asmdiff.py`.  If `asmdiff.py` reports that writable or thread-local
+  objects now share cache lines differently, also run a short A/B
+  timing: moving data can change speed without changing any
+  instruction.
 - **Cold path:** only code that runs once per run, operand or pattern
   changes.  Gates: `route_matrix.py` or another oracle that pins the
   behavior, `asmdiff.py --fail-on watch`, and A/B timing if a hot
@@ -66,16 +67,22 @@ each function after normalizing what moving code changes:
   bytes, when the instruction shows their size), or else the section.
 - A thread-local operand becomes the thread-local symbol, also when
   the offset comes from the thread pointer in `%fs:0x0` or from an
-  immediate loaded into the register of `%fs:(REG)`.
+  immediate loaded into the register of `%fs:(REG)`.  What a register
+  holds is followed only along straight-line code, up to a call or an
+  instruction that another path can reach (a branch target, a jump
+  table entry, or a target in another function), and an offset that
+  names no thread-local symbol stays as it is.
 - Alignment padding is dropped, and so are GCC clone numbers
   (`.part.N`, `.isra.N`) and LTO partition names (`.lto_priv.N`).
 
 In object files, relocations name the referenced symbols.  It also
 compares every named data object, with pointers written as what they
 point to, and lists the pairs of writable objects that start or stop
-sharing a 64-byte cache line.  It does not check anonymous constants
-whose size no instruction shows, or code and data reached only through
-computed addresses.  It refuses stripped files.
+sharing a 64-byte cache line, and likewise the pairs of thread-local
+objects (assuming a 64-byte aligned thread pointer, as in glibc).  It
+does not check anonymous constants whose size no instruction shows, or
+code and data reached only through computed addresses.  It refuses
+stripped files.
 
 `--fail-on any` (the default) fails on any changed, added or removed
 function or data object.  `--fail-on watch` fails only if a function
