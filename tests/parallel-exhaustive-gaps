@@ -8,8 +8,10 @@
 . "${srcdir=.}/init.sh"; path_prepend_ ../src
 
 command -v python3 >/dev/null 2>&1 || skip_ "python3 is not available"
+fuzzer="$abs_top_srcdir/benchmarks/exhaustive_gap_fuzzer.py"
+test -f "$fuzzer" \
+  || skip_ "benchmarks/exhaustive_gap_fuzzer.py is not available"
 
-python3 "$abs_top_srcdir/benchmarks/exhaustive_gap_fuzzer.py" \
-  --repo-root "$abs_top_builddir" || Exit 1
+python3 "$fuzzer" --repo-root "$abs_top_builddir" || Exit 1
 
 Exit 0
