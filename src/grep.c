@@ -7992,6 +7992,37 @@ walk_run_cmd_files (char *const *files, size_t nfiles)
   walk_execute_generation (gen);
 }
 
+/* Whether a regular file of status *ST can be searched in chunks.  */
+static bool
+can_chunk_reg_file (struct stat const *st)
+{
+  return (S_ISREG (st->st_mode) && CHUNK_FILE_MIN <= st->st_size
+          && (!out_invert || (out_before < 0 && out_after < 0))
+          && max_count == INTMAX_MAX);
+}
+
+/* How several threads can search standard input.  */
+enum stdin_route { STDIN_ROUTE_QUEUE, STDIN_ROUTE_CHUNK, STDIN_ROUTE_SLICE };
+
+/* Return how several threads can search standard input, and store its
+   status in *ST if fstat succeeds.  Callers check POOL_TARGET.  */
+static enum stdin_route
+classify_stdin_route (struct stat *st)
+{
+  if (stdin_is_closed || isatty (STDIN_FILENO)
+      || fstat (STDIN_FILENO, st) != 0)
+    return STDIN_ROUTE_QUEUE;
+  if (S_ISREG (st->st_mode))
+    return (can_chunk_reg_file (st) && !SAME_INODE (*st, out_stat)
+            && lseek (STDIN_FILENO, 0, SEEK_CUR) == 0
+            && list_files == LISTFILES_NONE && !exit_on_match
+            ? STDIN_ROUTE_CHUNK : STDIN_ROUTE_QUEUE);
+  return (out_before < 0 && out_after < 0 && max_count == INTMAX_MAX
+          && !initial_done_on_match && !line_buffered && !possibly_tty
+          && binary_files != WITHOUT_MATCH_BINARY_FILES
+          ? STDIN_ROUTE_SLICE : STDIN_ROUTE_QUEUE);
+}
+
 static void
 producer_run (char *const *files)
 {
@@ -8018,33 +8049,22 @@ producer_run (char *const *files)
           if (pool_started)
             rob_wait_all_committed ();
           struct stat st;
-          bool stdin_ok = !stdin_is_closed && fstat (STDIN_FILENO, &st) == 0;
-          bool stdin_is_reg = stdin_ok && S_ISREG (st.st_mode);
-          if (pool_target > 1 && stdin_is_reg && !isatty (STDIN_FILENO)
-              && st.st_size >= CHUNK_FILE_MIN
-              && !SAME_INODE (st, out_stat)
-              && lseek (STDIN_FILENO, 0, SEEK_CUR) == 0
-              && (!out_invert || (out_before < 0 && out_after < 0))
-              && list_files == LISTFILES_NONE && !exit_on_match
-              && max_count == INTMAX_MAX)
+          switch (pool_target > 1 ? classify_stdin_route (&st)
+                  : STDIN_ROUTE_QUEUE)
             {
+            case STDIN_ROUTE_CHUNK:
               GREP_TEST_ROUTE (STDIN_CHUNK, label);
               chunked_grep_fd (STDIN_FILENO, false, label ? label : _("(standard input)"), &st);
               rob_wait_all_committed ();
-            }
-          else if (pool_target > 1 && stdin_ok && !stdin_is_reg
-                   && !isatty (STDIN_FILENO)
-                   && out_before < 0 && out_after < 0 && max_count == INTMAX_MAX
-                   && !done_on_match && !line_buffered && !possibly_tty
-                   && binary_files != WITHOUT_MATCH_BINARY_FILES)
-            {
+              break;
+            case STDIN_ROUTE_SLICE:
               GREP_TEST_ROUTE (STDIN_SLICE, label);
               stream_slicer_stdin ();
-            }
-          else
-            {
+              break;
+            case STDIN_ROUTE_QUEUE:
               GREP_TEST_ROUTE (STDIN_QUEUE, label);
               producer_enqueue_stdin ();
+              break;
             }
         }
       else
@@ -8069,10 +8089,7 @@ producer_run (char *const *files)
                   walk_run_dirs (f, f_end - f);
                   f = f_end - 1;
                 }
-              else if (S_ISREG (st.st_mode) && st.st_size >= CHUNK_FILE_MIN
-                       && pool_target > 1
-                       && (!out_invert || (out_before < 0 && out_after < 0))
-                       && max_count == INTMAX_MAX)
+              else if (pool_target > 1 && can_chunk_reg_file (&st))
                 {
                   GREP_TEST_ROUTE (FILE_CHUNK, *f);
                   chunked_grep_file (*f, &st);
@@ -8359,28 +8376,14 @@ compute_worker_threads (char *const *files)
   bool single_operand = files[0] && !files[1];
   bool is_single_stdin = single_operand && STREQ (*files, "-");
   bool can_parallelize_stdin = false;
-  if (is_single_stdin && !isatty (STDIN_FILENO))
+  if (is_single_stdin)
     {
       /* If standard input cannot even be examined (e.g., it is closed),
-         let single-threaded grep diagnose it.  */
+         let single-threaded grep diagnose it.  STDIN_IS_CLOSED is not
+         set yet; a closed standard input fails fstat here.  */
       struct stat in_st;
-      bool stdin_ok = fstat (STDIN_FILENO, &in_st) == 0;
-      bool stdin_is_reg = stdin_ok && S_ISREG (in_st.st_mode);
-      bool stdin_is_large_reg = (stdin_is_reg
-                                 && in_st.st_size >= CHUNK_FILE_MIN
-                                 && !SAME_INODE (in_st, out_stat)
-                                 && lseek (STDIN_FILENO, 0, SEEK_CUR) == 0
-                                 && list_files == LISTFILES_NONE
-                                 && !exit_on_match
-                                 && (!out_invert
-                                     || (out_before < 0 && out_after < 0)));
-      bool can_slice_stdin = (stdin_ok && !stdin_is_reg
-                              && out_before < 0 && out_after < 0
-                              && max_count == INTMAX_MAX
-                              && !done_on_match && !line_buffered
-                              && !possibly_tty
-                              && binary_files != WITHOUT_MATCH_BINARY_FILES);
-      can_parallelize_stdin = stdin_is_large_reg || can_slice_stdin;
+      can_parallelize_stdin = (classify_stdin_route (&in_st)
+                               != STDIN_ROUTE_QUEUE);
     }
   bool is_single_large_file = false;
   bool is_dir_recurse = false;
@@ -8388,10 +8391,7 @@ compute_worker_threads (char *const *files)
   if (single_operand && !is_single_stdin && stat (*files, &tmp_st) == 0
       && !skipped_file (*files, true, S_ISDIR (tmp_st.st_mode) != 0))
     {
-      is_single_large_file = (S_ISREG (tmp_st.st_mode)
-                              && tmp_st.st_size >= CHUNK_FILE_MIN
-                              && (!out_invert
-                                  || (out_before < 0 && out_after < 0)));
+      is_single_large_file = can_chunk_reg_file (&tmp_st);
       is_dir_recurse = (directories == RECURSE_DIRECTORIES
                         && S_ISDIR (tmp_st.st_mode));
     }
