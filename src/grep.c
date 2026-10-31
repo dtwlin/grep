@@ -3903,6 +3903,58 @@ restore_search_tls (struct search_tls_state const *s)
 #undef GREP_TLS_RESTORE
 }
 
+/* Free SLOT's standard output and the offsets of its big writes, and
+   clear the flags that describe that output.  */
+static void
+rob_slot_discard_stdout (struct rob_slot *slot)
+{
+  free (slot->stdout_buf);
+  slot->stdout_buf = nullptr;
+  slot->stdout_len = 0;
+  free (slot->big);
+  slot->big = nullptr;
+  slot->nbig = 0;
+  slot->enc_error = false;
+  slot->had_prline = false;
+  slot->had_prtext = false;
+  slot->sep = false;
+}
+
+/* Free all of SLOT's output: its standard output as
+   rob_slot_discard_stdout does, and its standard error.  */
+static void
+rob_slot_discard_output (struct rob_slot *slot)
+{
+  rob_slot_discard_stdout (slot);
+  free (slot->stderr_buf);
+  slot->stderr_buf = nullptr;
+  slot->stderr_len = 0;
+  slot->errseen = false;
+}
+
+/* Move the status and output of SRC, a slot outside the reorder
+   buffer, into DST, whose output has been discarded.  */
+static void
+rob_slot_move_output (struct rob_slot *dst, struct rob_slot const *src)
+{
+  dst->status = src->status;
+  dst->errseen = src->errseen;
+  dst->had_prtext = src->had_prtext;
+  dst->had_prline = src->had_prline;
+  dst->sep = src->sep;
+  dst->enc_error = src->enc_error;
+  if (!src->stdout_buf && src->stdout_len > 0)
+    memcpy (dst->inline_out, src->inline_out, src->stdout_len);
+  dst->stdout_buf = src->stdout_buf;
+  dst->stdout_len = src->stdout_len;
+  dst->stdout_cap = src->stdout_cap;
+  dst->stderr_buf = src->stderr_buf;
+  dst->stderr_len = src->stderr_len;
+  dst->stderr_cap = src->stderr_cap;
+  dst->big = src->big;
+  dst->nbig = src->nbig;
+}
+
 /* Move the current thread's newly allocated output buffers and flags
    (some of the variables of GREP_TASK_TLS_SAVED) into SLOT.  */
 static inline void
@@ -3974,16 +4026,7 @@ static void
 stream_commit_binary (struct rob_slot *slot)
 {
   /* What a worker output from the slice does not count.  */
-  free (slot->stdout_buf);
-  slot->stdout_buf = nullptr;
-  slot->stdout_len = 0;
-  free (slot->big);
-  slot->big = nullptr;
-  slot->nbig = 0;
-  slot->enc_error = false;
-  slot->had_prline = false;
-  slot->had_prtext = false;
-  slot->sep = false;
+  rob_slot_discard_stdout (slot);
 
   if (!slot->stream_chunk_data)
     {
@@ -4089,15 +4132,7 @@ stream_commit_slice_locked (struct rob_slot *slot)
 static void
 rob_free_slot_resources_locked (struct rob_slot *slot)
 {
-  free (slot->stdout_buf);
-  slot->stdout_buf = nullptr;
-
-  free (slot->stderr_buf);
-  slot->stderr_buf = nullptr;
-
-  free (slot->big);
-  slot->big = nullptr;
-  slot->nbig = 0;
+  rob_slot_discard_output (slot);
 
   if (slot->cleanup_fn)
     {
@@ -5222,36 +5257,14 @@ chunk_slot_done_locked (struct chunk_file_state *state)
       for (size_t k = 0; k < state->num_chunks; k++)
         {
           struct rob_slot *s = &rob[(state->first_seq + k) % ROB_CAP];
-          free (s->stdout_buf);
-          free (s->stderr_buf);
-          free (s->big);
-          s->stdout_buf = s->stderr_buf = nullptr;
-          s->stdout_len = s->stderr_len = 0;
-          s->big = nullptr;
-          s->nbig = 0;
+          rob_slot_discard_output (s);
           s->status = true;
-          s->errseen = s->had_prtext = s->had_prline = false;
-          s->sep = s->enc_error = false;
           s->chunk_count = 0;
           s->is_chunk = s->is_last_chunk = false;
         }
       struct rob_slot *last
         = &rob[(state->first_seq + state->num_chunks - 1) % ROB_CAP];
-      last->status = result->status;
-      last->errseen = result->errseen;
-      last->had_prtext = result->had_prtext;
-      last->had_prline = result->had_prline;
-      last->sep = result->sep;
-      if (!result->stdout_buf && result->stdout_len > 0)
-        memcpy (last->inline_out, result->inline_out, result->stdout_len);
-      last->stdout_buf = result->stdout_buf;
-      last->stdout_len = result->stdout_len;
-      last->stdout_cap = result->stdout_cap;
-      last->stderr_buf = result->stderr_buf;
-      last->stderr_len = result->stderr_len;
-      last->stderr_cap = result->stderr_cap;
-      last->big = result->big;
-      last->nbig = result->nbig;
+      rob_slot_move_output (last, result);
       free (result);
     }
 
