@@ -80,8 +80,8 @@ grep_LDADD = $(LDADD) $(PCRE_LIBS) $(LIBCSTACK)
 localedir = $(datadir)/locale
 AM_CPPFLAGS = -I$(top_builddir)/lib -I$(top_srcdir)/lib
 
-# Included by grep.c in test builds, not compiled on its own.
-EXTRA_DIST = egrep.sh grep-test-hooks.c
+# The .c files here are included by grep.c, not compiled on their own.
+EXTRA_DIST = egrep.sh chunksearch.c grep-test-hooks.c parallel.c walk.c
 BUILT_SOURCES = sc-version.h
 
 grep.$(OBJEXT) grep_hooks-grep.$(OBJEXT) grep_shrunk-grep.$(OBJEXT): \

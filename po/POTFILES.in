@@ -29,6 +29,9 @@ lib/quotearg.c
 lib/regcomp.c
 lib/version-etc.c
 lib/xalloc-die.c
+src/chunksearch.c
 src/dfasearch.c
 src/grep.c
+src/parallel.c
 src/pcresearch.c
+src/walk.c
