@@ -17,6 +17,7 @@
 #include <config.h>
 
 #include "dfa-prefilter.h"
+#include "regex-lex.h"
 #include "system.h"
 
 #include <stdio.h>
@@ -282,6 +283,89 @@ run_utf8_tests (void)
                ere, true, "ab", "cd_ef");
 }
 
+static void
+run_regex_lex_c_tests (void)
+{
+  char *b1 = exact_dup (S ("\342\202\254xyz"));
+  if (utf8_byte_run_len (b1, b1 + 6) != 3
+      || utf8_byte_run_len (b1 + 3, b1 + 6) != 1)
+    {
+      fprintf (stderr, "FAIL lex-utf8-run\n");
+      failures++;
+    }
+  free (b1);
+
+  struct regex_interval iv;
+  char *iv1 = exact_dup (S ("{,3}tail"));
+  if (!regex_parse_interval (iv1, iv1 + 8, REGEX_IV_ALLOW_EMPTY_MIN, &iv)
+      || iv.min_rep != 0 || !iv.has_comma || iv.end != iv1 + 4
+      || regex_parse_interval (iv1, iv1 + 8, 0, &iv))
+    {
+      fprintf (stderr, "FAIL lex-iv-empty-min\n");
+      failures++;
+    }
+  free (iv1);
+
+  char *iv2 = exact_dup (S ("{,}"));
+  if (regex_parse_interval (iv2, iv2 + 3, REGEX_IV_ALLOW_EMPTY_MIN, &iv)
+      || !regex_parse_interval (iv2, iv2 + 3,
+                                REGEX_IV_ALLOW_EMPTY_MIN
+                                | REGEX_IV_ALLOW_EMPTY_BOTH, &iv)
+      || iv.end != iv2 + 3)
+    {
+      fprintf (stderr, "FAIL lex-iv-empty-both\n");
+      failures++;
+    }
+  free (iv2);
+
+  char *iv3 = exact_dup (S ("\\{12,34\\}z"));
+  if (!regex_parse_interval (iv3, iv3 + 10, REGEX_IV_BACKSLASH, &iv)
+      || iv.min_rep != 12 || !iv.has_comma || iv.end != iv3 + 9)
+    {
+      fprintf (stderr, "FAIL lex-iv-backslash\n");
+      failures++;
+    }
+  free (iv3);
+
+  char *iv4 = exact_dup (S ("{99999999999999999999999999}"));
+  if (!regex_parse_interval (iv4, iv4 + 28, 0, &iv) || iv.min_rep != IDX_MAX)
+    {
+      fprintf (stderr, "FAIL lex-iv-overflow\n");
+      failures++;
+    }
+  free (iv4);
+
+  char *cc1 = exact_dup (S ("[:alpha:]]"));
+  char *cc2 = exact_dup (S ("[:unclosed]"));
+  if (regex_bracket_class_end (cc1, cc1 + 10) != cc1 + 9
+      || regex_bracket_class_end (cc2, cc2 + 11) != nullptr
+      || regex_bracket_class_end (cc1, cc1 + 1) != nullptr)
+    {
+      fprintf (stderr, "FAIL lex-bracket-class\n");
+      failures++;
+    }
+  free (cc1);
+  free (cc2);
+}
+
+static void
+run_regex_lex_utf8_tests (void)
+{
+  char *u1 = exact_dup (S ("\342\202\254"));
+  char *u2 = exact_dup (S ("\200"));
+  char *u3 = exact_dup (S ("\342\202"));
+  if (utf8_char_len (u1, u1 + 3) != 3
+      || utf8_char_len (u2, u2 + 1) != (size_t) -1
+      || utf8_char_len (u3, u3 + 2) != (size_t) -2)
+    {
+      fprintf (stderr, "FAIL lex-utf8-char-len\n");
+      failures++;
+    }
+  free (u1);
+  free (u2);
+  free (u3);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -293,11 +377,13 @@ main (int argc, char **argv)
           return 77;
         }
       run_utf8_tests ();
+      run_regex_lex_utf8_tests ();
     }
   else
     {
       setlocale (LC_ALL, "C");
       run_c_locale_tests ();
+      run_regex_lex_c_tests ();
     }
 
   return failures ? EXIT_FAILURE : EXIT_SUCCESS;

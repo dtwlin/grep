@@ -36,7 +36,7 @@ grep_SOURCES += pcresearch.c
 endif
 
 noinst_HEADERS = dfa-prefilter.h grep.h grep-test-hooks.h grep-tunables.h \
-  search.h system.h
+  regex-lex.h search.h system.h
 
 # Test-only builds of grep, never installed.  grep-hooks honors
 # GREP_DELAY_AT (see GREP_TEST_DELAY in grep-test-hooks.h) and

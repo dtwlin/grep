@@ -20,6 +20,7 @@
 #include <search.h>
 #include "die.h"
 #include "grep-test-hooks.h"
+#include "regex-lex.h"
 
 #include <stdckdint.h>
 
@@ -215,41 +216,22 @@ pcre_group_header (char const *pat, idx_t p, idx_t size,
 static bool _GL_ATTRIBUTE_PURE
 is_pcre_brace_quantifier (char const *pat, idx_t p, idx_t size)
 {
-  if (p >= size || pat[p] != '{')
-    return false;
-  p++;
-  idx_t digits = 0;
-  while (p < size && pat[p] >= '0' && pat[p] <= '9')
-    {
-      digits++;
-      p++;
-    }
-  if (p < size && pat[p] == ',')
-    {
-      p++;
-      while (p < size && pat[p] >= '0' && pat[p] <= '9')
-        {
-          digits++;
-          p++;
-        }
-    }
-  return digits > 0 && p < size && pat[p] == '}';
+  struct regex_interval iv;
+  return regex_parse_interval (pat + p, pat + size,
+                               REGEX_IV_ALLOW_EMPTY_MIN, &iv);
 }
 
 static idx_t _GL_ATTRIBUTE_PURE
 skip_pcre_quantifiers (char const *pat, idx_t p, idx_t size)
 {
+  struct regex_interval iv;
   while (p < size)
     {
       if (pat[p] == '*' || pat[p] == '?' || pat[p] == '+')
         p++;
-      else if (is_pcre_brace_quantifier (pat, p, size))
-        {
-          while (p < size && pat[p] != '}')
-            p++;
-          if (p < size && pat[p] == '}')
-            p++;
-        }
+      else if (regex_parse_interval (pat + p, pat + size,
+                                     REGEX_IV_ALLOW_EMPTY_MIN, &iv))
+        p = iv.end - pat;
       else
         break;
     }
@@ -340,21 +322,14 @@ skip_pcre_char_class (char const *pat, idx_t p, idx_t size)
     {
       if (pat[p] == '\\')
         p = skip_pcre_escape (pat, p, size, true);
-      else if (p + 1 < size && pat[p] == '['
-               && (pat[p + 1] == ':' || pat[p + 1] == '.' || pat[p + 1] == '='))
+      else
         {
-          char ctype = pat[p + 1];
-          idx_t q = p + 2;
-          while (q + 1 < size && pat[q] != ']'
-                 && !(pat[q] == ctype && pat[q + 1] == ']'))
-            q++;
-          if (q + 1 < size && pat[q] == ctype && pat[q + 1] == ']')
-            p = q + 2;
+          char const *end = regex_bracket_class_end (pat + p, pat + size);
+          if (end)
+            p = end - pat;
           else
             p++;
         }
-      else
-        p++;
     }
   if (p < size && pat[p] == ']')
     p++;

@@ -20,52 +20,19 @@
 #include "dfa-prefilter.h"
 
 #include <stdlib.h>
-#include <wchar.h>
 
+#include "regex-lex.h"
 #include "xalloc.h"
 
-static bool _GL_ATTRIBUTE_PURE
-is_dfa_brace_quantifier (char const *p, char const *lim,
-                         reg_syntax_t syntax_bits)
+static bool
+parse_dfa_interval (char const *p, char const *lim, reg_syntax_t syntax_bits,
+                    struct regex_interval *out)
 {
   if (!(syntax_bits & RE_INTERVALS))
     return false;
-  bool ere = (syntax_bits & RE_NO_BK_VBAR) != 0;
-  if (ere)
-    {
-      if (p >= lim || *p != '{')
-        return false;
-      p++;
-    }
-  else
-    {
-      if (lim - p < 2 || p[0] != '\\' || p[1] != '{')
-        return false;
-      p += 2;
-    }
-  idx_t digits = 0;
-  bool has_comma = false;
-  while (p < lim && *p >= '0' && *p <= '9')
-    {
-      digits++;
-      p++;
-    }
-  if (p < lim && *p == ',')
-    {
-      has_comma = true;
-      p++;
-      while (p < lim && *p >= '0' && *p <= '9')
-        {
-          digits++;
-          p++;
-        }
-    }
-  if (digits == 0 && !has_comma)
-    return false;
-  if (ere)
-    return p < lim && *p == '}';
-  else
-    return lim - p >= 2 && p[0] == '\\' && p[1] == '}';
+  int flags = (((syntax_bits & RE_NO_BK_VBAR) ? 0 : REGEX_IV_BACKSLASH)
+               | REGEX_IV_ALLOW_EMPTY_MIN | REGEX_IV_ALLOW_EMPTY_BOTH);
+  return regex_parse_interval (p, lim, flags, out);
 }
 
 static bool _GL_ATTRIBUTE_PURE
@@ -73,75 +40,46 @@ is_quantifier (char const *p, char const *lim, reg_syntax_t syntax_bits)
 {
   if (p >= lim)
     return false;
+  struct regex_interval iv;
   if (syntax_bits & RE_NO_BK_VBAR) /* ERE */
-    {
-      if (*p == '*' || *p == '+' || *p == '?')
-        return true;
-      if (is_dfa_brace_quantifier (p, lim, syntax_bits))
-        return true;
-      return false;
-    }
-  else /* BRE */
-    {
-      if (*p == '*')
-        return true;
-      if (lim - p >= 2 && *p == '\\')
-        {
-          if (p[1] == '+' || p[1] == '?')
-            return true;
-          if (is_dfa_brace_quantifier (p, lim, syntax_bits))
-            return true;
-        }
-      return false;
-    }
+    return (*p == '*' || *p == '+' || *p == '?'
+            || parse_dfa_interval (p, lim, syntax_bits, &iv));
+  /* BRE */
+  if (*p == '*')
+    return true;
+  if (lim - p >= 2 && *p == '\\')
+    return (p[1] == '+' || p[1] == '?'
+            || parse_dfa_interval (p, lim, syntax_bits, &iv));
+  return false;
 }
 
 static char const * _GL_ATTRIBUTE_PURE
 skip_quantifiers (char const *p, char const *lim, reg_syntax_t syntax_bits)
 {
+  struct regex_interval iv;
   while (p < lim)
     {
       if (syntax_bits & RE_NO_BK_VBAR) /* ERE */
         {
           if (*p == '*' || *p == '+' || *p == '?')
-            {
-              p++;
-              continue;
-            }
-          if (is_dfa_brace_quantifier (p, lim, syntax_bits))
-            {
-              p++;
-              while (*p != '}')
-                p++;
-              p++;
-              continue;
-            }
-          break;
+            p++;
+          else if (parse_dfa_interval (p, lim, syntax_bits, &iv))
+            p = iv.end;
+          else
+            break;
         }
       else /* BRE */
         {
           if (*p == '*')
-            {
-              p++;
-              continue;
-            }
-          if (lim - p >= 2 && *p == '\\')
-            {
-              if (p[1] == '+' || p[1] == '?')
-                {
-                  p += 2;
-                  continue;
-                }
-              if (is_dfa_brace_quantifier (p, lim, syntax_bits))
-                {
-                  p += 2;
-                  while (!(p[0] == '\\' && p[1] == '}'))
-                    p++;
-                  p += 2;
-                  continue;
-                }
-            }
-          break;
+            p++;
+          else if (lim - p >= 2 && *p == '\\'
+                   && (p[1] == '+' || p[1] == '?'))
+            p += 2;
+          else if (lim - p >= 2 && *p == '\\'
+                   && parse_dfa_interval (p, lim, syntax_bits, &iv))
+            p = iv.end;
+          else
+            break;
         }
     }
   return p;
@@ -165,21 +103,11 @@ skip_bracket_expr (char const *s, char const *lim, reg_syntax_t syntax_bits)
           s += 2;
           continue;
         }
-      if (s + 1 < lim && *s == '['
-          && (s[1] == ':' || s[1] == '.' || s[1] == '='))
-        {
-          char ctype = s[1];
-          char const *q = s + 2;
-          while (lim - q >= 2 && *q != ']'
-                 && !(q[0] == ctype && q[1] == ']'))
-            q++;
-          if (lim - q >= 2 && q[0] == ctype && q[1] == ']')
-            {
-              s = q + 2;
-              continue;
-            }
-        }
-      s++;
+      char const *end = regex_bracket_class_end (s, lim);
+      if (end)
+        s = end;
+      else
+        s++;
     }
   return s < lim ? s + 1 : lim;
 }
@@ -438,12 +366,10 @@ extract_branch_best_literal (struct branch_slice slice,
                 bp = skip_quantifiers (bp, blim, syntax_bits);
               else
                 {
-                  idx_t esc_len = bp + 1 < blim ? 2 : 1;
-                  if (esc_len == 2 && utf8
-                      && (unsigned char) bp[1] >= 0x80)
-                    while (bp + esc_len < blim
-                           && ((unsigned char) bp[esc_len] & 0xC0) == 0x80)
-                      esc_len++;
+                  idx_t esc_len
+                    = (bp + 1 < blim
+                       ? 1 + (utf8 ? utf8_byte_run_len (bp + 1, blim) : 1)
+                       : 1);
                   bp = skip_quantifiers (bp + esc_len, blim, syntax_bits);
                 }
             }
@@ -467,13 +393,7 @@ extract_branch_best_literal (struct branch_slice slice,
         }
 
       /* Ordinary character (possibly multibyte UTF-8).  */
-      idx_t clen = 1;
-      if (utf8 && (unsigned char) *bp >= 0x80)
-        {
-          while (bp + clen < blim
-                 && ((unsigned char) bp[clen] & 0xC0) == 0x80)
-            clen++;
-        }
+      idx_t clen = utf8 ? utf8_byte_run_len (bp, blim) : 1;
       if (is_quantifier (bp + clen, blim, syntax_bits))
         {
           flush_branch_literal (best_lit, &best_len, cur_lit, &cur_len,
@@ -564,12 +484,7 @@ prefilter_secondary_must (char const *pat, idx_t size,
                           && (*bp == '|' || *bp == '+' || *bp == '?'
                               || *bp == '{' || *bp == '}'
                               || *bp == '(' || *bp == ')')));
-      idx_t clen = 1;
-      if (!is_meta && utf8 && (unsigned char) *bp >= 0x80)
-        {
-          while (bp + clen < lim && ((unsigned char) bp[clen] & 0xC0) == 0x80)
-            clen++;
-        }
+      idx_t clen = !is_meta && utf8 ? utf8_byte_run_len (bp, lim) : 1;
       if (is_meta || is_quantifier (bp + clen, lim, syntax_bits))
         {
           if (*bp == '\n'
@@ -586,11 +501,7 @@ prefilter_secondary_must (char const *pat, idx_t size,
           cur_len = 0;
           if (*bp == '\\' && bp + 1 < lim)
             {
-              idx_t esc_len = 2;
-              if (utf8 && (unsigned char) bp[1] >= 0x80)
-                while (bp + esc_len < lim
-                       && ((unsigned char) bp[esc_len] & 0xC0) == 0x80)
-                  esc_len++;
+              idx_t esc_len = 1 + (utf8 ? utf8_byte_run_len (bp + 1, lim) : 1);
               bp = skip_quantifiers (bp + esc_len, lim, syntax_bits);
             }
           else
@@ -763,24 +674,12 @@ parse_group_quantifier (char const **sp, char const *g1_end,
                || (!no_bk_parens && *s == '\\'
                    && s + 1 < g1_end && s[1] == '{'))
         {
-          if (!is_dfa_brace_quantifier (s, g1_end, syntax_bits))
+          struct regex_interval iv;
+          if (!parse_dfa_interval (s, g1_end, syntax_bits, &iv)
+              || iv.min_rep > 2559)
             return false;
-          s += no_bk_parens ? 1 : 2;
-          qmin = 0;
-          while (s < g1_end && *s >= '0' && *s <= '9')
-            {
-              if (qmin > 255)
-                return false;
-              qmin = qmin * 10 + (*s - '0');
-              s++;
-            }
-          if (s < g1_end && *s == ',')
-            {
-              s++;
-              while (s < g1_end && *s >= '0' && *s <= '9')
-                s++;
-            }
-          s += no_bk_parens ? 1 : 2;
+          qmin = iv.min_rep;
+          s = iv.end;
           had_quant = true;
         }
 
@@ -851,8 +750,7 @@ prefilter_backref_filter (char const *pat, idx_t len,
           char const *atom_start = s;
           if (utf8 && (unsigned char) atom_start[0] >= 0x80)
             {
-              mbstate_t mbs = { 0 };
-              size_t clen = mbrlen (s, g1_end - s, &mbs);
+              size_t clen = utf8_char_len (s, g1_end);
               if (clen == (size_t) -1 || clen == (size_t) -2 || clen == 0)
                 return;
               s += clen;
