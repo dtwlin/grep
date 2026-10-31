@@ -20,7 +20,7 @@
    (see src/Makefile.am), so that the tests reach the paths that wait
    for space, split work or recruit threads with small inputs.
    grep-shrunk also defines WALK_FD_CAP_MAX, which walk_fd_cap in
-   grep.c reads.  */
+   walk.c reads.  */
 
 #ifndef GREP_TUNABLES_H
 #define GREP_TUNABLES_H

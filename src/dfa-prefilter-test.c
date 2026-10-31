@@ -371,9 +371,10 @@ main (int argc, char **argv)
 {
   if (argc == 2 && STREQ (argv[1], "--utf8"))
     {
-      if (!setlocale (LC_ALL, "en_US.UTF-8") || MB_CUR_MAX <= 1)
+      if ((!setlocale (LC_ALL, "en_US.UTF-8") || MB_CUR_MAX <= 1)
+          && (!setlocale (LC_ALL, "C.UTF-8") || MB_CUR_MAX <= 1))
         {
-          fprintf (stderr, "SKIP: en_US.UTF-8 locale unavailable\n");
+          fprintf (stderr, "SKIP: UTF-8 locale unavailable\n");
           return 77;
         }
       run_utf8_tests ();
