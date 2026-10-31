@@ -96,6 +96,7 @@ TESTS =						\
   dfa-heap-overrun				\
   dfa-infloop					\
   dfa-invalid-utf8				\
+  dfa-prefilter-unit				\
   dfaexec-multibyte				\
   empty						\
   empty-line					\

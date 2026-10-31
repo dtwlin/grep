@@ -1,0 +1,31 @@
+#! /bin/sh
+# Run unit tests for src/dfa-prefilter.c in C and UTF-8 locales.
+#
+# Copyright (C) 2026 David Lin <dtwlin@gmail.com>
+#
+# Copying and distribution of this file, with or without modification,
+# are permitted in any medium without royalty provided the copyright
+# notice and this notice are preserved.
+
+. "${srcdir=.}/init.sh"; path_prepend_ ../src
+
+prog="$abs_top_builddir/src/dfa-prefilter-test"
+if test ! -x "$prog"; then
+  ${MAKE:-make} -C "$abs_top_builddir/src" dfa-prefilter-test >&2 \
+    || framework_failure_
+fi
+
+fail=0
+
+LC_ALL=C "$prog" || fail=1
+
+if test "${LOCALE_FR_UTF8:-none}" != none || LC_ALL=en_US.UTF-8 true 2>/dev/null
+then
+  LC_ALL=en_US.UTF-8 "$prog" --utf8
+  rc=$?
+  if test $rc -ne 0 && test $rc -ne 77; then
+    fail=1
+  fi
+fi
+
+Exit $fail

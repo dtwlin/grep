@@ -170,7 +170,7 @@ update-copyright-env = \
 include $(abs_top_srcdir)/dist-check.mk
 
 exclude_file_name_regexp--sc_bindtextdomain = \
-  ^tests/get-mb-cur-max\.c$$
+  ^(src/dfa-prefilter-test|tests/get-mb-cur-max)\.c$$
 
 exclude_file_name_regexp--sc_prohibit_strcmp = /colorize-.*\.c$$
 exclude_file_name_regexp--sc_prohibit_xalloc_without_use = ^src/kwset\.c$$

@@ -3,3 +3,4 @@
 /fgrep
 /grep-hooks
 /grep-shrunk
+/dfa-prefilter-test

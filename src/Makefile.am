@@ -25,6 +25,7 @@ AM_LDFLAGS = $(IGNORE_UNUSED_LIBRARIES_CFLAGS) -pthread
 bin_PROGRAMS = grep
 bin_SCRIPTS = egrep fgrep
 grep_SOURCES =					\
+  dfa-prefilter.c				\
   dfasearch.c					\
   die.h						\
   grep.c					\
@@ -34,8 +35,8 @@ if USE_PCRE
 grep_SOURCES += pcresearch.c
 endif
 
-noinst_HEADERS = grep.h grep-test-hooks.h grep-tunables.h search.h \
-  system.h
+noinst_HEADERS = dfa-prefilter.h grep.h grep-test-hooks.h grep-tunables.h \
+  search.h system.h
 
 # Test-only builds of grep, never installed.  grep-hooks honors
 # GREP_DELAY_AT (see GREP_TEST_DELAY in grep-test-hooks.h) and
@@ -46,7 +47,7 @@ noinst_HEADERS = grep.h grep-test-hooks.h grep-tunables.h search.h \
 # work runs often, and recruits and splits eagerly.  Only
 # -DGREP_TEST_HOOKS enables the hooks; the installed grep is built
 # without it and compiles them away.
-check_PROGRAMS = grep-hooks grep-shrunk
+check_PROGRAMS = grep-hooks grep-shrunk dfa-prefilter-test
 grep_hooks_SOURCES = $(grep_SOURCES)
 grep_hooks_CPPFLAGS = $(AM_CPPFLAGS) -DGREP_TEST_HOOKS
 grep_hooks_LDADD = $(grep_LDADD)
@@ -64,6 +65,8 @@ grep_shrunk_CPPFLAGS = $(AM_CPPFLAGS) -DGREP_TEST_HOOKS \
   -DWALK_RECRUIT_NS=200000 -DWALK_SPLIT_NS=200000 \
   -DWALK_SPLIT_FILE_NS=20000 -DWALK_FD_CAP_MAX=4
 grep_shrunk_LDADD = $(grep_LDADD)
+dfa_prefilter_test_SOURCES = dfa-prefilter-test.c dfa-prefilter.c
+dfa_prefilter_test_LDADD = $(LDADD)
 
 # Sometimes, the expansion of $(LIBINTL) includes -lc which may
 # include modules defining variables like 'optind', so libgreputils.a
