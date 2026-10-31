@@ -257,6 +257,7 @@ class Symbols:
                 for off, rtype, sym, addend in entries:
                     self.dyn[off] = (rtype, sym, addend)
         self.code = {}            # (section, address) -> (function, index)
+        self.jump_table_sizes = {}  # address -> entries (0 if unknown)
 
     @staticmethod
     def _index(entries):
@@ -494,14 +495,29 @@ class Normalizer:
     @staticmethod
     def jump_tables(insns):
         """Map the index of each instruction that loads the address of
-        a jump table to its number of entries, or 0 if unknown."""
+        a jump table to its number of entries, or 0 if unknown.  The
+        table is the base of a later "movslq (%REG,%X,4)" before REG
+        changes."""
         tables = {}
         for i, insn in enumerate(insns):
             m = RIP_LEA.match(insn[2])
             if not m:
                 continue
+            reg = REGS.get(m.group(1), m.group(1))
             load = f"movslq (%{m.group(1)},%"
-            if not any(load in later[2] for later in insns[i + 1:i + 7]):
+            found = False
+            for later in insns[i + 1:i + 65]:
+                text = later[2]
+                if load in text:
+                    found = True
+                    break
+                if text.startswith(("call", "ret", "jmp")):
+                    break
+                lm = LAST_REG.search(text)
+                if (lm and "," in text and not text.startswith(NO_WRITE)
+                        and REGS.get(lm.group(1)) == reg):
+                    break
+            if not found:
                 continue
             count = 0
             for j in range(i - 1, max(-1, i - 9), -1):
@@ -547,8 +563,12 @@ class Normalizer:
                 what = syms.section_offset(self.shndx, int(cm.group(1), 16),
                                            size, self.cur)
             elif cm and not syms.relocatable:
-                what = syms.address(int(cm.group(1), 16), size, table,
-                                    self.cur)
+                addr = int(cm.group(1), 16)
+                tbl = table
+                if tbl is None and text.startswith("lea "):
+                    # Another load of a known jump table's address.
+                    tbl = syms.jump_table_sizes.get(addr)
+                what = syms.address(addr, size, tbl, self.cur)
             return f"{what or 'X'}(%rip)"
 
         ins = RIP.sub(rip, ins)
@@ -642,9 +662,17 @@ def functions(path, objdump):
     """Return (Symbols, {function name: [normalized instructions]})."""
     syms = Symbols(path)
     norm = Normalizer(syms)
+    funcs = index_code(syms, disassemble(path, objdump))
+    if not syms.relocatable:
+        for _, _, insns in funcs:
+            for i, count in Normalizer.jump_tables(insns).items():
+                cm = re.match(r"([0-9a-f]+)", insns[i][3])
+                if cm:
+                    addr = int(cm.group(1), 16)
+                    old = syms.jump_table_sizes.get(addr, 0)
+                    syms.jump_table_sizes[addr] = max(old, count)
     result = collections.OrderedDict()
-    for key, section, insns in index_code(syms,
-                                          disassemble(path, objdump)):
+    for key, section, insns in funcs:
         result[key] = norm.function(key, section, insns)
     return syms, result
 
