@@ -242,79 +242,11 @@ static char *slice_freelist[SLICE_POOL_CAP];
 static int slice_freelist_cnt = 0;
 static pthread_cond_t slice_avail_cv = PTHREAD_COND_INITIALIZER;
 
-static char *
-alloc_slice_buf_locked (void)
-{
-  if (slice_freelist_cnt > 0)
-    return slice_freelist[--slice_freelist_cnt];
-
-  size_t buf_sz = sizeof (size_t) + SLICE_BUF_SIZE + 2 + uword_size;
-  void *p = MAP_FAILED;
-  if (MAP_POPULATE)
-    p = mmap (NULL, buf_sz, PROT_READ | PROT_WRITE,
-              MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
-  if (p == MAP_FAILED)
-    {
-      p = mmap (NULL, buf_sz, PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-      if (p == MAP_FAILED)
-        xalloc_die ();
-    }
-  size_t cap = SLICE_BUF_SIZE;
-  memcpy (p, &cap, sizeof cap);
-  return (char *) p + sizeof (size_t);
-}
-
-static void
-free_slice_buf_locked (char *ptr)
-{
-  char *raw = ptr - sizeof (size_t);
-  size_t cap;
-  memcpy (&cap, raw, sizeof cap);
-  if (cap == SLICE_BUF_SIZE && slice_freelist_cnt < SLICE_POOL_CAP)
-    {
-      slice_freelist[slice_freelist_cnt++] = ptr;
-      pthread_cond_signal (&slice_avail_cv);
-    }
-  else
-    munmap (raw, sizeof (size_t) + cap + 2 + uword_size);
-}
-
-static char *
-grow_slice_buf (char *chunk_alloc, size_t used_len, size_t new_cap)
-{
-  char *old_raw = chunk_alloc - sizeof (size_t);
-  size_t old_cap;
-  memcpy (&old_cap, old_raw, sizeof old_cap);
-  size_t new_map_sz = sizeof (size_t) + new_cap + 2 + uword_size;
-  void *new_raw = mmap (NULL, new_map_sz, PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (new_raw == MAP_FAILED)
-    xalloc_die ();
-  memcpy (new_raw, &new_cap, sizeof new_cap);
-  char *new_alloc = (char *) new_raw + sizeof (size_t);
-  memcpy (new_alloc, chunk_alloc, 1 + used_len);
-  if (old_cap == SLICE_BUF_SIZE)
-    {
-      pthread_mutex_lock (&pool_mutex);
-      free_slice_buf_locked (chunk_alloc);
-      pthread_mutex_unlock (&pool_mutex);
-    }
-  else
-    munmap (old_raw, sizeof (size_t) + old_cap + 2 + uword_size);
-  return new_alloc;
-}
-
-static void
-cleanup_slice_freelist (void)
-{
-  for (int i = 0; i < slice_freelist_cnt; ++i)
-    {
-      char *raw = slice_freelist[i] - sizeof (size_t);
-      munmap (raw, sizeof (size_t) + SLICE_BUF_SIZE + 2 + uword_size);
-    }
-  slice_freelist_cnt = 0;
-}
+static char *alloc_slice_buf_locked (void);
+static void free_slice_buf_locked (char *ptr);
+static char *grow_slice_buf (char *chunk_alloc, size_t used_len,
+                             size_t new_cap);
+static void cleanup_slice_freelist (void);
 
 static int pool_nthreads;
 static pthread_t *pool_threads;
@@ -573,146 +505,7 @@ rob_capture_tls_output (struct rob_slot *slot)
   tls_out = tls_err = tls_big = (struct membuf) { .data = nullptr };
 }
 
-/* Initialize thread-local search state to scan an unbuffered stdin
-   slice [BEG, LIM).  This sets only the part of GREP_TASK_TLS_SAVED
-   that a slice needs.  */
-static inline void
-init_stream_slice_tls (char *beg, char *lim, off_t slice_totalcc,
-                       intmax_t slice_totalnl, char const *slice_lastnl)
-{
-  buffering_enabled = false;
-  filename = label;
-  bufbeg = beg;
-  buflim = lim;
-  totalcc = slice_totalcc;
-  totalnl = slice_totalnl;
-  lastnl = slice_lastnl;
-  lastout = nullptr;
-  outleft = max_count;
-  pending = 0;
-  out_quiet = initial_out_quiet;
-  done_on_match = initial_done_on_match;
-  encoding_error_output = false;
-  file_used = false;
-  task_had_prtext = false;
-  task_had_prline = false;
-  task_sep = false;
-  offset_width = compute_offset_width (nullptr);
-}
-
-/* Commit the slice of standard input in SLOT in the light of null
-   bytes.  From the start of the read buffer that holds the first null
-   byte of the input, single-threaded grep outputs nothing more, stops
-   at the next match (which it reports at the end), and turns null bytes
-   into line ends.  How much a read from a pipe returns varies with the
-   writer; suppose a writer that keeps the pipe full, so that each read
-   returns STREAM_READSIZE bytes.  Single-threaded grep then switches at
-   the same point, and its results do not depend on the writer anyway
-   with -c, -l, -L and -q.  */
-static void
-stream_commit_binary (struct rob_slot *slot)
-{
-  /* What a worker output from the slice does not count.  */
-  rob_slot_discard_stdout (slot);
-
-  if (!slot->stream_chunk_data)
-    {
-      /* A worker searched the slice, which has no null byte, and its
-         count and status hold.  */
-      if (!count_matches && !slot->status)
-        stream_binary_match = true;
-      return;
-    }
-
-  char *beg = slot->stream_chunk_data;
-  char *lim = beg + slot->stream_chunk_len;
-  char *from = beg;
-  if (!stream_binary)
-    {
-      char *z = memchr (beg, '\0', lim - beg);
-      intmax_t boundary = ((slot->stream_totalcc + (z - beg))
-                           / stream_readsize * stream_readsize);
-      if (slot->stream_totalcc < boundary)
-        {
-          char *eol = memrchr (beg, eolbyte, boundary - slot->stream_totalcc);
-          if (eol)
-            from = eol + 1;
-        }
-      stream_binary = true;
-    }
-  zap_nuls (from, lim, eolbyte);
-
-  struct search_tls_state saved;
-  save_search_tls (&saved);
-  init_stream_slice_tls (beg, lim, slot->stream_totalcc,
-                         stream_commit_totalnl, beg);
-
-  intmax_t n = beg < from ? grepbuf (beg, from) : 0;
-  slot->enc_error = (binary_files == BINARY_BINARY_FILES && !out_quiet
-                     && encoding_error_output);
-  if (!count_matches)
-    {
-      out_quiet = true;
-      done_on_match = true;
-    }
-  intmax_t nb = grepbuf (from, lim);
-  if (!count_matches && 0 < nb)
-    stream_binary_match = true;
-  slot->chunk_count = count_matches ? n + nb : 0;
-  slot->status = n + nb == 0;
-  slot->chunk_nls = count_newlines (beg, lim);
-  slot->had_prline = task_had_prline;
-  slot->had_prtext = task_had_prtext;
-
-  restore_search_tls (&saved);
-
-  free_slice_buf_locked (slot->stream_chunk_alloc);
-  slot->stream_chunk_alloc = nullptr;
-  slot->stream_chunk_data = nullptr;
-}
-
-/* Commit the deferred stream slice in SLOT (either binary or line-numbered
-   with matches) and return the updated slot pointer.  POOL_MUTEX must be
-   held; it may be released and re-acquired while scanning.  */
-static struct rob_slot *
-stream_commit_slice_locked (struct rob_slot *slot)
-{
-  if (slot->stream_has_nul || stream_binary)
-    stream_commit_binary (slot);
-  else if (slot->stream_chunk_data != nullptr)
-    {
-      struct search_tls_state saved;
-      save_search_tls (&saved);
-      char *beg = slot->stream_chunk_data;
-      char *slice_lim = beg + slot->stream_chunk_len;
-      char *first_lbeg = slot->stream_first_lbeg;
-      init_stream_slice_tls (beg, slice_lim, slot->stream_totalcc,
-                             stream_commit_totalnl + slot->stream_first_rel_nl,
-                             first_lbeg);
-
-      pthread_mutex_unlock (&pool_mutex);
-      intmax_t mcnt = grepbuf (first_lbeg, slice_lim);
-      bool had_enc_err = (binary_files == BINARY_BINARY_FILES
-                          && !out_quiet && encoding_error_output);
-      pthread_mutex_lock (&pool_mutex);
-      slot = &rob[commit_seq % ROB_CAP];
-      slot->status = (mcnt == 0);
-      if (mcnt > 0)
-        slot->had_prtext = true;
-      slot->had_prline = task_had_prline;
-      slot->enc_error |= had_enc_err;
-
-      restore_search_tls (&saved);
-
-      free_slice_buf_locked (slot->stream_chunk_alloc);
-      slot->stream_chunk_alloc = nullptr;
-      slot->stream_chunk_data = nullptr;
-    }
-  stream_commit_totalnl += slot->chunk_nls;
-  slot->is_stream_chunk = false;
-  slot->chunk_nls = 0;
-  return slot;
-}
+static struct rob_slot *stream_commit_slice_locked (struct rob_slot *slot);
 
 /* Release all dynamic buffers and callbacks owned by SLOT and mark it
    empty.  POOL_MUTEX must be held.  */
@@ -1700,4 +1493,102 @@ producer_enqueue_errseen (void)
   slot->state = ROB_SLOT_DONE;
   rob_try_commit_locked ();
   pthread_mutex_unlock (&pool_mutex);
+}
+
+/* Create the worker threads other than the first, then work like
+   them.  Creating threads takes a while, so the first worker does it
+   instead of the thread that needed the workers.  */
+static void *
+pool_spawner (void *arg)
+{
+  pthread_attr_t attr;
+  pthread_attr_init (&attr);
+  pthread_attr_setstacksize (&attr, 1024 * 1024);
+  for (int i = 1; i < pool_nthreads; i++)
+    {
+      GREP_TEST_DELAY ("spawn");
+      if (atomic_load (&pool_stop_spawning))
+        break;
+      if (pthread_create (&pool_threads[i], &attr, worker_thread_func,
+                          nullptr) != 0)
+        {
+          pthread_mutex_lock (&pool_mutex);
+          pool_nthreads = i;
+          pthread_cond_broadcast (&q_not_full_cv);
+          pthread_mutex_unlock (&pool_mutex);
+          break;
+        }
+      atomic_store (&pool_created, i + 1);
+    }
+  pthread_attr_destroy (&attr);
+  return worker_thread_func (arg);
+}
+
+static void
+start_worker_pool (int nthreads)
+{
+  pool_started = true;
+  pool_nthreads = nthreads;
+  pool_threads = xnmalloc (pool_nthreads, sizeof *pool_threads);
+  pool_terminate = false;
+
+  pthread_attr_t attr;
+  pthread_attr_init (&attr);
+  pthread_attr_setstacksize (&attr, 1024 * 1024);
+  /* Count the first worker before it starts: it raises the count as it
+     creates the others, possibly before pthread_create returns here.  */
+  atomic_store (&pool_created, 1);
+  if (pthread_create (&pool_threads[0], &attr, pool_spawner, nullptr) != 0)
+    {
+      atomic_store (&pool_created, 0);
+      pool_nthreads = 0;
+    }
+  pthread_attr_destroy (&attr);
+  GREP_TEST_DELAY ("pool_started");
+}
+
+/* Start the worker threads if they are not running yet.  */
+static void
+ensure_pool (void)
+{
+  if (!pool_started)
+    start_worker_pool (pool_target);
+}
+
+static void
+finish_worker_pool (void)
+{
+  producer_flush_batch ();
+  if (pool_started)
+    {
+      pthread_mutex_lock (&pool_mutex);
+      rob_wait_all_committed_locked ();
+
+      pool_terminate = true;
+      pthread_cond_broadcast (&q_not_empty_cv);
+      pthread_cond_broadcast (&q_not_full_cv);
+      pthread_cond_broadcast (&rob_space_cv);
+      pthread_cond_broadcast (&slice_avail_cv);
+      pthread_mutex_unlock (&pool_mutex);
+
+      GREP_TEST_DELAY ("pool_join");
+      /* Join the first worker first: once it has exited, it has created
+         all the threads it will create.  */
+      atomic_store (&pool_stop_spawning, true);
+      if (0 < pool_nthreads)
+        pthread_join (pool_threads[0], nullptr);
+      int created = atomic_load (&pool_created);
+      for (int i = 1; i < created; ++i)
+        pthread_join (pool_threads[i], nullptr);
+
+      cleanup_slice_freelist ();
+
+      free (pool_threads);
+      pool_threads = nullptr;
+      pool_nthreads = 0;
+    }
+
+  free_compiled_pattern (primary_compiled_pattern);
+  primary_compiled_pattern = nullptr;
+  compiled_pattern = nullptr;
 }
