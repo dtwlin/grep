@@ -42,7 +42,12 @@ RULE = re.compile(r"[A-Za-z0-9_.+-]+")
 FILE_LINE = re.compile(r"[^:\s]+:\d+:(.*)")
 FILE_COLON = re.compile(r"[^:\s]+\.[A-Za-z0-9]+: (.*)")
 HALT = re.compile(r"[^:\s]+\.mk: ")
-MAKE_NOISE = re.compile(r"make(?:\[\d+\])?: (Entering|Leaving|Target) ")
+MAKE_NOISE = re.compile(r"make(?:\[\d+\])?: (Entering|Leaving|Target|"
+                        r"Nothing to be done) ")
+# Automake's silent-rule lines ("  CC       grep.o"), which appear when
+# a rule such as sc_tight_scope rebuilds out-of-date objects.
+BUILD_STEP = re.compile(r"  (?:AR|CC|CCLD|CPP|CXX|CXXLD|GEN|LEX|RANLIB|"
+                        r"YACC) +\S+")
 
 
 def violation_key(line):
@@ -66,7 +71,8 @@ def parse(path):
     current = None
 
     def record(rule, text):
-        if not text.strip() or HALT.match(text) or MAKE_NOISE.match(text):
+        if (not text.strip() or HALT.match(text) or MAKE_NOISE.match(text)
+                or BUILD_STEP.fullmatch(text)):
             return
         key = (rule, violation_key(text))
         keys[key] += 1

@@ -742,6 +742,21 @@ class ScDiffTest(unittest.TestCase):
         self.assertEqual(status, 1, out)
         self.assertIn("ran in A but not in B", out)
 
+    def test_rebuild_output(self):
+        # sc_tight_scope rebuilds out-of-date objects.
+        b = self.log().replace(
+            "0.04 trailing_blank",
+            "make[1]: Entering directory '/x/src'\n  CC       grep.o\n"
+            "  CCLD     grep\nmake[1]: Nothing to be done for 'all'.\n"
+            "0.04 trailing_blank")
+        status, out = self.diff(self.log(), b)
+        self.assertEqual(status, 0, out)
+        # An indented line that is no build step still counts.
+        b = b.replace("  CCLD     grep\n", "  CCLD     grep\n  NOTE x\n")
+        status, out = self.diff(self.log(), b)
+        self.assertEqual(status, 1, out)
+        self.assertIn("sc_trailing_blank:   NOTE x", out)
+
 
 class RouteMatrixTest(unittest.TestCase):
     """The matrix has the documented shape."""
