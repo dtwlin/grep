@@ -2,8 +2,8 @@
 # Binary files, context and exit status in the parallel paths, adapted
 # from ripgrep's binary.rs, glue.rs and regression tests (r1159, r1380,
 # r3108, r3131, f2288) with GNU grep semantics.  Each case names the
-# route it must take (see GREP_TEST_ROUTE in src/grep.c) and must match
-# GREP_THREADS=1 src/grep byte for byte.
+# route it must take (see GREP_TEST_ROUTE in src/grep-test-hooks.h) and
+# must match GREP_THREADS=1 src/grep byte for byte.
 #
 # The inputs are 320 KiB of 64-byte lines.  grep-shrunk cuts such a file
 # into 4 chunks starting at lines 1281, 2561 and 3841 (0-based) for any

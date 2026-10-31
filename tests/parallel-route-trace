@@ -2,9 +2,9 @@
 # Check the route trace of the test builds, and that each input reaches
 # the path meant for it.  A test build run with GREP_ROUTE_LOG=FILE
 # writes to FILE one line per decision about how to search an operand;
-# see GREP_TEST_ROUTE in src/grep.c.  Every route needs a case below:
-# the test fails if the build lists a route that no case requires, so
-# adding a route to src/grep.c means adding a case here.  The "!ROUTE"
+# see GREP_TEST_ROUTE in src/grep-test-hooks.h.  Every route needs a
+# case below: the test fails if the build lists a route that no case
+# requires, so adding a route means adding a case here.  The "!ROUTE"
 # cases are routing guards: they pin paths that some options must avoid.
 #
 # The trace must not exist in the release build: src/grep must ignore

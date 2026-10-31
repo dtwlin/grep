@@ -1,6 +1,7 @@
 #! /bin/sh
 # Sleep at each point where grep's threads hand data over to each other
-# (GREP_TEST_DELAY sites in src/grep.c, honored by the test builds
+# (GREP_TEST_DELAY sites in src/grep.c, described in
+# src/grep-test-hooks.h and honored by the test builds
 # src/grep-hooks and src/grep-shrunk), one point at a time, so that the
 # other threads run ahead into the window.  A thread that still uses an
 # object that another may free or reuse, a wakeup that can be missed,

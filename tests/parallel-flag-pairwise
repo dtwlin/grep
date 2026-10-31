@@ -6,9 +6,9 @@
 # Part 1 crosses patterns, binary-file options, ugrep's option bundles,
 # matchers and -w/-x, and file versus pipe input, using a pairwise
 # covering array: every pair of values of any two factors occurs in some
-# row.  Each row must take its route (see GREP_TEST_ROUTE in src/grep.c)
-# and must match GREP_THREADS=1 src/grep.  The full product runs in
-# benchmarks/exhaustive_gap_fuzzer.py.
+# row.  Each row must take its route (see GREP_TEST_ROUTE in
+# src/grep-test-hooks.h) and must match GREP_THREADS=1 src/grep.  The
+# full product runs in benchmarks/exhaustive_gap_fuzzer.py.
 #
 # Part 2 checks fixed expected output, because a comparison with
 # GREP_THREADS=1 cannot catch a bug that the single-threaded path shares.

@@ -36,7 +36,7 @@
 # unless every route the binary lists was required by some pl_route,
 # except the ROUTEs given, which the caller could not reach here.  The
 # routes and how to add one are described at GREP_TEST_ROUTE in
-# src/grep.c.  The route trace exists only in grep-hooks and
+# src/grep-test-hooks.h.  The route trace exists only in grep-hooks and
 # grep-shrunk; src/grep ignores GREP_ROUTE_LOG.
 
 pl_fail=0

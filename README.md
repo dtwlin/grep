@@ -201,7 +201,11 @@ Changing `GREP_THREADS` only affects speed — the output and line order are alw
 - `GREP_DELAY_AT=SITE:USEC[,...]` sleeps at thread hand-off points to widen race windows.
 - `GREP_ROUTE_LOG=FILE` appends one line per operand naming the search path taken (`file-chunk`, `stdin-slice`, `walk-dirs`, ...); `GREP_ROUTE_LOG=list` prints every route. `tests/parallel-route-trace` requires a case for each route.
 
-The installed `grep` is built without `-DGREP_TEST_HOOKS`: the hooks compile to nothing, it ignores both variables, and its machine code is identical to a build without them. The route list and the steps for adding one are documented at `GREP_TEST_ROUTE` in `src/grep.c`.
+The installed `grep` is built without `-DGREP_TEST_HOOKS`: the hooks compile
+to nothing, it ignores both variables, and its machine code is identical to
+a build without them. The route list and the steps for adding one are
+documented at `GREP_TEST_ROUTE` in `src/grep-test-hooks.h`, and the
+capacities that `src/grep-shrunk` shrinks are in `src/grep-tunables.h`.
 
 ## ⚠️ Honest notes
 

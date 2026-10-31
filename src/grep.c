@@ -88,95 +88,8 @@
 #include "xbinary-io.h"
 #include "xstrtol.h"
 
-/* Test hooks.  A build with -DGREP_TEST_HOOKS sleeps at the named
-   points where threads hand data over to each other, as requested by
-   the environment variable GREP_DELAY_AT="SITE:USEC[,SITE:USEC]...",
-   where SITE "*" matches every point.  This widens race windows so
-   that tests can catch races deterministically.  Other builds compile
-   the hooks away.  */
-#ifdef GREP_TEST_HOOKS
-static void grep_test_delay (char const *site);
-# define GREP_TEST_DELAY(site) grep_test_delay (site)
-#else
-# define GREP_TEST_DELAY(site) ((void) 0)
-#endif
-
-/* Route trace.  Each place where grep decides how to search an operand
-   calls GREP_TEST_ROUTE (ROUTE, NAME).  In a build with
-   -DGREP_TEST_HOOKS, setting the environment variable
-   GREP_ROUTE_LOG=FILE appends one line "ROUTE<TAB>NAME" to FILE for
-   each such call, so a test can check which path searched its input.
-   GREP_ROUTE_LOG=list prints every route and exits.  Lines from
-   different threads may appear in any order.  NAME is the operand (or
-   nullptr for none); a tab or newline in it is written as '?'.
-
-   Other builds compile the trace away: the macro expands to a no-op
-   that only checks at compile time that ROUTE names a route, and does
-   not evaluate NAME.  NAME must therefore have no side effects.
-
-   To add a route, add a line to GREP_ROUTES, call GREP_TEST_ROUTE at
-   the new decision point, and add a case to tests/parallel-route-trace,
-   which fails if a route has no case.
-
-   Route                 Taken when
-   serial                single-threaded search of an operand
-   file-queue            a file operand goes to the worker queue
-   file-chunk            a large file operand is searched in chunks
-   stdin-queue           standard input goes to the worker queue
-   stdin-chunk           a large regular-file stdin is searched in chunks
-   stdin-slice           a pipe on stdin is cut into slices
-   walk-files            16 or more file operands go to the walker
-   walk-dirs             directory operands go to the recursive walker
-   walk-bin-scan         -q on a large binary file in a walk, in slices
-   quiet-mmap            -q on a large binary file, in one mmap scan
-   chunk-quiet-probe     -q probes the first 96 KiB before chunking
-   chunk-fallback        chunking gave up (NUL early, mmap failure)
-   chunk-count           chunks counted (-c, -l, -L, -q)
-   chunk-stateless       chunks printed without line numbers or context
-   chunk-nul-sequential  pass 1 found a NUL after the first 96 KiB; the
-                         file is searched sequentially instead
-   chunk-nul-research    single-pass chunks found a NUL; the file is
-                         searched again sequentially
-   chunk-context         pass-1 matches formatted directly (context, or
-                         fewer matches than the cap)
-   chunk-enc-sequential  context output dropped a line with an encoding
-                         error; the file is searched sequentially
-   chunk-lineno          chunks searched again with line numbers (-v,
-                         or too many matches)  */
-#define GREP_ROUTES(X)                                  \
-  X (SERIAL, "serial")                                  \
-  X (FILE_QUEUE, "file-queue")                          \
-  X (FILE_CHUNK, "file-chunk")                          \
-  X (STDIN_QUEUE, "stdin-queue")                        \
-  X (STDIN_CHUNK, "stdin-chunk")                        \
-  X (STDIN_SLICE, "stdin-slice")                        \
-  X (WALK_FILES, "walk-files")                          \
-  X (WALK_DIRS, "walk-dirs")                            \
-  X (WALK_BIN_SCAN, "walk-bin-scan")                    \
-  X (QUIET_MMAP, "quiet-mmap")                          \
-  X (CHUNK_QUIET_PROBE, "chunk-quiet-probe")            \
-  X (CHUNK_FALLBACK, "chunk-fallback")                  \
-  X (CHUNK_COUNT, "chunk-count")                        \
-  X (CHUNK_STATELESS, "chunk-stateless")                \
-  X (CHUNK_NUL_SEQUENTIAL, "chunk-nul-sequential")      \
-  X (CHUNK_NUL_RESEARCH, "chunk-nul-research")          \
-  X (CHUNK_CONTEXT, "chunk-context")                    \
-  X (CHUNK_ENC_SEQUENTIAL, "chunk-enc-sequential")      \
-  X (CHUNK_LINENO, "chunk-lineno")
-
-enum grep_route
-{
-#define GREP_ROUTE_ENUM(id, name) GREP_ROUTE_##id,
-  GREP_ROUTES (GREP_ROUTE_ENUM)
-#undef GREP_ROUTE_ENUM
-};
-
-#ifdef GREP_TEST_HOOKS
-static void grep_test_route (enum grep_route route, char const *name);
-# define GREP_TEST_ROUTE(route, name) grep_test_route (GREP_ROUTE_##route, name)
-#else
-# define GREP_TEST_ROUTE(route, name) ((void) GREP_ROUTE_##route)
-#endif
+#include "grep-test-hooks.h"
+#include "grep-tunables.h"
 
 enum { SEP_CHAR_SELECTED = ':' };
 enum { SEP_CHAR_REJECTED = '-' };
@@ -617,26 +530,8 @@ static _Thread_local struct membuf tls_big;
 static _Thread_local bool tls_may_defer;
 static _Thread_local bool tls_deferred;
 
-/* A recursive search searches the files of a directory in batches.
-   Before it searches a regular file of at least WALK_SPLIT_SIZE bytes,
-   it lets other threads search the rest of the batch; see
-   walk_split_rest.  WALK_CUR_TASK is the batch that the current thread
-   is searching, if any.  */
-#ifndef GREP_WALK_SPLIT_SIZE
-# define GREP_WALK_SPLIT_SIZE (2 * 1024 * 1024)
-#endif
-enum { WALK_SPLIT_SIZE = GREP_WALK_SPLIT_SIZE };
-/* A recursive search scans a binary file of at least WALK_BIN_SCAN_MIN
-   bytes with -q in slices of WALK_BIN_SLICE bytes that any thread may
-   search; see walk_bin_scan.  */
-#ifndef GREP_WALK_BIN_SCAN_MIN
-# define GREP_WALK_BIN_SCAN_MIN (16 * 1024 * 1024)
-#endif
-#ifndef GREP_WALK_BIN_SLICE
-# define GREP_WALK_BIN_SLICE (4 * 1024 * 1024)
-#endif
-enum { WALK_BIN_SCAN_MIN = GREP_WALK_BIN_SCAN_MIN };
-enum { WALK_BIN_SLICE = GREP_WALK_BIN_SLICE };
+/* WALK_CUR_TASK is the batch that the current thread is searching, if
+   any; see walk_split_rest.  */
 struct walk_task;
 static _Thread_local struct walk_task *walk_cur_task;
 static void walk_split_rest (void);
@@ -3705,41 +3600,7 @@ struct chunk_file_state
   int offset_width;
 };
 
-/* Capacities of the work queue and of the reorder buffer (ROB).  Tests
-   build grep with much smaller values (see src/Makefile.am), so that
-   every path that waits for space runs often.  */
-#ifndef GREP_WORK_QUEUE_CAP
-# define GREP_WORK_QUEUE_CAP 256
-#endif
-#ifndef GREP_ROB_CAP
-# define GREP_ROB_CAP 1024
-#endif
-enum { WORK_QUEUE_CAP = GREP_WORK_QUEUE_CAP };
-enum { ROB_CAP = GREP_ROB_CAP };
-
-/* A file is searched in at most this many chunks.  All chunks of a file
-   must fit in the work queue at once, and their ROB slots, which may
-   not be committed before all chunks are searched, must leave room for
-   the slots of other inputs.  */
-enum { MAX_FILE_CHUNKS = MIN (64, MIN (WORK_QUEUE_CAP, ROB_CAP / 2)) };
-static_assert (2 <= MAX_FILE_CHUNKS);
-
-/* The stream slicer keeps at most this many slices in flight.  */
-enum { STREAM_MAX_INFLIGHT = MIN (56, ROB_CAP / 2) };
-static_assert (1 <= STREAM_MAX_INFLIGHT);
-
-/* Regular files of at least CHUNK_FILE_MIN bytes are searched in
-   chunks of at least CHUNK_MIN_SIZE bytes each.  */
-#ifndef GREP_CHUNK_FILE_MIN
-# define GREP_CHUNK_FILE_MIN (2 * 1024 * 1024)
-#endif
-#ifndef GREP_CHUNK_MIN_SIZE
-# define GREP_CHUNK_MIN_SIZE (2 * 1024 * 1024)
-#endif
-enum { CHUNK_FILE_MIN = GREP_CHUNK_FILE_MIN };
-enum { CHUNK_MIN_SIZE = GREP_CHUNK_MIN_SIZE };
-
-/* Such files are mapped at an address that is a multiple of
+/* Files searched in chunks are mapped at an address that is a multiple of
    CHUNK_MAP_ALIGN, the size of a PMD-level huge page on x86-64 and on
    arm64 with 4 KiB pages, so that the kernel can map each 2 MiB page
    cache folio of the file with a single page table entry.  */
@@ -3766,14 +3627,6 @@ static size_t rob_done_waiters = 0;
 static bool pool_terminate;
 static void rob_try_commit_locked (void);
 
-#ifndef GREP_SLICE_BUF_SIZE
-# define GREP_SLICE_BUF_SIZE (1024 * 1024)
-#endif
-#ifndef GREP_SLICE_POOL_CAP
-# define GREP_SLICE_POOL_CAP 64
-#endif
-enum { SLICE_BUF_SIZE = GREP_SLICE_BUF_SIZE };
-enum { SLICE_POOL_CAP = GREP_SLICE_POOL_CAP };
 static char *slice_freelist[SLICE_POOL_CAP];
 static int slice_freelist_cnt = 0;
 static pthread_cond_t slice_avail_cv = PTHREAD_COND_INITIALIZER;
@@ -4459,14 +4312,6 @@ producer_alloc_slot_locked (void)
 static void walk_participate (unsigned int);
 static void walk_free_thread_buffers (void);
 
-/* Chunk tasks search in pieces of about this many bytes, so that the
-   check for null bytes reads each piece while the search has left it in
-   cache.  */
-#ifndef GREP_CHUNK_PIECE
-# define GREP_CHUNK_PIECE (128 * 1024)
-#endif
-enum { CHUNK_PIECE = GREP_CHUNK_PIECE };
-
 static void chunk_slot_done_locked (struct chunk_file_state *state);
 
 /* Return true if chunk tasks of the file of STATE should still check
@@ -5098,11 +4943,6 @@ worker_thread_func (void *arg)
     }
   return NULL;
 }
-
-#ifndef GREP_PRODUCER_BATCH_SIZE
-# define GREP_PRODUCER_BATCH_SIZE 32
-#endif
-enum { PRODUCER_BATCH_SIZE = GREP_PRODUCER_BATCH_SIZE };
 
 struct producer_batch_item
 {
@@ -6360,24 +6200,6 @@ stream_slicer_stdin (void)
    - Diagnostics appear where fts-based grep issues them, after the same
      checks for exclusion patterns, devices and symbolic links.  */
 
-/* Maximum number of files searched by one task.  */
-#ifndef GREP_WALK_BATCH
-# define GREP_WALK_BATCH 32
-#endif
-enum { WALK_BATCH = GREP_WALK_BATCH };
-
-/* gnulib fts reads at most this many entries of a directory at a time,
-   and sorts a batch by inode number if it has more than
-   WALK_INODE_SORT_MIN entries.  */
-#ifndef GREP_WALK_READDIR_BATCH
-# define GREP_WALK_READDIR_BATCH 100000
-#endif
-#ifndef GREP_WALK_INODE_SORT_MIN
-# define GREP_WALK_INODE_SORT_MIN 10000
-#endif
-enum { WALK_READDIR_BATCH = GREP_WALK_READDIR_BATCH };
-enum { WALK_INODE_SORT_MIN = GREP_WALK_INODE_SORT_MIN };
-
 enum walk_kind
 {
   WALK_SKIP,                    /* nothing to search */
@@ -6470,11 +6292,6 @@ struct walk_bin_job
   size_t slice_size;
 };
 
-#ifndef GREP_WALK_BUF_CAP
-# define GREP_WALK_BUF_CAP (256 * 1024 * 1024)
-#endif
-enum { WALK_BUF_CAP = GREP_WALK_BUF_CAP };
-
 static struct
 {
   pthread_mutex_t mu;           /* protects the members up to INSIDE */
@@ -6515,13 +6332,6 @@ static struct
 static bool walk_recruited;
 static struct timespec walk_start;
 static _Thread_local bool walk_is_main;
-
-/* The main thread traverses alone for this many nanoseconds before it
-   recruits the worker threads.  Searches that end sooner, such as -q
-   with an early match, then never start them.  */
-#ifndef WALK_RECRUIT_NS
-# define WALK_RECRUIT_NS (1000 * 1000)
-#endif
 
 /* Per-thread buffers for names and directory entries.  */
 static _Thread_local char *walk_pbuf;
@@ -7586,21 +7396,6 @@ walk_maybe_recruit (void)
         walk_recruit (walk.gen);
     }
 }
-
-/* A batch of files that has been searched for this many nanoseconds
-   gives the second half of the files it has left to other threads, so
-   that a batch of files that are slow to search is spread over the
-   threads instead of keeping one of them busy while the others wait.  */
-#ifndef WALK_SPLIT_NS
-# define WALK_SPLIT_NS (3 * 1000 * 1000)
-#endif
-#ifndef WALK_SPLIT_FILE_NS
-# define WALK_SPLIT_FILE_NS (500 * 1000)
-#endif
-#ifndef GREP_WALK_SPLIT_MIN_REM
-# define GREP_WALK_SPLIT_MIN_REM 8
-#endif
-enum { WALK_SPLIT_MIN_REM = GREP_WALK_SPLIT_MIN_REM };
 
 /* The entry of WALK_CUR_TASK whose file the current thread searches.  */
 static _Thread_local size_t walk_cur_index;
@@ -9028,109 +8823,7 @@ parse_grep_options (int argc, char **argv, char **keys_inout,
 }
 
 #ifdef GREP_TEST_HOOKS
-/* The delays requested by GREP_DELAY_AT; see GREP_TEST_DELAY.  */
-static struct { char site[32]; unsigned int usec; } test_delays[32];
-static int n_test_delays;
-
-/* Parse GREP_DELAY_AT.  Call this before starting threads.  */
-static void
-init_test_delays (void)
-{
-  char const *env = getenv ("GREP_DELAY_AT");
-  if (!env)
-    return;
-  if (STREQ (env, "probe"))
-    {
-      puts ("grep-test-hooks");
-      exit (EXIT_SUCCESS);
-    }
-  for (char const *p = env; *p && n_test_delays < 32; )
-    {
-      char const *colon = strchr (p, ':');
-      if (!colon)
-        break;
-      size_t len = MIN ((size_t) (colon - p), sizeof test_delays[0].site - 1);
-      memcpy (test_delays[n_test_delays].site, p, len);
-      test_delays[n_test_delays].site[len] = '\0';
-      char *end;
-      test_delays[n_test_delays].usec = strtoul (colon + 1, &end, 10);
-      n_test_delays++;
-      p = *end == ',' ? end + 1 : end;
-    }
-}
-
-static void
-grep_test_delay (char const *site)
-{
-  for (int i = 0; i < n_test_delays; i++)
-    if (STREQ (test_delays[i].site, "*") || STREQ (test_delays[i].site, site))
-      {
-        usleep (test_delays[i].usec);
-        return;
-      }
-}
-
-/* The names of the routes; see GREP_TEST_ROUTE.  */
-static char const *const test_route_names[] =
-{
-#define GREP_ROUTE_NAME(id, name) name,
-  GREP_ROUTES (GREP_ROUTE_NAME)
-#undef GREP_ROUTE_NAME
-};
-
-/* The descriptor of the GREP_ROUTE_LOG file, or -1 if there is none.  */
-static int test_route_fd = -1;
-
-/* Open the file named by GREP_ROUTE_LOG.  Call this before starting
-   threads.  */
-static void
-init_test_routes (void)
-{
-  char const *env = getenv ("GREP_ROUTE_LOG");
-  if (!env || !*env)
-    return;
-  if (STREQ (env, "list"))
-    {
-      for (size_t i = 0;
-           i < sizeof test_route_names / sizeof *test_route_names; i++)
-        puts (test_route_names[i]);
-      exit (EXIT_SUCCESS);
-    }
-  int fd = open (env, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
-  if (fd < 0)
-    die (EXIT_TROUBLE, errno, "GREP_ROUTE_LOG=%s", env);
-  /* Keep descriptors 0-2 free, so that a closed standard stream stays
-     closed as far as the rest of grep can tell.  */
-  if (fd <= STDERR_FILENO)
-    {
-      int high = fcntl (fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
-      if (high < 0)
-        die (EXIT_TROUBLE, errno, "GREP_ROUTE_LOG=%s", env);
-      close (fd);
-      fd = high;
-    }
-  test_route_fd = fd;
-}
-
-static void
-grep_test_route (enum grep_route route, char const *name)
-{
-  if (test_route_fd < 0)
-    return;
-  int saved_errno = errno;
-  char line[512];
-  char const *r = test_route_names[route];
-  size_t n = strlen (r);
-  memcpy (line, r, n);
-  line[n++] = '\t';
-  for (char const *p = name ? name : "-"; *p && n < sizeof line - 1; p++)
-    line[n++] = *p == '\t' || *p == '\n' ? '?' : *p;
-  line[n++] = '\n';
-  /* One write per line, so that lines from different threads do not
-     interleave in the O_APPEND file.  */
-  ignore_value (write (test_route_fd, line, n));
-  errno = saved_errno;
-}
+# include "grep-test-hooks.c"
 #endif
 
 int

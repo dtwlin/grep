@@ -181,6 +181,11 @@ exclude_file_name_regexp--sc_prohibit_doubled_word = ^tests/count-newline$$
 
 exclude_file_name_regexp--sc_long_lines = ^tests/.*$$
 
+# Fragments #included by src/grep.c are not separate translation units.
+exclude_file_name_regexp--sc_require_config_h = ^src/grep-test-hooks\.c$$
+exclude_file_name_regexp--sc_require_config_h_first = \
+  ^src/grep-test-hooks\.c$$
+
 # If a test uses timeout, it must also use require_timeout_.
 # Grandfather-exempt the fedora test, since it ensures timeout works
 # as expected before using it.
