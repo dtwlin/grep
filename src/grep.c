@@ -118,9 +118,6 @@ static bool only_matching;
 /* If nonzero, make sure first content char in a line is on a tab stop. */
 static bool align_tabs;
 
-/* Print width of line numbers and byte offsets.  Nonzero if ALIGN_TABS.  */
-static _Thread_local int offset_width;
-
 /* An entry in the PATLOC array saying where patterns came from.  */
 struct patloc
   {
@@ -496,16 +493,78 @@ struct membuf
   size_t cap;
 };
 
-static _Thread_local bool buffering_enabled;
-static _Thread_local struct membuf tls_out;
-static _Thread_local struct membuf tls_err;
-static _Thread_local bool tls_errseen;
+/* Thread-local state of the task that the current thread searches.
+   Each entry declares a variable of its own.  Do not group them into
+   a struct: the addresses of the output buffers escape, and GCC would
+   then reload every field of the struct after each byte stored to an
+   output buffer.  X (TYPE, NAME, RESET): task_reset executes RESET,
+   and GREP_TLS_KEEP lets a task inherit the value.  The variables of
+   GREP_TASK_TLS_SAVED are also saved and restored around a nested
+   search; see struct search_tls_state.  Per-task state that task_reset
+   must reset, or that a nested search must save and restore, belongs
+   in one of these lists.  */
+#define GREP_TLS_KEEP ((void) 0)
+#define GREP_TASK_TLS_SAVED(X)                                              \
+  /* The input file name, or (if standard input) null or a --label          \
+     argument.  */                                                          \
+  X (char const *, filename, GREP_TLS_KEEP)                                 \
+  X (char const *, cached_filename_ptr, cached_filename_ptr = nullptr)      \
+  X (size_t, cached_filename_len, GREP_TLS_KEEP)                            \
+  /* Beginning of user-visible stuff.  */                                   \
+  X (char *, bufbeg, GREP_TLS_KEEP)                                         \
+  /* Limit of user-visible stuff.  */                                       \
+  X (char *, buflim, GREP_TLS_KEEP)                                         \
+  /* Total character count before bufbeg.  */                               \
+  X (intmax_t, totalcc, totalcc = 0)                                        \
+  /* Total newline count before lastnl.  */                                 \
+  X (intmax_t, totalnl, GREP_TLS_KEEP)                                      \
+  /* Pointer after last newline counted.  */                                \
+  X (char const *, lastnl, lastnl = nullptr)                                \
+  /* Pointer after last character output; null if no character has          \
+     been output or if it's conceptually before bufbeg.  */                 \
+  X (char *, lastout, lastout = nullptr)                                    \
+  /* Maximum number of selected lines.  */                                  \
+  X (intmax_t, outleft, outleft = max_count)                                \
+  /* Pending lines of output.  Always kept 0 if out_quiet is true.  */      \
+  X (intmax_t, pending, pending = 0)                                        \
+  X (bool, buffering_enabled, GREP_TLS_KEEP)                                \
+  /* Suppress all normal output.  */                                        \
+  X (bool, out_quiet, out_quiet = initial_out_quiet)                        \
+  /* Stop scanning file on first match.  */                                 \
+  X (bool, done_on_match, done_on_match = initial_done_on_match)            \
+  /* True if output from the current input file has been suppressed         \
+     because an output line had an encoding error.  */                      \
+  X (bool, encoding_error_output, GREP_TLS_KEEP)                            \
+  /* Print width of line numbers and byte offsets.  Nonzero if              \
+     ALIGN_TABS.  */                                                        \
+  X (int, offset_width, GREP_TLS_KEEP)                                      \
+  X (bool, file_used, file_used = false)                                    \
+  X (bool, task_had_prtext, task_had_prtext = false)                        \
+  /* True if the current buffered task output a line with prline.           \
+     Single-threaded grep dies of an earlier write error only after         \
+     outputting a line (see prline), so the committer does so only          \
+     after committing the output of a task that output one.  */             \
+  X (bool, task_had_prline, task_had_prline = false)                        \
+  /* True if the current buffered task called prtext without                \
+     OUT_QUIET before any other prtext call.  Whether a group               \
+     separator precedes that output depends on what was output              \
+     before the task, which only the committer knows.  */                   \
+  X (bool, task_sep, task_sep = false)                                      \
+  X (bool, tls_errseen, tls_errseen = false)                                \
+  X (struct membuf, tls_out, membuf_reset (&tls_out))                       \
+  X (struct membuf, tls_err, membuf_reset (&tls_err))                       \
+  /* Writes recorded in exact mode; see BIG_WRITE_MIN.  */                  \
+  X (struct membuf, tls_big, membuf_reset (&tls_big))
+#define GREP_TASK_TLS_UNSAVED(X)                                            \
+  /* See TLS_MAY_DEFER.  */                                                 \
+  X (bool, tls_deferred, tls_deferred = false)                              \
+  X (bool, walk_ent_post_grep, walk_ent_post_grep = false)                  \
+  X (intmax_t, walk_ent_count, walk_ent_count = 0)
 
-/* True if the current buffered task called prtext without OUT_QUIET
-   before any other prtext call.  Whether a group separator precedes
-   that output depends on what was output before the task, which only
-   the committer knows.  */
-static _Thread_local bool task_sep;
+#define GREP_TLS_DECLARE(type, name, reset) static _Thread_local type name;
+GREP_TASK_TLS_SAVED (GREP_TLS_DECLARE)
+GREP_TASK_TLS_UNSAVED (GREP_TLS_DECLARE)
+#undef GREP_TLS_DECLARE
 
 /* True if output committed from worker buffers must reach standard
    output through the same sequence of stdio buffer states as in
@@ -520,7 +579,6 @@ static bool exact_stdout;
    writes never bypass a stdio buffer that is at least that large, so
    they can be replayed in any pieces that are smaller too.  */
 enum { BIG_WRITE_MIN = 128 };
-static _Thread_local struct membuf tls_big;
 
 /* In exact mode, worker threads must not read the output file, since
    what they would read depends on how much output has been committed.
@@ -528,7 +586,6 @@ static _Thread_local struct membuf tls_big;
    TLS_DEFERRED; the committer then searches the file itself, when all
    the output that precedes it has been written.  */
 static _Thread_local bool tls_may_defer;
-static _Thread_local bool tls_deferred;
 
 /* WALK_CUR_TASK is the batch that the current thread is searching, if
    any; see walk_split_rest.  */
@@ -873,15 +930,9 @@ bool match_lines;
 char eolbyte;
 
 /* For error messages. */
-/* The input file name, or (if standard input) null or a --label argument.  */
-static _Thread_local char const *filename;
 /* Omit leading "./" from file names in diagnostics.  */
 static bool omit_dot_slash;
 static bool errseen;
-
-/* True if output from the current input file has been suppressed
-   because an output line had an encoding error.  */
-static _Thread_local bool encoding_error_output;
 
 enum directories_type
   {
@@ -973,10 +1024,6 @@ static char const *walk_shown_name (char const *path);
 static _Thread_local struct walk_dir const *walk_cur_dir;
 static _Thread_local struct walk_ent const *walk_cur_ent;
 static _Thread_local bool walk_ent_defer_post;
-static _Thread_local bool walk_ent_post_grep;
-static _Thread_local intmax_t walk_ent_count;
-static _Thread_local char const *cached_filename_ptr;
-static _Thread_local size_t cached_filename_len;
 
 char const *
 input_filename (void)
@@ -1268,8 +1315,6 @@ static int pool_target;
 static _Thread_local char *buffer;		/* Base of buffer. */
 static _Thread_local idx_t bufalloc;		/* Allocated buffer size, counting slop. */
 static _Thread_local int bufdesc;		/* File descriptor. */
-static _Thread_local char *bufbeg;		/* Beginning of user-visible stuff. */
-static _Thread_local char *buflim;		/* Limit of user-visible stuff. */
 static idx_t pagesize;		/* alignment of memory pages */
 static _Thread_local idx_t good_readsize;	/* good size to pass to 'read' */
 static _Thread_local off_t bufoffset;		/* Read offset.  */
@@ -1279,7 +1324,6 @@ static _Thread_local off_t after_last_match;	/* Pointer after last matching line
 static _Thread_local bool skip_nuls;		/* Skip '\0' in data.  */
 static bool skip_empty_lines;	/* Skip empty lines in data.  */
 static bool patterns_have_nul;	/* True if any raw pattern contains '\0'.  */
-static _Thread_local intmax_t totalnl;	/* Total newline count before lastnl. */
 static _Thread_local bool buffer_is_mmap;
 
 /* True if the current input is known to be at end of file, because a
@@ -1622,7 +1666,6 @@ static enum
 static int out_file;
 
 static int filename_mask;	/* If zero, output nulls after filenames.  */
-static _Thread_local bool out_quiet;	/* Suppress all normal output. */
 static bool initial_out_quiet;
 static bool out_invert;		/* Print nonmatching stuff. */
 static bool out_line;		/* Print line numbers. */
@@ -1635,17 +1678,6 @@ static intmax_t max_count;	/* Max number of selected
 static bool line_buffered;	/* Use line buffering.  */
 static char *label;		/* Fake filename for stdin */
 
-
-/* Internal variables to keep track of byte count, context, etc. */
-static _Thread_local intmax_t totalcc;	/* Total character count before bufbeg. */
-static _Thread_local char const *lastnl;	/* Pointer after last newline counted. */
-static _Thread_local char *lastout;		/* Pointer after last character output;
-                                   null if no character has been output
-                                   or if it's conceptually before bufbeg. */
-static _Thread_local intmax_t outleft;	/* Maximum number of selected lines.  */
-static _Thread_local intmax_t pending;	/* Pending lines of output.
-                                   Always kept 0 if out_quiet is true.  */
-static _Thread_local bool done_on_match;	/* Stop scanning file on first match.  */
 static bool initial_done_on_match;
 static bool exit_on_match;	/* Exit on first match.  */
 static bool dev_null_output;	/* Stdout is known to be /dev/null.  */
@@ -1654,14 +1686,6 @@ static bool binary;		/* Use binary rather than text I/O.  */
 static bool stdin_is_closed;	/* Standard input was closed at startup.  */
 
 static bool global_used;
-static _Thread_local bool file_used;
-static _Thread_local bool task_had_prtext;
-
-/* True if the current buffered task output a line with prline.
-   Single-threaded grep dies of an earlier write error only after
-   outputting a line (see prline), so the committer does so only after
-   committing the output of a task that output one.  */
-static _Thread_local bool task_had_prline;
 
 static idx_t _GL_ATTRIBUTE_PURE
 count_newlines (char const *beg, char const *lim)
@@ -3848,117 +3872,39 @@ commit_output (char const *out, size_t outlen, char const *err,
 static void
 task_reset (void)
 {
-  membuf_reset (&tls_out);
-  membuf_reset (&tls_err);
-  membuf_reset (&tls_big);
-  tls_errseen = false;
-  tls_deferred = false;
-  walk_ent_post_grep = false;
-  walk_ent_count = 0;
-  cached_filename_ptr = nullptr;
-  out_quiet = initial_out_quiet;
-  done_on_match = initial_done_on_match;
-  totalcc = 0;
-  lastnl = nullptr;
-  lastout = nullptr;
-  outleft = max_count;
-  pending = 0;
-  file_used = false;
-  task_had_prtext = false;
-  task_had_prline = false;
-  task_sep = false;
+#define GREP_TLS_RESET(type, name, reset) reset;
+  GREP_TASK_TLS_SAVED (GREP_TLS_RESET)
+  GREP_TASK_TLS_UNSAVED (GREP_TLS_RESET)
+#undef GREP_TLS_RESET
 }
 
 /* Saved thread-local search and buffering state when a thread
    temporarily switches to a nested search or stream-slice commit.  */
 struct search_tls_state
 {
-  char const *filename;
-  char const *cached_filename_ptr;
-  size_t cached_filename_len;
-  char *bufbeg;
-  char *buflim;
-  intmax_t totalcc;
-  intmax_t totalnl;
-  char const *lastnl;
-  char *lastout;
-  intmax_t outleft;
-  intmax_t pending;
-  bool buffering_enabled;
-  bool out_quiet;
-  bool done_on_match;
-  bool encoding_error_output;
-  int offset_width;
-  bool file_used;
-  bool task_had_prtext;
-  bool task_had_prline;
-  bool task_sep;
-  bool tls_errseen;
-  struct membuf tls_out;
-  struct membuf tls_err;
-  struct membuf tls_big;
+#define GREP_TLS_FIELD(type, name, reset) type name;
+  GREP_TASK_TLS_SAVED (GREP_TLS_FIELD)
+#undef GREP_TLS_FIELD
 };
 
 static inline void
 save_search_tls (struct search_tls_state *s)
 {
-  s->filename = filename;
-  s->cached_filename_ptr = cached_filename_ptr;
-  s->cached_filename_len = cached_filename_len;
-  s->bufbeg = bufbeg;
-  s->buflim = buflim;
-  s->totalcc = totalcc;
-  s->totalnl = totalnl;
-  s->lastnl = lastnl;
-  s->lastout = lastout;
-  s->outleft = outleft;
-  s->pending = pending;
-  s->buffering_enabled = buffering_enabled;
-  s->out_quiet = out_quiet;
-  s->done_on_match = done_on_match;
-  s->encoding_error_output = encoding_error_output;
-  s->offset_width = offset_width;
-  s->file_used = file_used;
-  s->task_had_prtext = task_had_prtext;
-  s->task_had_prline = task_had_prline;
-  s->task_sep = task_sep;
-  s->tls_errseen = tls_errseen;
-  s->tls_out = tls_out;
-  s->tls_err = tls_err;
-  s->tls_big = tls_big;
+#define GREP_TLS_SAVE(type, name, reset) s->name = name;
+  GREP_TASK_TLS_SAVED (GREP_TLS_SAVE)
+#undef GREP_TLS_SAVE
 }
 
 static inline void
 restore_search_tls (struct search_tls_state const *s)
 {
-  filename = s->filename;
-  cached_filename_ptr = s->cached_filename_ptr;
-  cached_filename_len = s->cached_filename_len;
-  bufbeg = s->bufbeg;
-  buflim = s->buflim;
-  totalcc = s->totalcc;
-  totalnl = s->totalnl;
-  lastnl = s->lastnl;
-  lastout = s->lastout;
-  outleft = s->outleft;
-  pending = s->pending;
-  buffering_enabled = s->buffering_enabled;
-  out_quiet = s->out_quiet;
-  done_on_match = s->done_on_match;
-  encoding_error_output = s->encoding_error_output;
-  offset_width = s->offset_width;
-  file_used = s->file_used;
-  task_had_prtext = s->task_had_prtext;
-  task_had_prline = s->task_had_prline;
-  task_sep = s->task_sep;
-  tls_errseen = s->tls_errseen;
-  tls_out = s->tls_out;
-  tls_err = s->tls_err;
-  tls_big = s->tls_big;
+#define GREP_TLS_RESTORE(type, name, reset) name = s->name;
+  GREP_TASK_TLS_SAVED (GREP_TLS_RESTORE)
+#undef GREP_TLS_RESTORE
 }
 
 /* Move the current thread's newly allocated output buffers and flags
-   into SLOT.  */
+   (some of the variables of GREP_TASK_TLS_SAVED) into SLOT.  */
 static inline void
 rob_capture_tls_output (struct rob_slot *slot)
 {
@@ -3989,7 +3935,8 @@ rob_capture_tls_output (struct rob_slot *slot)
 }
 
 /* Initialize thread-local search state to scan an unbuffered stdin
-   slice [BEG, LIM).  */
+   slice [BEG, LIM).  This sets only the part of GREP_TASK_TLS_SAVED
+   that a slice needs.  */
 static inline void
 init_stream_slice_tls (char *beg, char *lim, off_t slice_totalcc,
                        intmax_t slice_totalnl, char const *slice_lastnl)
